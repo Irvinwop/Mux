@@ -91,7 +91,6 @@ The intended browser bindings are:
 - `Ctrl+Q`: close the pane
 - `Ctrl+Shift+Enter`: open a split
 - `Ctrl+Shift+T`: open a layer in another Kitty tab
-- `Ctrl+Shift+N`: open a Kitty OS window
 
 These paths are not all release-qualified. User Kitty mappings may override or
 conflict with Mux bindings.
@@ -109,11 +108,13 @@ isolation still require interactive validation.
 
 ## Known runtime limitations
 
-- Workspace metadata survives daemon restart, but offline panes are not
-  relaunched automatically after a full desktop logout.
+- Workspace URL and layer metadata survives daemon restart, but offline panes
+  and Kitty layouts are not relaunched automatically.
 - In-flight trusted UI requests are cancelled when an engine is replaced.
-- Logical layer moves do not yet guarantee physical Kitty moves.
-- Closing a pane can bypass a page's before-unload flow.
+- One dedicated Kitty OS window is supported. A physical layer move requires a
+  live destination pane in the same Kitty instance.
+- The first close request runs WebKit's before-unload flow; a second request or
+  the two-minute safety timeout forces teardown.
 - Browser UI paths such as uploads, downloads, popups, notifications, and
   permission prompts need live-site testing.
 - Shortcut routing has not been validated against a broad set of Kitty user

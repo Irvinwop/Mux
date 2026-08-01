@@ -96,8 +96,7 @@ actually observes.
 | `Ctrl+D` | Add or remove a bookmark for the current page. |
 | `Ctrl+Shift+Enter` | Open another browser split. |
 | `Ctrl+Shift+T` | Open another browser layer/tab. |
-| `Ctrl+Shift+N` | Open another Kitty OS window. |
-| `Ctrl+Q` | Close the focused pane. |
+| `Ctrl+Q` | Ask the page to close; press again to force it. |
 
 These bindings still need a full conflict and behavior pass against stock and
 user-customized Kitty configurations.
@@ -123,12 +122,14 @@ Browser content does not execute inside `muxd`.
   supported.
 - Automatic dependency installation is maintained only for Arch-family
   systems.
-- Workspace metadata is persisted, but restored offline panes are not yet
-  relaunched automatically after a full desktop logout.
+- Workspace URL and layer metadata is persisted for recovery, but offline panes
+  and Kitty layouts are not relaunched automatically.
 - In-flight trusted UI requests are cancelled when an engine crashes.
-- Layers are primarily logical: moving a view does not yet guarantee a
-  physical Kitty move.
-- Closing a pane can bypass a page's before-unload flow.
+- One dedicated Kitty OS window is supported; layers are tabs in that window.
+- A physical layer move requires a live destination pane in the same Kitty
+  instance; otherwise it fails without changing logical state.
+- The first close request uses WebKit's before-unload flow. A second request or
+  the two-minute safety timeout forces teardown.
 - Browser shortcuts and trusted overlays still require interactive coverage.
 - Site compatibility, media codecs, downloads, uploads, permissions, popups,
   notifications, clipboard bridging, and renderer recovery are not yet

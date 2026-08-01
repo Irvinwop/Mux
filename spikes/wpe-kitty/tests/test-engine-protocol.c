@@ -221,6 +221,53 @@ test_packet_round_trip(void)
     close_socket_pair(sockets);
 }
 
+static void
+test_close_handshake_round_trip(void)
+{
+    static const guint16 types[] = {
+        MUX_ENGINE_MESSAGE_REQUEST_CLOSE,
+        MUX_ENGINE_MESSAGE_CLOSE_READY,
+    };
+
+    for (gsize index = 0; index < G_N_ELEMENTS(types); index++) {
+        int sockets[2];
+        g_autoptr(GBytes) payload = g_bytes_new(NULL, 0);
+        MuxEngineMessage outgoing = {0};
+        MuxEngineMessage incoming = {0};
+        g_autoptr(GError) error = NULL;
+
+        open_socket_pair(sockets);
+        mux_engine_message_init(&outgoing,
+                                types[index],
+                                MUX_ENGINE_FLAG_NONE,
+                                G_GUINT64_CONSTANT(0x1020304050607080),
+                                G_GUINT64_CONSTANT(0x8877665544332211),
+                                payload);
+
+        g_assert_true(mux_engine_send_message(sockets[0],
+                                              &outgoing,
+                                              &error));
+        g_assert_no_error(error);
+        g_assert_true(mux_engine_receive_message(sockets[1],
+                                                 &incoming,
+                                                 &error));
+        g_assert_no_error(error);
+        g_assert_cmpuint(incoming.type, ==, types[index]);
+        g_assert_cmpuint(incoming.flags, ==, MUX_ENGINE_FLAG_NONE);
+        g_assert_cmpuint(incoming.view_id,
+                         ==,
+                         G_GUINT64_CONSTANT(0x1020304050607080));
+        g_assert_cmpuint(incoming.serial,
+                         ==,
+                         G_GUINT64_CONSTANT(0x8877665544332211));
+        g_assert_cmpuint(g_bytes_get_size(incoming.payload), ==, 0);
+
+        mux_engine_message_clear(&incoming);
+        mux_engine_message_clear(&outgoing);
+        close_socket_pair(sockets);
+    }
+}
+
 typedef enum {
     MALFORMED_WRONG_MAGIC,
     MALFORMED_WRONG_VERSION,
@@ -294,6 +341,8 @@ main(int argc, char **argv)
                     test_cursor_detects_trailing_data);
     g_test_add_func("/engine-protocol/packet/round-trip",
                     test_packet_round_trip);
+    g_test_add_func("/engine-protocol/packet/close-handshake",
+                    test_close_handshake_round_trip);
 
     for (index = 0; index < G_N_ELEMENTS(malformed_cases); index++) {
         g_test_add_data_func(malformed_cases[index].path,

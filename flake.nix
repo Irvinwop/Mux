@@ -99,9 +99,47 @@
 
               export MUX_LAYER=main
               export MUX_GLOBAL_BAR=1
-              export KITTY_LISTEN_ON="unix:@mux-kitty-$$"
+              uid="$(${pkgs.coreutils}/bin/id -u)"
+              if [[ -n "''${XDG_RUNTIME_DIR:-}" ]]; then
+                runtime_parent="$XDG_RUNTIME_DIR"
+                if [[ "$runtime_parent" != /* || ! -d "$runtime_parent" ||
+                      -L "$runtime_parent" ||
+                      "$(${pkgs.coreutils}/bin/stat -c %u -- "$runtime_parent")" != "$uid" ]]; then
+                  echo "XDG_RUNTIME_DIR must be an owner-controlled absolute directory." >&2
+                  exit 1
+                fi
+                kitty_runtime="$runtime_parent/mux"
+              else
+                kitty_runtime="/tmp/mux-$uid"
+              fi
 
-              exec kitty \
+              umask 077
+              if [[ -L "$kitty_runtime" ]]; then
+                echo "Refusing symlinked runtime directory: $kitty_runtime" >&2
+                exit 1
+              fi
+              ${pkgs.coreutils}/bin/mkdir -p -- "$kitty_runtime"
+              if [[ ! -d "$kitty_runtime" || -L "$kitty_runtime" ||
+                    "$(${pkgs.coreutils}/bin/stat -c %u -- "$kitty_runtime")" != "$uid" ]]; then
+                echo "Mux runtime directory is not owned by the current user." >&2
+                exit 1
+              fi
+              ${pkgs.coreutils}/bin/chmod 700 -- "$kitty_runtime"
+
+              kitty_socket="$kitty_runtime/kitty-$$.sock"
+              if [[ ''${#kitty_socket} -ge 100 ]]; then
+                echo "Kitty control socket path is too long: $kitty_socket" >&2
+                exit 1
+              fi
+              ${pkgs.coreutils}/bin/rm -f -- "$kitty_socket"
+              export KITTY_LISTEN_ON="unix:$kitty_socket"
+
+              cleanup_kitty_socket() {
+                ${pkgs.coreutils}/bin/rm -f -- "$kitty_socket"
+              }
+              trap cleanup_kitty_socket EXIT
+
+              kitty \
                 --config ${./kitty}/wpe.conf \
                 --listen-on "$KITTY_LISTEN_ON" \
                 --title Mux \

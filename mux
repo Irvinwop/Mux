@@ -1,14 +1,14 @@
 #!/bin/sh
 set -eu
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 
 if [ "$(uname -s)" != "Linux" ]; then
     printf '%s\n' "Mux currently runs on Linux because WPEPlatform is Linux-only." >&2
     exit 1
 fi
 
-for command in kitty kitten meson ninja pkg-config; do
+for command in id kitty kitten meson ninja pkg-config stat; do
     if ! command -v "$command" >/dev/null 2>&1; then
         printf '%s\n' "Missing required command: $command" >&2
         exit 1
@@ -55,10 +55,54 @@ fi
 
 MUX_LAYER=main
 MUX_GLOBAL_BAR=1
-KITTY_LISTEN_ON=unix:@mux-kitty-$$
+uid=$(id -u)
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    runtime_parent=$XDG_RUNTIME_DIR
+    case $runtime_parent in
+        /*) ;;
+        *)
+            printf '%s\n' "XDG_RUNTIME_DIR must be an absolute path." >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -d "$runtime_parent" ] || [ -L "$runtime_parent" ] ||
+       [ "$(stat -c %u -- "$runtime_parent")" != "$uid" ]; then
+        printf '%s\n' "XDG_RUNTIME_DIR must be an owner-controlled directory." >&2
+        exit 1
+    fi
+    kitty_runtime=$runtime_parent/mux
+else
+    kitty_runtime=/tmp/mux-$uid
+fi
+
+umask 077
+if [ -L "$kitty_runtime" ]; then
+    printf '%s\n' "Refusing symlinked runtime directory: $kitty_runtime" >&2
+    exit 1
+fi
+mkdir -p -- "$kitty_runtime"
+if [ ! -d "$kitty_runtime" ] || [ -L "$kitty_runtime" ] ||
+   [ "$(stat -c %u -- "$kitty_runtime")" != "$uid" ]; then
+    printf '%s\n' "Mux runtime directory is not owned by the current user." >&2
+    exit 1
+fi
+chmod 700 -- "$kitty_runtime"
+
+kitty_socket=$kitty_runtime/kitty-$$.sock
+if [ "${#kitty_socket}" -ge 100 ]; then
+    printf '%s\n' "Kitty control socket path is too long: $kitty_socket" >&2
+    exit 1
+fi
+rm -f -- "$kitty_socket"
+KITTY_LISTEN_ON=unix:$kitty_socket
 export MUX_LAYER MUX_GLOBAL_BAR KITTY_LISTEN_ON
 
-exec kitty \
+cleanup_kitty_socket() {
+    rm -f -- "$kitty_socket"
+}
+trap cleanup_kitty_socket EXIT
+
+kitty \
     --config "$repo_root/kitty/wpe.conf" \
     --listen-on "$KITTY_LISTEN_ON" \
     --title Mux \

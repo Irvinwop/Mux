@@ -39,6 +39,8 @@ typedef struct {
     dev_t reservation_device;
     ino_t reservation_inode;
     gboolean reservation_active;
+    gboolean pending_slot_held;
+    gboolean active_slot_held;
     gint64 last_progress_us;
     gulong decide_destination_handler;
     gulong created_destination_handler;
@@ -51,12 +53,131 @@ struct _MuxDownloadManager {
     WebKitNetworkSession *network_session;
     GHashTable *by_download;
     GHashTable *by_id;
+    GHashTable *pending_by_view;
+    GHashTable *active_by_view;
+    guint pending_count;
+    guint active_count;
     MuxDownloadSendFunc send_func;
     MuxDownloadEventFunc event_func;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     gulong download_started_handler;
 };
+
+static gpointer
+download_view_key(MuxDownloadManager *manager,
+                  WebKitWebView *source_view)
+{
+    return source_view ? (gpointer)source_view : (gpointer)manager;
+}
+
+static gboolean
+reserve_count(MuxDownloadManager *manager,
+              WebKitWebView *source_view,
+              GHashTable *by_view,
+              guint *global_count,
+              guint per_view_limit,
+              guint global_limit)
+{
+    gpointer key = download_view_key(manager, source_view);
+    guint view_count =
+        GPOINTER_TO_UINT(g_hash_table_lookup(by_view, key));
+
+    if (*global_count >= global_limit ||
+        view_count >= per_view_limit)
+        return FALSE;
+    (*global_count)++;
+    g_hash_table_insert(
+        by_view, key, GUINT_TO_POINTER(view_count + 1));
+    return TRUE;
+}
+
+static void
+release_count(MuxDownloadManager *manager,
+              WebKitWebView *source_view,
+              GHashTable *by_view,
+              guint *global_count)
+{
+    gpointer key = download_view_key(manager, source_view);
+    guint view_count =
+        GPOINTER_TO_UINT(g_hash_table_lookup(by_view, key));
+
+    g_assert(*global_count > 0);
+    g_assert(view_count > 0);
+    (*global_count)--;
+    if (view_count == 1)
+        g_hash_table_remove(by_view, key);
+    else
+        g_hash_table_insert(
+            by_view, key, GUINT_TO_POINTER(view_count - 1));
+}
+
+static gboolean
+reserve_pending_slot(PendingDownload *pending)
+{
+    MuxDownloadManager *manager = pending->manager;
+
+    if (!reserve_count(manager,
+                       pending->source_view,
+                       manager->pending_by_view,
+                       &manager->pending_count,
+                       MUX_DOWNLOAD_MAX_PENDING_PER_VIEW,
+                       MUX_DOWNLOAD_MAX_PENDING_GLOBAL))
+        return FALSE;
+    pending->pending_slot_held = TRUE;
+    return TRUE;
+}
+
+static gboolean
+reserve_active_slot(PendingDownload *pending)
+{
+    MuxDownloadManager *manager = pending->manager;
+
+    if (!reserve_count(manager,
+                       pending->source_view,
+                       manager->active_by_view,
+                       &manager->active_count,
+                       MUX_DOWNLOAD_MAX_ACTIVE_PER_VIEW,
+                       MUX_DOWNLOAD_MAX_ACTIVE_GLOBAL))
+        return FALSE;
+    pending->active_slot_held = TRUE;
+    return TRUE;
+}
+
+static void
+release_pending_slot(PendingDownload *pending)
+{
+    MuxDownloadManager *manager = pending->manager;
+
+    if (!pending->pending_slot_held)
+        return;
+    release_count(manager,
+                  pending->source_view,
+                  manager->pending_by_view,
+                  &manager->pending_count);
+    pending->pending_slot_held = FALSE;
+}
+
+static void
+release_active_slot(PendingDownload *pending)
+{
+    MuxDownloadManager *manager = pending->manager;
+
+    if (!pending->active_slot_held)
+        return;
+    release_count(manager,
+                  pending->source_view,
+                  manager->active_by_view,
+                  &manager->active_count);
+    pending->active_slot_held = FALSE;
+}
+
+static void
+release_download_slots(PendingDownload *pending)
+{
+    release_pending_slot(pending);
+    release_active_slot(pending);
+}
 
 static guint64
 next_download_id(MuxDownloadManager *manager)
@@ -245,6 +366,7 @@ pending_download_free(PendingDownload *pending)
 {
     if (!pending)
         return;
+    release_download_slots(pending);
     disconnect_download(pending);
     if (pending->state != DOWNLOAD_STATE_FINISHED)
         cleanup_files(pending);
@@ -420,8 +542,9 @@ begin_destination(PendingDownload *pending,
         return FALSE;
     }
     webkit_download_set_allow_overwrite(pending->download, FALSE);
-    webkit_download_set_destination(pending->download, partial_uri);
     pending->state = DOWNLOAD_STATE_TRANSFERRING;
+    release_pending_slot(pending);
+    webkit_download_set_destination(pending->download, partial_uri);
     return TRUE;
 }
 
@@ -526,6 +649,7 @@ on_failed(WebKitDownload *download,
 
     (void)download;
     pending->state = DOWNLOAD_STATE_FAILED;
+    release_download_slots(pending);
     g_free(pending->failure_message);
     pending->failure_message = bounded_utf8(error->message, 8192);
     cleanup_files(pending);
@@ -597,14 +721,19 @@ on_download_started(WebKitNetworkSession *network_session,
                     MuxDownloadManager *manager)
 {
     PendingDownload *pending = g_new0(PendingDownload, 1);
+    WebKitWebView *source_view =
+        webkit_download_get_web_view(download);
 
     (void)network_session;
     pending->manager = manager;
     pending->download = g_object_ref(download);
-    pending->source_view = webkit_download_get_web_view(download)
-                               ? g_object_ref(
-                                     webkit_download_get_web_view(download))
-                               : NULL;
+    pending->source_view = source_view ? g_object_ref(source_view) : NULL;
+    if (!reserve_pending_slot(pending) ||
+        !reserve_active_slot(pending)) {
+        pending_download_free(pending);
+        webkit_download_cancel(download);
+        return;
+    }
     pending->download_id = next_download_id(manager);
     pending->state = DOWNLOAD_STATE_NEW;
     pending->last_progress_us = g_get_monotonic_time();
@@ -658,6 +787,10 @@ mux_download_manager_new(WebKitNetworkSession *network_session,
         NULL,
         (GDestroyNotify)pending_download_free);
     manager->by_id = g_hash_table_new(g_int64_hash, g_int64_equal);
+    manager->pending_by_view =
+        g_hash_table_new(g_direct_hash, g_direct_equal);
+    manager->active_by_view =
+        g_hash_table_new(g_direct_hash, g_direct_equal);
     manager->send_func = send_func;
     manager->event_func = event_func;
     manager->user_data = user_data;
@@ -692,6 +825,10 @@ mux_download_manager_free(MuxDownloadManager *manager)
     g_hash_table_remove_all(manager->by_id);
     g_clear_pointer(&manager->by_download, g_hash_table_unref);
     g_clear_pointer(&manager->by_id, g_hash_table_unref);
+    g_assert(manager->pending_count == 0);
+    g_assert(manager->active_count == 0);
+    g_clear_pointer(&manager->pending_by_view, g_hash_table_unref);
+    g_clear_pointer(&manager->active_by_view, g_hash_table_unref);
     if (manager->user_data_destroy)
         manager->user_data_destroy(manager->user_data);
     g_clear_object(&manager->network_session);

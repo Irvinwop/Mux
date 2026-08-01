@@ -33,9 +33,10 @@
 #include <wpe/wpe-platform.h>
 
 #define MUX_ENGINE_MAX_CLIENTS 128u
-#define MUX_ENGINE_MAX_VIEWS 256u
+#define MUX_ENGINE_MAX_VIEWS 32u
 #define MUX_ENGINE_MAX_CLIENT_VIEWS 32u
-#define MUX_ENGINE_MAX_DIMENSION 16384u
+#define MUX_ENGINE_MAX_DIMENSION 8192u
+#define MUX_ENGINE_MAX_PIXELS (9u * 1024u * 1024u)
 #define MUX_ENGINE_MIN_SCALE 250u
 #define MUX_ENGINE_MAX_SCALE 8000u
 #define MUX_ENGINE_MAX_LAYER_BYTES 128u
@@ -133,6 +134,9 @@ struct _EngineView {
     guint64 pending_frame_serial;
     gchar *pending_shm_name;
     guint frame_timeout_id;
+    gboolean close_pending;
+    gboolean close_ready;
+    guint64 pending_close_serial;
 };
 
 struct _Engine {
@@ -1325,7 +1329,8 @@ engine_view_update_pixels(EngineView *view,
     height = (guint)wpe_buffer_get_height(buffer);
     if (!width || !height ||
         width > MUX_ENGINE_MAX_DIMENSION ||
-        height > MUX_ENGINE_MAX_DIMENSION)
+        height > MUX_ENGINE_MAX_DIMENSION ||
+        (guint64)width * height > MUX_ENGINE_MAX_PIXELS)
         return FALSE;
 
     bytes = wpe_buffer_import_to_pixels(buffer, &error);
@@ -1589,6 +1594,27 @@ view_leave_fullscreen(WebKitWebView *web_view, gpointer data)
     view->fullscreen = FALSE;
     view_send_metadata(view);
     return FALSE;
+}
+
+static void
+view_close(WebKitWebView *web_view, gpointer data)
+{
+    EngineView *view = data;
+    guint64 serial;
+
+    (void)web_view;
+    if (!view->close_pending || view->close_ready || !view->owner ||
+        view->owner->failed)
+        return;
+
+    serial = view->pending_close_serial;
+    view->close_pending = FALSE;
+    view->pending_close_serial = 0;
+    if (client_send_empty(view->owner,
+                          MUX_ENGINE_MESSAGE_CLOSE_READY,
+                          view->id,
+                          serial))
+        view->close_ready = TRUE;
 }
 
 static void
@@ -2081,6 +2107,10 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
                      G_CALLBACK(view_leave_fullscreen),
                      view);
     g_signal_connect(view->web_view,
+                     "close",
+                     G_CALLBACK(view_close),
+                     view);
+    g_signal_connect(view->web_view,
                      "load-changed",
                      G_CALLBACK(view_load_changed),
                      view);
@@ -2138,6 +2168,36 @@ handle_destroy_view(Client *client, const MuxEngineMessage *request)
         return TRUE;
     client_send_ack(client, request);
     g_hash_table_remove(client->engine->views, &view->id);
+    return !client->failed;
+}
+
+static gboolean
+handle_request_close(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+
+    if (!view)
+        return TRUE;
+    if (request->flags != MUX_ENGINE_FLAG_NONE ||
+        !request->serial ||
+        g_bytes_get_size(request->payload) != 0) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "invalid REQUEST_CLOSE record");
+        return TRUE;
+    }
+    if (view->close_pending || view->close_ready) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_STATE,
+                          "a close request is already in progress");
+        return TRUE;
+    }
+
+    view->close_pending = TRUE;
+    view->pending_close_serial = request->serial;
+    webkit_web_view_try_close(view->web_view);
     return !client->failed;
 }
 
@@ -2588,7 +2648,7 @@ browser_show_command_surface(EngineView *view, GError **error)
     return mux_browser_affordance_bridge_show_command_surface(
         view->affordance_bridge,
         "Mux commands and history",
-        "Type to filter, then press Enter to run or open.",
+        "Use Up/Down to choose, then press Enter to run or open.",
         choices,
         browser_palette_selected,
         palette,
@@ -3099,6 +3159,8 @@ handle_message(Client *client, const MuxEngineMessage *request)
         return handle_create_view(client, request);
     case MUX_ENGINE_MESSAGE_DESTROY_VIEW:
         return handle_destroy_view(client, request);
+    case MUX_ENGINE_MESSAGE_REQUEST_CLOSE:
+        return handle_request_close(client, request);
     case MUX_ENGINE_MESSAGE_RESIZE:
         return handle_resize(client, request);
     case MUX_ENGINE_MESSAGE_NAVIGATE:

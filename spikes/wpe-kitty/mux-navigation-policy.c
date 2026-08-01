@@ -16,6 +16,8 @@ typedef enum {
 
 typedef struct {
     guint64 request_id;
+    guint64 navigation_epoch;
+    guint64 tls_epoch;
     PendingKind kind;
     gchar *uri;
     gchar *host;
@@ -31,7 +33,18 @@ struct _MuxNavigationPolicy {
     gpointer output_data;
     GDestroyNotify output_destroy;
     GHashTable *pending;
+    guint64 navigation_epoch;
+    guint64 tls_epoch;
+    gchar *navigation_uri;
 };
+
+static void
+advance_epoch(guint64 *epoch)
+{
+    (*epoch)++;
+    if (*epoch == 0)
+        (*epoch)++;
+}
 
 static gchar *
 bounded_utf8(const gchar *text, gsize limit)
@@ -65,6 +78,42 @@ pending_decision_free(gpointer data)
     g_free(pending);
 }
 
+static void
+invalidate_pending_tls(MuxNavigationPolicy *policy)
+{
+    GHashTableIter iter;
+    gpointer value;
+
+    g_hash_table_iter_init(&iter, policy->pending);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        PendingDecision *pending = value;
+
+        if (pending->kind == PENDING_TLS)
+            g_hash_table_iter_remove(&iter);
+    }
+}
+
+static void
+navigation_changed(MuxNavigationPolicy *policy, const gchar *uri)
+{
+    advance_epoch(&policy->navigation_epoch);
+    g_free(policy->navigation_uri);
+    policy->navigation_uri = g_strdup(uri);
+    invalidate_pending_tls(policy);
+}
+
+static void
+load_changed(WebKitWebView *web_view,
+             WebKitLoadEvent load_event,
+             gpointer data)
+{
+    MuxNavigationPolicy *policy = data;
+
+    if (load_event == WEBKIT_LOAD_STARTED ||
+        load_event == WEBKIT_LOAD_REDIRECTED)
+        navigation_changed(policy, webkit_web_view_get_uri(web_view));
+}
+
 static guint64
 next_request_id(MuxNavigationPolicy *policy)
 {
@@ -90,13 +139,16 @@ send_request(MuxNavigationPolicy *policy,
     g_autoptr(MuxUiRequest) request = mux_ui_request_new(kind);
     g_autoptr(GBytes) payload = NULL;
     const gchar *current_uri = webkit_web_view_get_uri(policy->web_view);
+    const gchar *origin = pending->kind == PENDING_TLS
+                              ? pending->uri
+                              : current_uri;
 
     request->request_id = pending->request_id;
     request->flags = flags;
     if (policy->private_profile)
         request->flags |= MUX_UI_REQUEST_FLAG_PRIVATE_PROFILE;
     request->deadline_ms = MUX_NAVIGATION_PROMPT_DEADLINE_MS;
-    request->origin = bounded_utf8(current_uri ? current_uri : "about:blank",
+    request->origin = bounded_utf8(origin ? origin : "about:blank",
                                    MUX_NAVIGATION_ORIGIN_LIMIT);
     request->heading = g_strdup(heading);
     request->message = bounded_utf8(message, MUX_NAVIGATION_MESSAGE_LIMIT);
@@ -168,11 +220,19 @@ load_failed_with_tls_errors(WebKitWebView *web_view,
     host = g_uri_get_host(parsed);
     if (!scheme || g_ascii_strcasecmp(scheme, "https") != 0 || !host || !*host)
         return FALSE;
+
+    invalidate_pending_tls(policy);
+    advance_epoch(&policy->tls_epoch);
     if (g_hash_table_size(policy->pending) >= MUX_NAVIGATION_MAX_PENDING)
         return FALSE;
 
+    g_free(policy->navigation_uri);
+    policy->navigation_uri = g_strdup(failing_uri);
+
     pending = g_new0(PendingDecision, 1);
     pending->request_id = next_request_id(policy);
+    pending->navigation_epoch = policy->navigation_epoch;
+    pending->tls_epoch = policy->tls_epoch;
     pending->kind = PENDING_TLS;
     pending->uri = g_strdup(failing_uri);
     pending->host = g_strdup(host);
@@ -243,6 +303,8 @@ decide_policy(WebKitWebView *web_view,
         WEBKIT_NAVIGATION_POLICY_DECISION(decision));
     request = webkit_navigation_action_get_request(navigation);
     uri = request ? webkit_uri_request_get_uri(request) : NULL;
+    if (decision_type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION)
+        navigation_changed(policy, uri);
     scheme = uri ? g_uri_peek_scheme(uri) : NULL;
     if (!scheme || scheme_is_internal(scheme))
         return FALSE;
@@ -315,6 +377,13 @@ mux_navigation_policy_new(WebKitWebView *web_view,
                                             g_int64_equal,
                                             g_free,
                                             pending_decision_free);
+    policy->navigation_epoch = 1;
+    policy->tls_epoch = 1;
+    policy->navigation_uri = g_strdup(webkit_web_view_get_uri(web_view));
+    g_signal_connect(web_view,
+                     "load-changed",
+                     G_CALLBACK(load_changed),
+                     policy);
     g_signal_connect(web_view,
                      "load-failed-with-tls-errors",
                      G_CALLBACK(load_failed_with_tls_errors),
@@ -348,16 +417,37 @@ mux_navigation_policy_handle_payload(MuxNavigationPolicy *policy,
         return TRUE;
 
     if (pending->kind == PENDING_TLS) {
+        g_autoptr(GTlsCertificate) certificate = NULL;
+        g_autofree gchar *host = NULL;
+        g_autofree gchar *uri = NULL;
+        g_autoptr(GUri) parsed = NULL;
+        const gchar *parsed_host;
+
+        parsed = g_uri_parse(pending->uri, G_URI_FLAGS_NONE, NULL);
+        parsed_host = parsed ? g_uri_get_host(parsed) : NULL;
+        if (pending->navigation_epoch != policy->navigation_epoch ||
+            pending->tls_epoch != policy->tls_epoch ||
+            g_strcmp0(pending->uri, policy->navigation_uri) != 0 ||
+            !parsed_host ||
+            g_ascii_strcasecmp(parsed_host, pending->host) != 0) {
+            g_hash_table_remove(policy->pending, &response->request_id);
+            return TRUE;
+        }
         if (response->action == MUX_UI_ACTION_ALLOW_ONCE ||
             response->action == MUX_UI_ACTION_ALLOW_ALWAYS) {
             WebKitNetworkSession *session =
                 webkit_web_view_get_network_session(policy->web_view);
 
+            certificate = g_object_ref(pending->certificate);
+            host = g_strdup(pending->host);
+            uri = g_strdup(pending->uri);
+            g_hash_table_remove(policy->pending, &response->request_id);
             webkit_network_session_allow_tls_certificate_for_host(
                 session,
-                pending->certificate,
-                pending->host);
-            webkit_web_view_load_uri(policy->web_view, pending->uri);
+                certificate,
+                host);
+            webkit_web_view_load_uri(policy->web_view, uri);
+            return TRUE;
         }
     } else {
         pending->decision_resolved = TRUE;
@@ -382,6 +472,7 @@ mux_navigation_policy_free(MuxNavigationPolicy *policy)
     g_clear_pointer(&policy->pending, g_hash_table_unref);
     if (policy->output_destroy)
         policy->output_destroy(policy->output_data);
+    g_free(policy->navigation_uri);
     g_clear_object(&policy->web_view);
     g_free(policy);
 }

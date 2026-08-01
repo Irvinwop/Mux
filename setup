@@ -39,8 +39,8 @@ while (( $# )); do
       break
       ;;
     *)
-      mux_args+=("$1")
-      shift
+      mux_args+=("$@")
+      break
       ;;
   esac
 done

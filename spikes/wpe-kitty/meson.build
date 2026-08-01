@@ -39,7 +39,7 @@ executable(
   install: false,
 )
 
-executable(
+muxd_executable = executable(
   'muxd',
   [
     'src/muxd.c',
@@ -64,7 +64,7 @@ executable(
   install: true,
 )
 
-executable(
+muxctl_executable = executable(
   'muxctl',
   [
     'src/muxctl.c',
@@ -284,6 +284,23 @@ session_state_test = executable(
 )
 
 test('session-state', session_state_test)
+
+muxd_integration_test = executable(
+  'test-muxd-integration',
+  [
+    'tests/test-muxd-integration.c',
+    'src/mux-protocol.c',
+  ],
+  include_directories: include_directories('src'),
+  dependencies: [glib_dep, gio_dep],
+)
+
+test(
+  'muxd-integration',
+  muxd_integration_test,
+  args: [muxd_executable.full_path(), muxctl_executable.full_path()],
+  timeout: 20,
+)
 
 browser_store_test = executable(
   'test-browser-store',

@@ -54,6 +54,7 @@
 #define RECONNECT_MAX_MS 5000u
 #define ACTIVE_MAINTENANCE_MS 50
 #define IDLE_MAINTENANCE_MS 250
+#define CLOSE_TIMEOUT_MS 120000
 
 typedef struct {
     int engine_fd;
@@ -62,6 +63,8 @@ typedef struct {
     guint64 view_id;
     guint64 next_serial;
     guint64 pending_frame_serial;
+    guint64 close_request_serial;
+    gint64 close_deadline_us;
     guint image_id;
     guint width;
     guint height;
@@ -249,6 +252,11 @@ disconnect_engine(Pane *pane)
     pane->frame_waiting = FALSE;
     pane->pending_frame_serial = 0;
     delete_image(pane);
+    if (pane->close_request_serial) {
+        pane->close_request_serial = 0;
+        pane->close_deadline_us = 0;
+        pane->quit = TRUE;
+    }
     if (!pane->shutting_down)
         queue_retry(&pane->engine_retry_us,
                     &pane->engine_backoff_ms);
@@ -713,6 +721,35 @@ send_empty(Pane *pane,
                                    payload);
     g_bytes_unref(payload);
     return result;
+}
+
+static void
+request_close(Pane *pane)
+{
+    guint64 serial;
+
+    if (pane->close_request_serial) {
+        pane->quit = TRUE;
+        return;
+    }
+    if (pane->engine_fd < 0 || !pane->view_id) {
+        pane->quit = TRUE;
+        return;
+    }
+
+    serial = ++pane->next_serial;
+    if (!serial)
+        serial = ++pane->next_serial;
+    if (!send_empty(pane,
+                    MUX_ENGINE_MESSAGE_REQUEST_CLOSE,
+                    pane->view_id,
+                    serial)) {
+        pane->quit = TRUE;
+        return;
+    }
+    pane->close_request_serial = serial;
+    pane->close_deadline_us = g_get_monotonic_time() +
+        (gint64)CLOSE_TIMEOUT_MS * 1000;
 }
 
 static gboolean
@@ -1251,8 +1288,12 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
          mux_pane_clipboard_picker_is_open(pane->clipboard))) {
         pane->width = width;
         pane->height = height;
-        pane->frame_waiting = TRUE;
-        pane->pending_frame_serial = message->serial;
+        send_empty(pane,
+                   MUX_ENGINE_MESSAGE_FRAME_ACK,
+                   pane->view_id,
+                   message->serial);
+        pane->frame_waiting = FALSE;
+        pane->pending_frame_serial = 0;
         g_free(shm_name);
         return TRUE;
     }
@@ -1472,6 +1513,19 @@ handle_engine_message(Pane *pane)
         break;
     case MUX_ENGINE_MESSAGE_METADATA:
         handle_metadata(pane, &message);
+        break;
+    case MUX_ENGINE_MESSAGE_CLOSE_READY:
+        if (message.flags != MUX_ENGINE_FLAG_NONE ||
+            g_bytes_get_size(message.payload) != 0 ||
+            !pane->close_request_serial ||
+            message.serial != pane->close_request_serial) {
+            g_printerr("mux-pane: invalid or out-of-order CLOSE_READY\n");
+            disconnect_engine(pane);
+        } else {
+            pane->close_request_serial = 0;
+            pane->close_deadline_us = 0;
+            pane->quit = TRUE;
+        }
         break;
     case MUX_ENGINE_MESSAGE_EXTENSION: {
         gsize packet_length;
@@ -1867,7 +1921,7 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
     if (event_type == 1 &&
         (modifiers & WPE_MODIFIER_CONTROL) &&
         (key_number == 'q' || key_number == 'Q'))
-        pane->quit = TRUE;
+        request_close(pane);
     else if (event_type == 1 &&
              (modifiers & WPE_MODIFIER_CONTROL) &&
              (key_number == 'l' || key_number == 'L'))
@@ -2282,7 +2336,7 @@ process_terminal_input(Pane *pane)
                                                      picker_key,
                                                      0);
             } else if (byte == 17)
-                pane->quit = TRUE;
+                request_close(pane);
             else if (byte == 18)
                 send_navigation(pane,
                                 MUX_ENGINE_NAVIGATE_RELOAD,
@@ -2597,6 +2651,9 @@ next_poll_timeout(Pane *pane, gint64 now_us)
     tighten_timeout(&timeout_ms,
                     deadline_timeout_ms(pane->events_retry_us,
                                         now_us));
+    tighten_timeout(&timeout_ms,
+                    deadline_timeout_ms(pane->close_deadline_us,
+                                        now_us));
     if (g_main_context_pending(pane->main_context))
         tighten_timeout(&timeout_ms, 0);
     else if (active_maintenance)
@@ -2609,6 +2666,13 @@ next_poll_timeout(Pane *pane, gint64 now_us)
 static void
 service_maintenance(Pane *pane, gint64 monotonic_us)
 {
+    if (pane->close_request_serial && pane->close_deadline_us &&
+        monotonic_us >= pane->close_deadline_us) {
+        pane->close_request_serial = 0;
+        pane->close_deadline_us = 0;
+        pane->quit = TRUE;
+        return;
+    }
     while (g_main_context_iteration(pane->main_context, FALSE))
         ;
     if (pane->clipboard != NULL)

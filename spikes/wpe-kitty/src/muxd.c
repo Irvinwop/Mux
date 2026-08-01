@@ -69,6 +69,8 @@ typedef struct {
 #define SESSION_WRITE_RETRY_US (1000 * 1000)
 #define VIEW_ID_RESERVATION_SIZE 64u
 #define MAX_PEER_ENVIRONMENT_BYTES (4u * 1024u * 1024u)
+#define MAX_KITTY_SOCKET_BYTES 4096u
+#define MAX_KITTY_WINDOW_ID_BYTES 20u
 
 static volatile sig_atomic_t stop_requested;
 
@@ -369,6 +371,87 @@ static Client *find_layer_view(Server *server, const gchar *layer)
     return NULL;
 }
 
+static gboolean kitty_socket_is_valid(const gchar *socket)
+{
+    gsize length;
+
+    if (!socket)
+        return FALSE;
+    length = strnlen(socket, MAX_KITTY_SOCKET_BYTES + 1u);
+    if (length == 0 || length > MAX_KITTY_SOCKET_BYTES)
+        return FALSE;
+    for (gsize i = 0; i < length; i++) {
+        guchar byte = (guchar)socket[i];
+
+        if (byte < 0x20 || byte == 0x7f)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean kitty_window_id_is_valid(const gchar *id)
+{
+    gchar *end = NULL;
+    guint64 value;
+    gsize length;
+
+    if (!id)
+        return FALSE;
+    length = strnlen(id, MAX_KITTY_WINDOW_ID_BYTES + 1u);
+    if (length == 0 || length > MAX_KITTY_WINDOW_ID_BYTES)
+        return FALSE;
+    for (gsize i = 0; i < length; i++) {
+        if (!g_ascii_isdigit((guchar)id[i]))
+            return FALSE;
+    }
+
+    errno = 0;
+    value = g_ascii_strtoull(id, &end, 10);
+    return errno != ERANGE && end == id + length && value > 0;
+}
+
+static gboolean kitty_move_view(const Client *source, const Client *target,
+                                gboolean *spawn_failed)
+{
+    g_autofree gchar *source_match =
+        g_strdup_printf("id:%s", source->kitty_window);
+    g_autofree gchar *target_tab =
+        g_strdup_printf("window_id:%s", target->kitty_window);
+    gchar *argv[] = {
+        "kitten",
+        "@",
+        "--use-password=always",
+        "--to",
+        source->kitty_socket,
+        "detach-window",
+        "--match",
+        source_match,
+        "--target-tab",
+        target_tab,
+        NULL,
+    };
+    gint wait_status = 0;
+
+    *spawn_failed = FALSE;
+    if (!g_spawn_sync(NULL,
+                      argv,
+                      NULL,
+                      G_SPAWN_SEARCH_PATH |
+                          G_SPAWN_STDIN_FROM_DEV_NULL |
+                          G_SPAWN_STDOUT_TO_DEV_NULL |
+                          G_SPAWN_STDERR_TO_DEV_NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      &wait_status,
+                      NULL)) {
+        *spawn_failed = TRUE;
+        return FALSE;
+    }
+    return g_spawn_check_wait_status(wait_status, NULL);
+}
+
 static gboolean kitty_focus(Client *client)
 {
     if (!client || !client->kitty_window || !*client->kitty_window ||
@@ -636,6 +719,11 @@ static void handle_control(
     if (g_strcmp0(command, "MOVE") == 0 && field_count >= 4) {
         Client *view = control_target(server, fields[2]);
         gchar *layer = decode_layer(fields[3]);
+        Client *target = NULL;
+        gboolean found_live_view = FALSE;
+        gboolean found_invalid_identity = FALSE;
+        gboolean found_other_kitty = FALSE;
+        gboolean spawn_failed = FALSE;
 
         if (!view) {
             g_free(layer);
@@ -646,6 +734,73 @@ static void handle_control(
             control_error(client, "invalid layer identifier");
             return;
         }
+
+        if (g_strcmp0(view->layer, layer) == 0) {
+            g_free(layer);
+            mux_send_line(client->fd, "OK");
+            client->closing = TRUE;
+            return;
+        }
+        if (view->closing || view->fd < 0) {
+            g_free(layer);
+            control_error(client, "source view is not live");
+            return;
+        }
+        if (!kitty_socket_is_valid(view->kitty_socket) ||
+            !kitty_window_id_is_valid(view->kitty_window)) {
+            g_free(layer);
+            control_error(client, "source view has an invalid Kitty identity");
+            return;
+        }
+
+        for (guint i = 0; i < server->clients->len; i++) {
+            Client *candidate = g_ptr_array_index(server->clients, i);
+
+            if (candidate->kind != CLIENT_VIEW || candidate->closing ||
+                candidate->fd < 0 ||
+                g_strcmp0(candidate->layer, layer) != 0) {
+                continue;
+            }
+            found_live_view = TRUE;
+            if (!kitty_socket_is_valid(candidate->kitty_socket) ||
+                !kitty_window_id_is_valid(candidate->kitty_window)) {
+                found_invalid_identity = TRUE;
+                continue;
+            }
+            if (g_strcmp0(candidate->kitty_socket, view->kitty_socket) != 0) {
+                found_other_kitty = TRUE;
+                continue;
+            }
+            target = candidate;
+            break;
+        }
+
+        if (!target) {
+            g_free(layer);
+            if (!found_live_view) {
+                control_error(client, "target layer has no live Kitty view");
+            } else if (found_other_kitty && !found_invalid_identity) {
+                control_error(client,
+                              "target layer belongs to a different Kitty instance");
+            } else if (found_invalid_identity && !found_other_kitty) {
+                control_error(client,
+                              "target layer has no valid Kitty window");
+            } else {
+                control_error(client,
+                              "target layer has no safe compatible Kitty view");
+            }
+            return;
+        }
+
+        if (!kitty_move_view(view, target, &spawn_failed)) {
+            g_free(layer);
+            control_error(client,
+                          spawn_failed
+                              ? "failed to execute Kitty layer move"
+                              : "Kitty rejected layer move");
+            return;
+        }
+
         replace_string(&view->layer, layer);
         update_persisted_view(server, view);
         broadcast_view(server, view, "UPSERT");
