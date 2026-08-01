@@ -1,41 +1,127 @@
 # Installing Mux v0.1
 
-Mux v0.1 is a personal Linux preview. A usable installation needs Kitty 0.45 or
-newer and WPE WebKit built with WPEPlatform, with both pkg-config modules at
+Mux v0.1 is a personal Linux preview. A usable installation needs Kitty 0.45
+or newer and WPE WebKit built with WPEPlatform, with both pkg-config modules at
 2.52.5 or newer. Versions before 2.52.5 are affected by the official
 [WSA-2026-0004 advisory](https://www.webkitgtk.org/security/WSA-2026-0004.html).
 WPE WebKit 2.52.5 is the corresponding
 [stable release](https://wpewebkit.org/release/wpewebkit-2.52.5.html).
 
-## Release-qualified path: Arch family
+## Release-qualified path: x86_64 Arch Linux
 
-From the repository root:
+Run setup from the repository root as the ordinary user who will own the
+installation:
 
 ```sh
 ./setup
 ```
 
-`setup` runs `pacman -Syu --needed` interactively, checks the environment,
-creates an incremental release build outside the checkout, and launches the
-real WPE implementation in Kitty. Review the package transaction before
-accepting it: `pacman -Syu` is a full system upgrade and may update the kernel
-or packages unrelated to Mux. The build portion is safe to resume after an
-interruption.
+The script performs these steps:
 
-Open an initial page or stop after dependency checks with:
+1. It elevates only `pacman -Syu --needed` using `sudo`, `doas`, or `su`.
+2. It returns to the invoking user and runs `doctor`.
+3. It creates a release build below the user's XDG cache.
+4. It installs a relocatable prefix below `~/.local` by default.
+5. It launches the newly installed `mux` unless `--no-launch` was requested.
+
+Do not run `sudo ./setup`. Setup rejects root so compilation, Meson
+installation, profile creation, and Mux runtime processes cannot accidentally
+become root-owned. Review the package transaction before accepting it:
+`pacman -Syu` is a full system upgrade and may update the kernel or unrelated
+packages.
+
+Useful setup forms are:
 
 ```sh
 ./setup https://example.com
+./setup --no-launch
 ./setup --deps-only
+./setup --prefix "$HOME/.local/opt/mux" --no-launch
+./setup --development https://example.com
 ```
 
-The automatic Arch package set includes the compiler toolchain, GLib, Kitty,
-Meson, Ninja, WPE WebKit, common GStreamer codecs, and Noto fonts.
+`--deps-only` stops after dependency reconciliation and diagnostics.
+`--development` launches directly from the checkout and does not install.
+`--skip-packages` is available when dependencies were supplied manually.
 
-## Other Linux distributions
+## Installed layout
+
+For a prefix `PREFIX`, Meson installs:
+
+| Path | Contents |
+| --- | --- |
+| `PREFIX/bin/mux` | Relocatable launcher |
+| `PREFIX/libexec/mux/muxd` | Control daemon |
+| `PREFIX/libexec/mux/muxctl` | Control client |
+| `PREFIX/libexec/mux/mux-bar` | Global bar |
+| `PREFIX/libexec/mux/mux-layer` | Layer launcher |
+| `PREFIX/libexec/mux/mux-engine` | Shared WPE engine |
+| `PREFIX/libexec/mux/mux-pane` | Kitty pane process |
+| `PREFIX/share/mux/kitty/kitty.conf` | Shared Kitty appearance |
+| `PREFIX/share/mux/kitty/wpe.conf` | WPE pane bindings and control ACL |
+
+The launcher resolves symlinks and derives `PREFIX` from its own physical
+location. It prepends `PREFIX/libexec/mux` to `PATH` because the runtime
+processes intentionally spawn each other by name. No installed file contains a
+checkout or build-cache path.
+
+With the default prefix, ensure `$HOME/.local/bin` is on `PATH`. A dedicated
+prefix can itself be moved:
+
+```sh
+./setup --prefix "$HOME/.local/opt/mux" --no-launch
+mv "$HOME/.local/opt/mux" "$HOME/Applications/mux"
+"$HOME/Applications/mux/bin/mux" --print-install-paths
+```
+
+Moving or deleting the source checkout does not affect either default or
+custom-prefix installations.
+
+## Reinstall and uninstall
+
+Re-running setup with the same prefix is idempotent: Meson rebuilds changed
+sources and replaces the same nine installed files. Profiles and runtime state
+are not part of the program prefix.
+
+Remove only Mux program files with:
+
+```sh
+mux --uninstall
+```
+
+For a custom prefix, invoke that prefix's launcher:
+
+```sh
+"$HOME/Applications/mux/bin/mux" --uninstall
+```
+
+Uninstall removes the launcher, six runtime programs, and two Kitty configs.
+It removes only now-empty Mux-owned subdirectories. It does not remove XDG
+profile data, caches, source builds, or packages installed by pacman.
+`./setup --uninstall --prefix /absolute/path` is an equivalent convenience
+while the checkout remains available.
+
+## Arch Linux ARM
+
+Arch Linux ARM is not included in the automatic Arch recipe. Its official
+repositories do not provide `wpewebkit`, so `pacman` cannot satisfy Mux's
+required `wpe-webkit-2.0` and `wpe-platform-2.0` modules.
+
+If those modules are supplied from a separately maintained source, an ARM user
+can request only environment checking and installation with:
+
+```sh
+./setup --skip-packages --no-launch
+```
+
+That is an unqualified source path. The flake evaluates for `aarch64-linux` and
+can become the preferred ARM path after its full custom WPE build and runtime
+are qualified; evaluation alone is not that qualification.
+
+## Other Linux source installations
 
 There is no maintained automatic apt or dnf recipe. Install these requirements
-using your distribution, a custom prefix, or a containerized development
+using the distribution, a custom prefix, or a containerized development
 environment:
 
 - A C17 compiler
@@ -54,75 +140,88 @@ pkg-config --atleast-version=2.52.5 wpe-platform-2.0
 ./doctor
 ```
 
-If `doctor` passes, build and launch with:
+Then choose the conventional install or checkout development path:
 
 ```sh
-./mux https://example.com
-```
+./setup --skip-packages --no-launch
+"$HOME/.local/bin/mux" https://example.com
 
-Non-Arch source installations are useful for development, but they are not a
-release-qualified v0.1 path.
-
-## Nix flake
-
-The lock file pins the flake inputs, and the flake has passed evaluation checks
-for `x86_64-linux` and `aarch64-linux`. The default app is intended to build the
-custom WPE derivation and Mux runtime, then launch them in Kitty:
-
-```sh
-nix run . -- https://example.com
-```
-
-This path is not release-qualified. A complete custom WPE build has not
-finished locally or in CI. Its evaluated closure requires roughly 1.5 GiB of
-downloads and 6.1 GiB unpacked, so successful evaluation is not evidence of a
-successful build.
-
-Build only the runtime package or enter the development shell with:
-
-```sh
-nix build .#runtime
-nix develop
-```
-
-The Nix app includes common GStreamer plugin sets in the runtime environment.
-It does not make Mux portable to macOS: the implementation and flake outputs
-remain Linux-only.
-
-## Normal source launches
-
-After dependencies are ready, use:
-
-```sh
-./mux
 ./mux https://example.com
 ./mux ctl status
 ```
 
-The launcher configures a release build under the XDG cache directory, compiles
-only changed files, ensures the control daemon is running, and opens a dedicated
-Kitty instance. It does not install files globally or write build products into
-the checkout.
+`./mux` is intentionally checkout-bound: it uses source configs and stores a
+build under
+`$XDG_CACHE_HOME/mux/checkouts/<checkout-sha256>/wpe-kitty`. The installed
+launcher is intentionally checkout-independent.
+
+## Package staging with DESTDIR
+
+`DESTDIR` is honored without being compiled into the launcher and implies
+`--no-launch`. For example:
+
+```sh
+stage="$(mktemp -d)"
+DESTDIR="$stage" ./setup --skip-packages --prefix=/usr --no-launch
+find "$stage/usr" -type f
+```
+
+After packaging moves `$stage/usr` to `/usr`, the launcher resolves `/usr`.
+The focused portable test stages the same layout with stub runtime programs,
+moves the prefix, resolves through a symlink, exercises `mux ctl status`
+without a GUI, repeats the install, and checks bounded uninstall:
+
+```sh
+scripts/test-user-install.sh
+```
+
+## Nix flake
+
+The lock file pins the flake inputs, and the flake has passed evaluation checks
+for `x86_64-linux` and `aarch64-linux`. Stock Nix does not enable the modern
+command and flake interfaces by default. Enable both experimental features for
+each invocation:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' run . -- https://example.com
+nix --extra-experimental-features 'nix-command flakes' build .#runtime
+nix --extra-experimental-features 'nix-command flakes' develop
+```
+
+Alternatively, enable `nix-command flakes` in the user's `nix.conf` and use
+the shorter commands.
+
+The Nix path is not release-qualified. A complete custom WPE build has not
+finished locally or in CI. Its evaluated closure requires roughly 1.5 GiB of
+downloads and 6.1 GiB unpacked, so successful evaluation is not evidence of a
+successful build. The Nix app includes common GStreamer plugin sets and remains
+Linux-only.
+
+## Keyboard terminology
+
+`Super` is canonical in the installed Kitty config. Kitty names this modifier
+`super`; in a macOS-hosted Kitty session it is the Command key, not Ctrl.
+`Ctrl` bindings are explicit Linux compatibility aliases. This terminology
+does not claim that the local WPE runtime runs on macOS.
 
 ## Full-stack runtime smoke
 
 The release gate needs Weston, Mesa's software stack, Python 3, D-Bus, and
-procps in addition to the normal Mux dependencies. On Arch Linux:
+procps in addition to the normal Mux dependencies. On x86_64 Arch Linux:
 
 ```sh
 sudo pacman -Syu --needed weston mesa dbus python procps-ng
 ```
 
-Build through the normal launcher, then run the smoke as your ordinary desktop
-user:
+Build through checkout development mode, then run the smoke as the ordinary
+desktop user:
 
 ```sh
 ./mux ctl status
 ./runtime-smoke
 ```
 
-`runtime-smoke` computes the exact
-`$XDG_CACHE_HOME/mux/checkouts/<checkout-sha256>/wpe-kitty` directory used by
+`runtime-smoke` computes the exact checkout-specific build directory used by
 `./mux`. A separately built tree can be selected explicitly:
 
 ```sh
@@ -131,60 +230,50 @@ MUX_BIN_DIR="$PWD/build/runtime-smoke" ./runtime-smoke
 
 The command owns a 120-second default timeout and bounded cleanup. It creates
 0700 XDG, profile, cache, and runtime directories; uses an ephemeral profile;
-starts a D-Bus session when the caller has none; and runs Weston headless with
-Pixman. Loopback HTTP pages are used instead of `data:` URIs because Mux rejects
-that scheme.
+starts a D-Bus session when needed; and runs Weston headless with Pixman.
+Loopback HTTP pages are used instead of `data:` URIs because Mux rejects that
+scheme.
 
 The gate starts foreground muxd and mux-engine processes followed by a real
-Kitty -> mux-layer -> mux-pane and mux-bar stack. It proves JavaScript page load
-through title metadata in `muxctl list`, process presence, physical focus and
-layer changes, targeted navigation to a second fixture, and graceful `Super+Q`
-for both panes. Kitty commands use encrypted blank-password remote control with
-the `KITTY_PUBLIC_KEY` read from the pane environment. Only the temporary Kitty
-config copy gains `send-key` and `get-text`, which are used for the close path
-and failure diagnostics.
+Kitty -> mux-layer -> mux-pane and mux-bar stack. It proves JavaScript execution
+through title metadata, process topology, physical focus and layer changes,
+global URL entry through encrypted `Super+L` plus Kitty `send-text`, targeted
+navigation, and `Super+Q` closure. Its opt-in smoke telemetry stores only
+frame/view identifiers and content hashes, then requires positive Kitty
+graphics acknowledgements for delivered page frames. Production launches do
+not write this telemetry, and the production remote-control ACL is unchanged.
 
-This is not a pixel oracle. Mux does not expose Kitty's graphics `FRAME_ACK`, so
-the gate cannot prove that Kitty displayed a frame. It also does not cover a
-real GPU, live sites, media, desktop keyboard conflicts, endurance, or resource
-budgets.
+The acknowledgement proves that an immutable frame reached Kitty and its
+load/place request was accepted. It does not prove physical monitor scanout or
+qualify a real GPU, live sites, media, desktop keyboard conflicts, or endurance.
 
-Do not use `sudo ./runtime-smoke`. Normal Linux use must be non-root. The GitHub
-job is the sole root path: its disposable Arch container is privileged and uses
-the host user namespace so WebKit's nested bubblewrap sandbox remains enabled,
-and it opts in with both `CI=true` and `MUX_SMOKE_ALLOW_ROOT_CI=1`.
+Do not use `sudo ./runtime-smoke`. Normal Linux use must be non-root. The CI
+root path is limited to its explicit disposable privileged container opt-in.
 
-## Diagnostics
+## Resource qualification
 
-Run:
+Run the companion gate against the same checkout build with:
 
 ```sh
-./doctor
+./resource-smoke
 ```
 
-The doctor is read-only. Hard failures include the exact missing command or
+It exercises an active multi-pane phase, an idle phase, a hidden-pane phase,
+and bounded shutdown. It enforces architecture-specific active CPU limits plus
+idle CPU, RSS/PSS, process-count, named `/dev/shm`, hidden frame-suspension, and
+cleanup-latency limits. JSON and TSV artifacts make each measurement auditable.
+See [Resource qualification](resource-qualification.md) for the exact budgets,
+environment overrides, and methodology.
+
+## Diagnostics and packaging boundary
+
+`./doctor` is read-only. Hard failures include the exact missing command or
 pkg-config module and a repair hint. A missing Wayland/X11 display is only a
-warning so the same check can run in headless CI; starting Kitty still requires
-a graphical session. In containers, provide a writable `/dev/shm` with enough
-space for raw frames.
+warning so checks can run headlessly. In containers, provide a writable
+`/dev/shm` with enough space for raw frames.
 
-## Packaging boundary
-
-Meson installs the six runtime executables. The Nix derivation still copies
-them explicitly so its app wrapper can provide Kitty configuration and media
-plugin paths without a global install. A conventional distribution package
-must additionally install an appropriate launcher and both Kitty configuration
-files.
-
-## CI boundary
-
-The Linux workflow retains its Arch warning-free build and fatal-GLib native
-test job. A separate `Runtime smoke` job builds again in a privileged Arch
-container with host user namespaces and 2 GiB of shared memory, then runs
-`./runtime-smoke`. The outer privilege is required for nested WebKit bubblewrap;
-the gate refuses the environment variable that disables WebKit sandboxing.
-
-CI now launches real Weston, Kitty, WPE, and every Mux runtime process against
-loopback fixtures. It still does not build the flake's custom WPE derivation,
-observe a Kitty pixel acknowledgement, use a physical display/GPU, or prove
-compatibility with live websites.
+Meson owns all conventional program installation: six native runtime
+executables, the launcher, and both Kitty configs. The launcher assumes the
+standard relative `bin`, `libexec`, and `share` layout selected by `setup`.
+Distribution packages can select another absolute prefix while preserving
+those relative directories.

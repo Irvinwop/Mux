@@ -15,6 +15,11 @@ for command in id kitty kitten meson ninja pkg-config sha256sum stat; do
     fi
 done
 
+if [ "$(id -u)" -eq 0 ]; then
+    printf '%s\n' "Run ./mux as an ordinary user, not root." >&2
+    exit 1
+fi
+
 require_kitty_045() {
     if ! kitty_version_output=$(LC_ALL=C kitty --version 2>/dev/null); then
         printf '%s\n' "Mux requires Kitty 0.45 or newer, but kitty --version failed." >&2
@@ -31,14 +36,7 @@ require_kitty_045() {
     esac
     kitty_version=${kitty_version%% *}
     case $kitty_version in
-        ''|*[!0-9.]*|.*|*.|*..*)
-            printf '%s\n' "Mux could not parse Kitty's version output: $kitty_version_output" >&2
-            printf '%s\n' "Install Kitty 0.45 or newer." >&2
-            exit 1
-            ;;
-    esac
-    case $kitty_version in
-        *.*.*.*)
+        ''|*[!0-9.]*|.*|*.|*..*|*.*.*.*)
             printf '%s\n' "Mux could not parse Kitty's version output: $kitty_version_output" >&2
             printf '%s\n' "Install Kitty 0.45 or newer." >&2
             exit 1
@@ -86,115 +84,16 @@ build_dir=$cache_root/mux/checkouts/$repo_key/wpe-kitty
 
 if [ ! -f "$build_dir/build.ninja" ]; then
     mkdir -p "$build_dir"
-    meson setup \
-        --buildtype=release \
-        "$build_dir" \
-        "$repo_root/spikes/wpe-kitty"
+    meson setup --buildtype=release "$build_dir" "$repo_root/spikes/wpe-kitty"
 fi
 
 meson compile -C "$build_dir"
 
-PATH=$build_dir:$PATH
-export PATH
+MUX_LAUNCH_MODE=development
+MUX_DEVELOPMENT_ROOT=$repo_root
+MUX_DEVELOPMENT_BIN_DIR=$build_dir
+MUX_DEVELOPMENT_CONFIG=$repo_root/kitty/wpe.conf
+export MUX_LAUNCH_MODE MUX_DEVELOPMENT_ROOT
+export MUX_DEVELOPMENT_BIN_DIR MUX_DEVELOPMENT_CONFIG
 
-if [ "$#" -gt 0 ] && [ "$1" = "ctl" ]; then
-    "$build_dir/muxd" --ensure
-    shift
-    exec "$build_dir/muxctl" "$@"
-fi
-
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
-    printf '%s\n' "Mux needs a Wayland or X11 graphical session to launch Kitty." >&2
-    printf '%s\n' "Use './mux ctl ...' for headless control commands." >&2
-    exit 1
-fi
-
-MUX_LAYER=main
-MUX_GLOBAL_BAR=1
-uid=$(id -u)
-if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-    runtime_parent=$XDG_RUNTIME_DIR
-    case $runtime_parent in
-        /*) ;;
-        *)
-            printf '%s\n' "XDG_RUNTIME_DIR must be an absolute path." >&2
-            exit 1
-            ;;
-    esac
-    if [ -L "$runtime_parent" ]; then
-        printf '%s\n' "XDG_RUNTIME_DIR must not be a symlink: $runtime_parent" >&2
-        exit 1
-    fi
-    if [ ! -e "$runtime_parent" ]; then
-        printf '%s\n' "XDG_RUNTIME_DIR does not exist: $runtime_parent" >&2
-        exit 1
-    fi
-    if [ ! -d "$runtime_parent" ]; then
-        printf '%s\n' "XDG_RUNTIME_DIR is not a directory: $runtime_parent" >&2
-        exit 1
-    fi
-    if ! runtime_uid=$(stat -c %u -- "$runtime_parent" 2>/dev/null); then
-        printf '%s\n' "Mux could not inspect XDG_RUNTIME_DIR ownership: $runtime_parent" >&2
-        exit 1
-    fi
-    if [ "$runtime_uid" != "$uid" ]; then
-        printf '%s\n' "XDG_RUNTIME_DIR must be owned by uid $uid: $runtime_parent" >&2
-        exit 1
-    fi
-    if ! runtime_mode=$(stat -c %a -- "$runtime_parent" 2>/dev/null); then
-        printf '%s\n' "Mux could not inspect XDG_RUNTIME_DIR permissions: $runtime_parent" >&2
-        exit 1
-    fi
-    case $runtime_mode in
-        ''|*[!0-7]*)
-            printf '%s\n' "Mux could not parse XDG_RUNTIME_DIR mode '$runtime_mode': $runtime_parent" >&2
-            exit 1
-            ;;
-    esac
-    if [ $((0$runtime_mode & 077)) -ne 0 ]; then
-        printf '%s\n' "XDG_RUNTIME_DIR must have no group or other permission bits: $runtime_parent (mode $runtime_mode)" >&2
-        exit 1
-    fi
-    if [ ! -w "$runtime_parent" ] || [ ! -x "$runtime_parent" ]; then
-        printf '%s\n' "XDG_RUNTIME_DIR must be writable and searchable by uid $uid: $runtime_parent" >&2
-        exit 1
-    fi
-    kitty_runtime=$runtime_parent/mux
-else
-    kitty_runtime=/tmp/mux-$uid
-fi
-
-umask 077
-if [ -L "$kitty_runtime" ]; then
-    printf '%s\n' "Refusing symlinked runtime directory: $kitty_runtime" >&2
-    exit 1
-fi
-mkdir -p -- "$kitty_runtime"
-if [ ! -d "$kitty_runtime" ] || [ -L "$kitty_runtime" ] ||
-   [ "$(stat -c %u -- "$kitty_runtime")" != "$uid" ]; then
-    printf '%s\n' "Mux runtime directory is not owned by the current user." >&2
-    exit 1
-fi
-chmod 700 -- "$kitty_runtime"
-
-kitty_socket=$kitty_runtime/kitty-$$.sock
-if [ "${#kitty_socket}" -ge 100 ]; then
-    printf '%s\n' "Kitty control socket path is too long: $kitty_socket" >&2
-    exit 1
-fi
-rm -f -- "$kitty_socket"
-KITTY_LISTEN_ON=unix:$kitty_socket
-export MUX_LAYER MUX_GLOBAL_BAR KITTY_LISTEN_ON
-
-"$build_dir/muxd" --ensure
-
-cleanup_kitty_socket() {
-    rm -f -- "$kitty_socket"
-}
-trap cleanup_kitty_socket EXIT
-
-kitty \
-    --config "$repo_root/kitty/wpe.conf" \
-    --listen-on "$KITTY_LISTEN_ON" \
-    --title Mux \
-    "$build_dir/mux-layer" "$@"
+exec "$repo_root/spikes/wpe-kitty/packaging/mux" "$@"

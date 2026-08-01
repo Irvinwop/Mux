@@ -17,6 +17,8 @@ cc = meson.get_compiler('c')
 glib_dep = dependency('glib-2.0', version: '>=2.74')
 gio_dep = dependency('gio-2.0', version: '>=2.74')
 
+mux_runtime_install_dir = get_option('libexecdir') / 'mux'
+
 view_deps = [
   glib_dep,
   dependency('wpe-webkit-2.0', version: '>=2.52.5'),
@@ -63,6 +65,7 @@ muxd_executable = executable(
   ],
   dependencies: [glib_dep, gio_dep],
   install: true,
+  install_dir: mux_runtime_install_dir,
 )
 
 muxctl_executable = executable(
@@ -73,6 +76,7 @@ muxctl_executable = executable(
   ],
   dependencies: [glib_dep],
   install: true,
+  install_dir: mux_runtime_install_dir,
 )
 
 executable(
@@ -84,6 +88,7 @@ executable(
   ],
   dependencies: [glib_dep],
   install: true,
+  install_dir: mux_runtime_install_dir,
 )
 
 executable(
@@ -91,6 +96,7 @@ executable(
   'src/mux-layer.c',
   dependencies: [glib_dep],
   install: true,
+  install_dir: mux_runtime_install_dir,
 )
 
 engine_dependencies = [
@@ -125,6 +131,7 @@ executable(
   ],
   dependencies: engine_dependencies,
   install: true,
+  install_dir: mux_runtime_install_dir,
 )
 
 pane_dependencies = [
@@ -167,6 +174,7 @@ executable(
   ],
   dependencies: pane_dependencies,
   install: true,
+  install_dir: mux_runtime_install_dir,
 )
 clipboard_history_test = executable(
   'test-clipboard-history',
@@ -338,4 +346,18 @@ test(
   'file-chooser-engine',
   file_chooser_engine_test,
   timeout: 20,
+)
+
+configure_file(
+  input: 'packaging/mux',
+  output: 'mux',
+  copy: true,
+  install: true,
+  install_dir: get_option('bindir'),
+  install_mode: 'rwxr-xr-x',
+)
+
+install_subdir(
+  'packaging/kitty',
+  install_dir: get_option('datadir') / 'mux',
 )

@@ -22,7 +22,7 @@ browser.
 
 ## Requirements
 
-- Linux on x86-64 or ARM64
+- Linux on x86-64, or ARM64 with WPE supplied outside Arch Linux ARM
 - A Wayland or X11 desktop session
 - Kitty 0.45 or newer, including `kitten`
 - A C17 compiler, Meson, Ninja, and pkg-config
@@ -36,56 +36,89 @@ The decisive dependency check is that pkg-config can find both
 [WSA-2026-0004](https://www.webkitgtk.org/security/WSA-2026-0004.html); see the
 official [WPE WebKit 2.52.5 release](https://wpewebkit.org/release/wpewebkit-2.52.5.html).
 
-## Release-qualified start path
+## Release-qualified user install
 
-On Arch Linux or Arch Linux ARM, `setup` is the release-qualified installation
-and launch path. It reconciles the required packages, runs the environment
-doctor, builds the WPE implementation incrementally, and opens its dedicated
-Kitty window:
+The release-qualified v0.1 path is an ordinary-user installation on x86_64
+Arch Linux:
 
 ```sh
 ./setup
 ./setup https://example.com
 ```
 
-The package step runs `pacman -Syu` interactively. Review the transaction before
-accepting it: this is a full system upgrade and may update the kernel or other
-packages unrelated to Mux.
+`setup` elevates only the interactive `pacman -Syu --needed` transaction. It
+then returns to the invoking user, runs the environment doctor, builds in the
+user's XDG cache, and installs below `~/.local` by default. It rejects running
+the script itself as root.
 
-On other distributions, install the requirements yourself and launch with
-`./mux`. Those source installations are supported for development but are not a
-release-qualified v0.1 path. Mux does not guess package names for unmaintained
-distribution recipes.
+The installed layout is:
 
-The flake is pinned and evaluation-checked for `x86_64-linux` and
-`aarch64-linux`:
+- `~/.local/bin/mux`: relocatable launcher
+- `~/.local/libexec/mux`: `muxd`, `muxctl`, `mux-bar`, `mux-layer`,
+  `mux-engine`, and `mux-pane`
+- `~/.local/share/mux/kitty`: `kitty.conf` and `wpe.conf`
+
+The launcher resolves its prefix from its own path. It does not refer to the
+checkout or build cache, so the checkout can be renamed or removed after
+installation. Re-running `./setup` safely updates the same paths. Use
+`./setup --no-launch` for an install-only run, `--prefix /absolute/path` for a
+different movable prefix, and `mux --uninstall` for a bounded removal that
+leaves profiles, caches, build trees, and system packages untouched.
+
+The package step is a full system upgrade and may update the kernel or
+unrelated packages. Review the transaction before accepting it.
+
+Official Arch Linux ARM repositories do not provide `wpewebkit`. Therefore
+Arch Linux ARM is not part of the automatic or release-qualified Arch path.
+The flake evaluates for `aarch64-linux` and can remain the prospective ARM path
+once its full custom WPE build is qualified; it is not qualified today.
+
+## Checkout development mode
+
+The checkout launcher remains explicit and incremental:
 
 ```sh
-nix run . -- https://example.com
+./mux
+./mux https://example.com
+./mux ctl status
+./setup --development https://example.com
+```
+
+It builds below
+`$XDG_CACHE_HOME/mux/checkouts/<checkout-sha256>/wpe-kitty` and deliberately
+uses the Kitty configs from the checkout. This is the development path, not
+the installed-user path.
+
+On other Linux distributions, install the requirements yourself and use
+`./setup --skip-packages --no-launch` for the conventional user install, or
+`./mux` for development. Those source environments are not release-qualified
+v0.1 package recipes.
+
+## Nix path
+
+The flake is pinned and evaluation-checked for `x86_64-linux` and
+`aarch64-linux`. Stock Nix requires the `nix-command` and `flakes`
+experimental features; enable them for the invocation with:
+
+```sh
+nix --extra-experimental-features 'nix-command flakes' run . -- https://example.com
 ```
 
 This Nix path is not release-qualified. A complete build of its custom WPE
 derivation has not finished locally or in CI; the evaluated build requires
 roughly 1.5 GiB of downloads and 6.1 GiB unpacked.
 
-After source dependencies are installed, normal starts use the incremental
-launcher:
-
-```sh
-./mux
-./mux https://example.com
-./mux ctl status
-```
-
-Run `./doctor` for a read-only, actionable dependency report. See
-[Installation](docs/install.md) for package and Nix details.
+Run `./doctor` for a read-only dependency report. See
+[Installation](docs/install.md) for prefix, staging, uninstall, Arch Linux ARM,
+and Nix details.
 
 ## Headless full-stack runtime gate
 
-After the normal source build has produced the six executables, run the gate
-as an ordinary user on Linux:
+After the source build has produced the six executables, run the gate as an
+ordinary user on Linux:
 
 ```sh
+./mux ctl status
 ./runtime-smoke
 ```
 
@@ -101,16 +134,24 @@ when needed, and uses Weston headless with its Pixman renderer. It serves only
 loopback HTTP fixtures because Mux intentionally rejects `data:` navigation.
 Through a real Kitty process it proves JavaScript title execution, the
 Kitty-to-pane process topology, muxd and engine connectivity, muxctl focus,
-physical layer switching, targeted navigation, and encrypted blank-password
-`Super+Q` closure. The temporary Kitty copy adds only `send-key` and `get-text`;
-the production ACL is unchanged.
+physical layer switching, global URL entry through encrypted `Super+L` plus
+Kitty `send-text`, targeted navigation, and `Super+Q` closure. Test-only,
+hash-based frame telemetry requires a positive Kitty graphics response for
+delivered page frames; production mode writes no such telemetry and retains
+the narrower production ACL.
 
-The gate does not expose Kitty's graphics `FRAME_ACK`, so it does not prove
-that a pixel reached Kitty. It also does not qualify real GPU rendering, live
-websites, media, desktop input conflicts, or long-running resource behavior.
+The acknowledgement proves that Mux sent an immutable frame and Kitty accepted
+its load/place request. It does not prove physical monitor scanout, a real GPU,
+live-site compatibility, media behavior, or desktop shortcut compatibility.
 Weston, Python 3, D-Bus, and `pgrep` from procps are additional smoke-only
 dependencies. Root execution is rejected except for the explicit privileged
 container path used by CI.
+
+Run `./resource-smoke` for the companion bounded-resource gate. It records
+active and idle CPU, RSS/PSS, process count, named shared-memory use, hidden-pane
+frame suspension, and cleanup latency. See
+[Resource qualification](docs/resource-qualification.md) for the budgets and
+artifact format.
 
 ## Current implementation
 
@@ -127,16 +168,14 @@ The v0.1 code currently wires these paths:
   downloads, menus, popups, notifications, and renderer crashes.
 
 These are implemented code paths, not a claim that every site or interaction
-has passed interactive testing. Clipboard snapshots can retain related text,
-image, and binary MIME variants, but Mux can only record clipboard traffic it
-actually observes.
+has passed interactive testing.
 
 ## Intended controls
 
-`Super` (`Command` on an Apple keyboard mapped into Linux) is canonical for
-Mux-owned shortcuts. Conventional `Ctrl` equivalents are retained as explicit
-Linux compatibility aliases. This does not make Mux portable to macOS; the WPE
-runtime remains Linux-only.
+`Super` is canonical for Mux-owned shortcuts. Kitty calls the modifier
+`super`; in a macOS-hosted Kitty session this is the Command key, not Ctrl.
+The `Ctrl` mappings are explicit Linux compatibility aliases. This naming does
+not make the WPE runtime portable to macOS.
 
 | Key | Action |
 | --- | --- |
@@ -149,9 +188,6 @@ runtime remains Linux-only.
 | `Super+Shift+Enter` (`Ctrl+Shift+Enter` Linux alias) | Open another browser split. |
 | `Super+Shift+T` (`Ctrl+Shift+T` Linux alias) | Open another browser layer/tab. |
 | `Super+Q` (`Ctrl+Q` Linux alias) | Ask the page to close; press again to force it. |
-
-These bindings still need a full conflict and behavior pass against stock and
-user-customized Kitty configurations.
 
 ## Process model
 
@@ -171,17 +207,13 @@ Browser content does not execute inside `muxd`.
 ## Known v0.1 limitations
 
 - Linux and Kitty are mandatory; macOS and other terminal emulators are not
-  supported.
-- Automatic dependency installation is maintained only for Arch-family
-  systems.
+  supported runtime targets.
+- Automatic dependency installation is maintained only for x86_64 Arch Linux.
+- Arch Linux ARM lacks an official `wpewebkit` package.
 - Workspace URL and layer metadata is persisted for recovery, but offline panes
   and Kitty layouts are not relaunched automatically.
 - In-flight trusted UI requests are cancelled when an engine crashes.
 - One dedicated Kitty OS window is supported; layers are tabs in that window.
-- A physical layer move requires a live destination pane in the same Kitty
-  instance; otherwise it fails without changing logical state.
-- The first close request uses WebKit's before-unload flow. A second request
-  while it is pending forces teardown; the two-minute timeout cancels the close.
 - Browser shortcuts and trusted overlays still require interactive coverage.
 - Site compatibility, media codecs, downloads, uploads, permissions, popups,
   notifications, clipboard bridging, and renderer recovery are not yet
@@ -189,11 +221,11 @@ Browser content does not execute inside `muxd`.
 
 ## Runtime storage
 
-The source launcher keeps each checkout's release build under
-`$XDG_CACHE_HOME/mux/checkouts/<checkout-sha256>/wpe-kitty` and recompiles only
-changed sources. Profile data follows XDG data and cache directories.
-Authenticated local sockets use `$XDG_RUNTIME_DIR`; when it is absent, Mux
-uses an owner-only fallback below `/tmp`.
+Installed program files live entirely under the selected prefix and can move
+with it. Profile state follows XDG data and cache directories. Authenticated
+local sockets use `$XDG_RUNTIME_DIR`; when it is absent, Mux uses an owner-only
+fallback below `/tmp`. Checkout development builds remain in the
+checkout-keyed XDG cache path described above.
 
 See [Running the WPE implementation](docs/running-wpe.md) for the runtime
 boundary and [Architecture](docs/architecture.md) for design rationale.
