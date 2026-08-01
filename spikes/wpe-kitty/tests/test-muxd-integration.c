@@ -98,6 +98,74 @@ static gboolean wait_child_success(pid_t pid,
     return FALSE;
 }
 
+static gboolean reap_child_signal_now(pid_t pid,
+                                      int expected_signal,
+                                      GError **error)
+{
+    int status = 0;
+    pid_t result;
+
+    do {
+        result = waitpid(pid, &status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    G_IO_ERROR_BUSY,
+                    "child %ld was still running when stop completed",
+                    (long)pid);
+        return FALSE;
+    }
+    if (result < 0) {
+        set_errno_error(error, "waitpid", errno);
+        return FALSE;
+    }
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != expected_signal) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    G_IO_ERROR_FAILED,
+                    "child %ld terminated unexpectedly (status=%d)",
+                    (long)pid,
+                    status);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean reap_child_exit_now(pid_t pid,
+                                    int expected_status,
+                                    GError **error)
+{
+    int status = 0;
+    pid_t result;
+
+    do {
+        result = waitpid(pid, &status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == 0) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    G_IO_ERROR_BUSY,
+                    "child %ld was still running when stop completed",
+                    (long)pid);
+        return FALSE;
+    }
+    if (result < 0) {
+        set_errno_error(error, "waitpid", errno);
+        return FALSE;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != expected_status) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    G_IO_ERROR_FAILED,
+                    "child %ld exited unexpectedly (status=%d)",
+                    (long)pid,
+                    status);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static void child_redirect_to_null(void)
 {
     int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
@@ -125,6 +193,26 @@ static gboolean run_command(const gchar *executable,
     if (pid == 0) {
         child_redirect_to_null();
         execl(executable, executable, argument, (char *)NULL);
+        _exit(127);
+    }
+    return wait_child_success(pid, timeout_ms, error);
+}
+
+static gboolean run_command_with_extra_argument(const gchar *executable,
+                                                const gchar *argument,
+                                                const gchar *extra,
+                                                guint timeout_ms,
+                                                GError **error)
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        set_errno_error(error, "fork", errno);
+        return FALSE;
+    }
+    if (pid == 0) {
+        child_redirect_to_null();
+        execl(executable, executable, argument, extra, (char *)NULL);
         _exit(127);
     }
     return wait_child_success(pid, timeout_ms, error);
@@ -743,6 +831,199 @@ static gboolean wait_for_path_absent(const gchar *path, guint timeout_ms)
         (void)poll(NULL, 0, MIN(remaining_ms(deadline_us), 10));
     }
     return !g_file_test(path, G_FILE_TEST_EXISTS);
+}
+
+static gboolean pid_is_terminated(pid_t pid)
+{
+    g_autofree gchar *path =
+        g_strdup_printf("/proc/%ld/stat", (long)pid);
+    g_autofree gchar *contents = NULL;
+    gchar *command_end;
+
+    errno = 0;
+    if (kill(pid, 0) < 0)
+        return errno == ESRCH;
+    if (!g_file_get_contents(path, &contents, NULL, NULL))
+        return FALSE;
+
+    command_end = strrchr(contents, ')');
+    return command_end != NULL &&
+        command_end[1] == ' ' &&
+        command_end[2] == 'Z' &&
+        (command_end[3] == ' ' || command_end[3] == '\0');
+}
+
+static gboolean wait_for_pid_terminated(pid_t pid, guint timeout_ms)
+{
+    gint64 deadline_us =
+        g_get_monotonic_time() + ((gint64)timeout_ms * 1000);
+
+    while (remaining_ms(deadline_us) > 0) {
+        if (pid_is_terminated(pid))
+            return TRUE;
+        (void)poll(NULL, 0, MIN(remaining_ms(deadline_us), 10));
+    }
+    return pid_is_terminated(pid);
+}
+
+static gboolean publish_marker(const gchar *path, const gchar *contents)
+{
+    GError *error = NULL;
+    gboolean result = g_file_set_contents(path, contents, -1, &error);
+
+    g_clear_error(&error);
+    return result;
+}
+
+static pid_t spawn_stoppable_view(const gchar *socket_path,
+                                  const gchar *proposed_id,
+                                  const gchar *ready_path,
+                                  GError **error)
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        set_errno_error(error, "fork stoppable view", errno);
+        return -1;
+    }
+    if (pid == 0) {
+        GError *child_error = NULL;
+        gchar *assigned_id = NULL;
+        int fd = connect_unix_socket(socket_path,
+                                     CONNECT_TIMEOUT_MS,
+                                     &child_error);
+
+        if (fd < 0 ||
+            !register_view(fd, proposed_id, &assigned_id, &child_error) ||
+            assigned_id == NULL ||
+            !publish_marker(ready_path, assigned_id))
+            _exit(2);
+        for (;;) {
+            gchar *line = mux_read_line(fd, -1);
+
+            if (line == NULL)
+                _exit(3);
+            if (g_strcmp0(line, "DO\tQUIT\t") == 0) {
+                g_free(line);
+                if (!mux_send_line(fd, "BYE"))
+                    _exit(4);
+                close(fd);
+                g_free(assigned_id);
+                g_clear_error(&child_error);
+                _exit(0);
+            }
+            g_free(line);
+        }
+    }
+    return pid;
+}
+
+static pid_t spawn_transport_breaking_view(const gchar *socket_path,
+                                           const gchar *ready_path,
+                                           const gchar *broken_path,
+                                           GError **error)
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        set_errno_error(error, "fork transport-breaking view", errno);
+        return -1;
+    }
+    if (pid == 0) {
+        GError *child_error = NULL;
+        gchar *assigned_id = NULL;
+        int fd;
+
+        signal(SIGTERM, SIG_IGN);
+        fd = connect_unix_socket(socket_path,
+                                 CONNECT_TIMEOUT_MS,
+                                 &child_error);
+        if (fd < 0 ||
+            !register_view(fd, "", &assigned_id, &child_error) ||
+            assigned_id == NULL ||
+            !publish_marker(ready_path, assigned_id))
+            _exit(2);
+        for (;;) {
+            gchar *line = mux_read_line(fd, -1);
+
+            if (line == NULL)
+                _exit(3);
+            if (g_strcmp0(line, "DO\tQUIT\t") == 0) {
+                g_free(line);
+                close(fd);
+                if (!publish_marker(broken_path, "broken"))
+                    _exit(4);
+                for (;;)
+                    pause();
+            }
+            g_free(line);
+        }
+    }
+    return pid;
+}
+
+static pid_t spawn_stoppable_bar(const gchar *socket_path,
+                                 const gchar *ready_path,
+                                 const gchar *closed_path,
+                                 GError **error)
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        set_errno_error(error, "fork stoppable bar", errno);
+        return -1;
+    }
+    if (pid == 0) {
+        GError *child_error = NULL;
+        int fd = connect_unix_socket(socket_path,
+                                     CONNECT_TIMEOUT_MS,
+                                     &child_error);
+        gchar *id = mux_encode("stop-integration-bar");
+        gchar *window = mux_encode("902");
+        gchar *kitty_socket = mux_encode("integration-kitty");
+        gchar *layer = mux_encode("main");
+        gboolean complete = FALSE;
+
+        if (fd < 0 ||
+            !mux_send_line(fd,
+                           "BAR\t%s\t%ld\t%s\t%s\t%s",
+                           id,
+                           (long)getpid(),
+                           window,
+                           kitty_socket,
+                           layer))
+            _exit(2);
+        g_free(layer);
+        g_free(kitty_socket);
+        g_free(window);
+        g_free(id);
+
+        for (guint i = 0; i < 256; i++) {
+            gchar *line = mux_read_line(fd, RESPONSE_TIMEOUT_MS);
+
+            if (line == NULL)
+                _exit(3);
+            complete = g_strcmp0(line, "END") == 0;
+            g_free(line);
+            if (complete)
+                break;
+        }
+        if (!complete || !publish_marker(ready_path, "ready"))
+            _exit(4);
+        while (TRUE) {
+            gchar *line = mux_read_line(fd, -1);
+
+            if (line == NULL)
+                break;
+            g_free(line);
+        }
+        close(fd);
+        if (!publish_marker(closed_path, "closed"))
+            _exit(5);
+        g_clear_error(&child_error);
+        _exit(0);
+    }
+    return pid;
 }
 
 static pid_t spawn_silent_muxd(const gchar *socket_path,
@@ -1552,6 +1833,288 @@ cleanup:
     g_free(old_runtime);
 }
 
+static void test_muxctl_stop_lifecycle(void)
+{
+    gchar *root = NULL;
+    gchar *runtime_dir = NULL;
+    gchar *state_dir = NULL;
+    gchar *socket_path = NULL;
+    gchar *view_ready_path = NULL;
+    gchar *bar_ready_path = NULL;
+    gchar *bar_closed_path = NULL;
+    gchar *broken_ready_path = NULL;
+    gchar *broken_closed_path = NULL;
+    gchar *reclaim_ready_path = NULL;
+    gchar *view_id = NULL;
+    gchar *reclaimed_id = NULL;
+    gchar *output = NULL;
+    gchar *old_runtime = g_strdup(g_getenv("XDG_RUNTIME_DIR"));
+    gchar *old_state = g_strdup(g_getenv("XDG_STATE_HOME"));
+    gchar *old_ephemeral = g_strdup(g_getenv("MUX_EPHEMERAL"));
+    GError *error = NULL;
+    struct ucred credentials;
+    int guard_fd = -1;
+    int malformed_fd = -1;
+    pid_t daemon_pid = -1;
+    pid_t view_pid = -1;
+    pid_t bar_pid = -1;
+    pid_t broken_pid = -1;
+    pid_t reclaim_pid = -1;
+    mode_t old_umask = umask(0077);
+
+    root = g_dir_make_tmp("muxctl-stop-integration-XXXXXX", &error);
+    REQUIRE_CALL(root != NULL, "create muxctl stop root");
+    runtime_dir = g_build_filename(root, "runtime", NULL);
+    state_dir = g_build_filename(root, "state", NULL);
+    socket_path =
+        g_build_filename(runtime_dir, "mux", "muxd.sock", NULL);
+    view_ready_path = g_build_filename(root, "view-ready", NULL);
+    bar_ready_path = g_build_filename(root, "bar-ready", NULL);
+    bar_closed_path = g_build_filename(root, "bar-closed", NULL);
+    broken_ready_path = g_build_filename(root, "broken-ready", NULL);
+    broken_closed_path = g_build_filename(root, "broken-closed", NULL);
+    reclaim_ready_path = g_build_filename(root, "reclaim-ready", NULL);
+    REQUIRE(g_mkdir(runtime_dir, 0700) == 0,
+            "create runtime directory: %s",
+            g_strerror(errno));
+    REQUIRE(g_mkdir(state_dir, 0700) == 0,
+            "create state directory: %s",
+            g_strerror(errno));
+    REQUIRE(g_setenv("XDG_RUNTIME_DIR", runtime_dir, TRUE),
+            "set XDG_RUNTIME_DIR");
+    REQUIRE(g_setenv("XDG_STATE_HOME", state_dir, TRUE),
+            "set XDG_STATE_HOME");
+    REQUIRE(g_setenv("MUX_EPHEMERAL", "0", TRUE),
+            "set persistent peer identity");
+
+    REQUIRE_CALL(run_command(muxd_executable,
+                             "--ensure",
+                             CHILD_TIMEOUT_MS,
+                             &error),
+                 "start muxd for stop test");
+    guard_fd = connect_unix_socket(socket_path,
+                                   CONNECT_TIMEOUT_MS,
+                                   &error);
+    REQUIRE_CALL(guard_fd >= 0, "connect stop-test guard");
+    REQUIRE_CALL(get_peer_credentials(guard_fd, &credentials, &error),
+                 "identify stop-test muxd");
+    daemon_pid = credentials.pid;
+
+    malformed_fd = connect_unix_socket(socket_path,
+                                       RESPONSE_TIMEOUT_MS,
+                                       &error);
+    REQUIRE_CALL(malformed_fd >= 0, "connect malformed STOP client");
+    REQUIRE(mux_send_line(malformed_fd, "CTL\tSTOP\textra"),
+            "send malformed STOP: %s",
+            g_strerror(errno));
+    {
+        g_autofree gchar *line =
+            mux_read_line(malformed_fd, RESPONSE_TIMEOUT_MS);
+        g_auto(GStrv) fields = line != NULL
+            ? g_strsplit(line, "\t", -1)
+            : NULL;
+        g_autofree gchar *message =
+            fields != NULL && g_strv_length(fields) >= 2
+            ? mux_decode(fields[1])
+            : NULL;
+
+        REQUIRE(g_strcmp0(message, "unknown or malformed command") == 0,
+                "unexpected malformed STOP response: %s",
+                line != NULL ? line : "(none)");
+    }
+    close(malformed_fd);
+    malformed_fd = -1;
+    REQUIRE(!run_command_with_extra_argument(muxctl_executable,
+                                             "stop",
+                                             "extra",
+                                             CHILD_TIMEOUT_MS,
+                                             &error),
+            "muxctl accepted an extra STOP argument");
+    g_clear_error(&error);
+    {
+        guint count = G_MAXUINT;
+
+        REQUIRE_CALL(query_view_count(socket_path, &count, &error),
+                     "query daemon after rejected STOP commands");
+        REQUIRE(count == 0,
+                "rejected STOP command changed view count to %u",
+                count);
+    }
+
+    view_pid = spawn_stoppable_view(socket_path,
+                                    "",
+                                    view_ready_path,
+                                    &error);
+    REQUIRE_CALL(view_pid > 0, "spawn stoppable view");
+    bar_pid = spawn_stoppable_bar(socket_path,
+                                  bar_ready_path,
+                                  bar_closed_path,
+                                  &error);
+    REQUIRE_CALL(bar_pid > 0, "spawn stoppable bar");
+    broken_pid = spawn_transport_breaking_view(socket_path,
+                                               broken_ready_path,
+                                               broken_closed_path,
+                                               &error);
+    REQUIRE_CALL(broken_pid > 0, "spawn transport-breaking view");
+    REQUIRE(wait_for_path(view_ready_path, STATE_TIMEOUT_MS),
+            "stoppable view did not become ready");
+    REQUIRE(wait_for_path(bar_ready_path, STATE_TIMEOUT_MS),
+            "stoppable bar did not become ready");
+    REQUIRE(wait_for_path(broken_ready_path, STATE_TIMEOUT_MS),
+            "transport-breaking view did not become ready");
+    REQUIRE_CALL(g_file_get_contents(view_ready_path,
+                                     &view_id,
+                                     NULL,
+                                     &error),
+                 "read persistent view ID");
+    REQUIRE(persistent_view_id_is_valid(view_id),
+            "stoppable view received invalid ID %s",
+            view_id);
+
+    output = run_command_capture(muxctl_executable,
+                                 "stop",
+                                 7000,
+                                 &error);
+    REQUIRE_CALL(output != NULL, "run muxctl stop");
+    REQUIRE(g_strcmp0(output, "muxd stopped\n") == 0,
+            "unexpected muxctl stop output: %s",
+            output);
+    g_clear_pointer(&output, g_free);
+    REQUIRE_CALL(reap_child_exit_now(view_pid, 0, &error),
+                 "graceful view was alive after successful stop");
+    view_pid = -1;
+    REQUIRE_CALL(reap_child_signal_now(broken_pid, SIGKILL, &error),
+                 "transport-breaking view survived successful stop");
+    broken_pid = -1;
+    close(guard_fd);
+    guard_fd = -1;
+    REQUIRE_CALL(wait_child_success(bar_pid,
+                                    CHILD_TIMEOUT_MS,
+                                    &error),
+                 "reap transport-stopped bar");
+    bar_pid = -1;
+    REQUIRE(wait_for_path(bar_closed_path, STATE_TIMEOUT_MS),
+            "bar did not observe daemon transport closure");
+    REQUIRE(wait_for_path(broken_closed_path, STATE_TIMEOUT_MS),
+            "transport-breaking view did not close its control socket");
+    REQUIRE(wait_for_path_absent(socket_path, STATE_TIMEOUT_MS),
+            "muxctl stop left the daemon socket behind");
+    REQUIRE(wait_for_pid_terminated(daemon_pid, STATE_TIMEOUT_MS),
+            "muxctl stop left muxd pid %ld running",
+            (long)daemon_pid);
+    daemon_pid = -1;
+
+    output = run_command_capture(muxctl_executable,
+                                 "stop",
+                                 CHILD_TIMEOUT_MS,
+                                 &error);
+    REQUIRE_CALL(output != NULL, "repeat muxctl stop while absent");
+    REQUIRE(g_strcmp0(output, "muxd is not running\n") == 0,
+            "unexpected absent stop output: %s",
+            output);
+    g_clear_pointer(&output, g_free);
+
+    REQUIRE_CALL(run_command(muxd_executable,
+                             "--ensure",
+                             CHILD_TIMEOUT_MS,
+                             &error),
+                 "restart muxd after controlled stop");
+    guard_fd = connect_unix_socket(socket_path,
+                                   CONNECT_TIMEOUT_MS,
+                                   &error);
+    REQUIRE_CALL(guard_fd >= 0, "connect replacement muxd");
+    REQUIRE_CALL(get_peer_credentials(guard_fd, &credentials, &error),
+                 "identify replacement muxd");
+    daemon_pid = credentials.pid;
+    reclaim_pid = spawn_stoppable_view(socket_path,
+                                       view_id,
+                                       reclaim_ready_path,
+                                       &error);
+    REQUIRE_CALL(reclaim_pid > 0, "spawn reclaiming view");
+    REQUIRE(wait_for_path(reclaim_ready_path, STATE_TIMEOUT_MS),
+            "reclaiming view did not become ready");
+    REQUIRE_CALL(g_file_get_contents(reclaim_ready_path,
+                                     &reclaimed_id,
+                                     NULL,
+                                     &error),
+                 "read reclaimed persistent view ID");
+    REQUIRE(g_strcmp0(reclaimed_id, view_id) == 0,
+            "controlled stop lost session view %s and returned %s",
+            view_id,
+            reclaimed_id);
+
+    output = run_command_capture(muxctl_executable,
+                                 "stop",
+                                 7000,
+                                 &error);
+    REQUIRE_CALL(output != NULL, "stop replacement muxd");
+    REQUIRE(g_strcmp0(output, "muxd stopped\n") == 0,
+            "unexpected replacement stop output: %s",
+            output);
+    g_clear_pointer(&output, g_free);
+    close(guard_fd);
+    guard_fd = -1;
+    REQUIRE_CALL(wait_child_success(reclaim_pid,
+                                    CHILD_TIMEOUT_MS,
+                                    &error),
+                 "reap reclaiming view");
+    reclaim_pid = -1;
+    REQUIRE(wait_for_pid_terminated(daemon_pid, STATE_TIMEOUT_MS),
+            "replacement muxd pid %ld remained running",
+            (long)daemon_pid);
+    daemon_pid = -1;
+
+cleanup:
+    if (malformed_fd >= 0)
+        close(malformed_fd);
+    if (guard_fd >= 0)
+        close(guard_fd);
+    if (reclaim_pid > 0)
+        reap_forcefully(reclaim_pid);
+    if (broken_pid > 0)
+        reap_forcefully(broken_pid);
+    if (bar_pid > 0)
+        reap_forcefully(bar_pid);
+    if (view_pid > 0)
+        reap_forcefully(view_pid);
+    if (daemon_pid > 1 && socket_path != NULL) {
+        GError *stop_error = NULL;
+
+        if (!stop_identified_daemon(socket_path,
+                                    daemon_pid,
+                                    &stop_error)) {
+            g_test_message("stop muxctl-stop test daemon: %s",
+                           stop_error != NULL
+                               ? stop_error->message
+                               : "unknown error");
+            g_test_fail();
+        }
+        g_clear_error(&stop_error);
+    }
+    g_clear_error(&error);
+    remove_tree(root);
+    restore_environment("XDG_RUNTIME_DIR", old_runtime);
+    restore_environment("XDG_STATE_HOME", old_state);
+    restore_environment("MUX_EPHEMERAL", old_ephemeral);
+    (void)umask(old_umask);
+    g_free(output);
+    g_free(reclaimed_id);
+    g_free(view_id);
+    g_free(reclaim_ready_path);
+    g_free(broken_closed_path);
+    g_free(broken_ready_path);
+    g_free(bar_closed_path);
+    g_free(bar_ready_path);
+    g_free(view_ready_path);
+    g_free(socket_path);
+    g_free(state_dir);
+    g_free(runtime_dir);
+    g_free(root);
+    g_free(old_ephemeral);
+    g_free(old_state);
+    g_free(old_runtime);
+}
+
 static void test_muxd_ensure_timeout_reaps_owned_child(void)
 {
     gchar *root = NULL;
@@ -1692,6 +2255,8 @@ int main(int argc, char **argv)
                     test_muxd_async_move_and_queued_replies);
     g_test_add_func("/muxd/integration/muxctl-complete-response",
                     test_muxctl_requires_complete_response);
+    g_test_add_func("/muxd/integration/muxctl-stop-lifecycle",
+                    test_muxctl_stop_lifecycle);
     g_test_add_func("/muxd/integration/ensure-timeout-reaps-owned-child",
                     test_muxd_ensure_timeout_reaps_owned_child);
     result = g_test_run();

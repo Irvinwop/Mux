@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -48,6 +49,10 @@ typedef struct {
     gchar *title;
     long pid;
     pid_t peer_pid;
+    int peer_pidfd;
+    gboolean stop_term_sent;
+    gboolean stop_kill_sent;
+    gboolean stop_abandon;
     guint64 session_view_id;
     gboolean focused;
 } Client;
@@ -64,6 +69,12 @@ typedef struct {
     guint64 reserved_view_id_limit;
     guint64 next_transient_id;
     gboolean running;
+    gboolean stopping;
+    gboolean stop_term_sent;
+    gboolean stop_kill_sent;
+    gboolean stop_cleanup_failed;
+    gint64 stop_deadline_us;
+    Client *stop_client;
     gboolean session_dirty;
     gint64 session_write_due_us;
     GMainContext *main_context;
@@ -102,6 +113,11 @@ typedef struct {
 #define ENSURE_STARTUP_POLL_US 10000u
 #define ENSURE_TERMINATE_GRACE_MS 500u
 #define ENSURE_KILL_GRACE_MS 500u
+#define STOP_CLIENT_GRACE_MS 1500u
+#define STOP_CLIENT_TERM_GRACE_MS 500u
+#define STOP_CLIENT_KILL_GRACE_MS 500u
+#define STOP_OWNED_CHILD_REAP_MS 500u
+#define STOP_REPLY_FLUSH_MS 500u
 
 static volatile sig_atomic_t stop_requested;
 
@@ -109,6 +125,79 @@ static void stop_signal(int signal_number)
 {
     (void)signal_number;
     stop_requested = 1;
+}
+
+static int peer_pidfd_open(pid_t pid)
+{
+#ifdef SYS_pidfd_open
+    int fd;
+
+    do {
+        fd = (int)syscall(SYS_pidfd_open, pid, 0);
+    } while (fd < 0 && errno == EINTR);
+    return fd;
+#else
+    (void)pid;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static gboolean peer_pidfd_signal(Client *client, int signal_number)
+{
+#ifdef SYS_pidfd_send_signal
+    long result;
+
+    if (client->peer_pidfd < 0) {
+        errno = ENOTSUP;
+        return FALSE;
+    }
+    do {
+        result = syscall(SYS_pidfd_send_signal,
+                         client->peer_pidfd,
+                         signal_number,
+                         NULL,
+                         0);
+    } while (result < 0 && errno == EINTR);
+    return result == 0 || errno == ESRCH;
+#else
+    (void)client;
+    (void)signal_number;
+    errno = ENOSYS;
+    return FALSE;
+#endif
+}
+
+static gboolean peer_pidfd_exited(Client *client)
+{
+    struct pollfd descriptor = {
+        .fd = client->peer_pidfd,
+        .events = POLLIN,
+    };
+    int result;
+
+    if (client->peer_pidfd < 0)
+        return FALSE;
+    do {
+        result = poll(&descriptor, 1, 0);
+    } while (result < 0 && errno == EINTR);
+    return result > 0 &&
+        (descriptor.revents & (POLLIN | POLLHUP | POLLERR));
+}
+
+static gboolean signal_stopping_view(Server *server,
+                                     Client *client,
+                                     int signal_number)
+{
+    if (peer_pidfd_signal(client, signal_number))
+        return TRUE;
+
+    server->stop_cleanup_failed = TRUE;
+    client->stop_abandon = TRUE;
+    g_warning("cannot signal tracked pane %ld safely: %s",
+              (long)client->peer_pid,
+              g_strerror(errno));
+    return FALSE;
 }
 
 static void replace_string(gchar **destination, gchar *value)
@@ -443,11 +532,48 @@ static gboolean client_flush(Client *client)
     return !client->closing;
 }
 
+static gboolean client_flush_bounded(Client *client, guint timeout_ms)
+{
+    gint64 deadline_us = g_get_monotonic_time() +
+        ((gint64)timeout_ms * 1000);
+
+    while (!client->closing && client->output_bytes > 0) {
+        struct pollfd descriptor = {
+            .fd = client->fd,
+            .events = POLLOUT,
+        };
+        gint64 remaining_us;
+        gint wait_ms;
+        int result;
+
+        (void)client_flush(client);
+        if (client->output_bytes == 0)
+            return TRUE;
+        if (client->closing)
+            return FALSE;
+
+        remaining_us = deadline_us - g_get_monotonic_time();
+        if (remaining_us <= 0)
+            return FALSE;
+        wait_ms = (gint)MIN((remaining_us + 999) / 1000,
+                            (gint64)G_MAXINT);
+        do {
+            result = poll(&descriptor, 1, wait_ms);
+        } while (result < 0 && errno == EINTR);
+        if (result <= 0 ||
+            (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)))
+            return FALSE;
+    }
+    return client->output_bytes == 0;
+}
+
 static void client_free(gpointer data)
 {
     Client *client = data;
     if (client->fd >= 0)
         close(client->fd);
+    if (client->peer_pidfd >= 0)
+        close(client->peer_pidfd);
     if (client->input)
         g_string_free(client->input, TRUE);
     if (client->output) {
@@ -723,23 +849,55 @@ static void pending_moves_detach_client(Server *server, Client *client)
     }
 }
 
-static void pending_moves_shutdown(Server *server)
+static gboolean pending_moves_shutdown(Server *server)
 {
-    while (server->pending_moves->len > 0) {
-        PendingMove *move = g_ptr_array_index(server->pending_moves, 0);
-        gint wait_status;
-        pid_t waited;
+    gint64 deadline_us = g_get_monotonic_time() +
+        ((gint64)STOP_OWNED_CHILD_REAP_MS * 1000);
+    gboolean complete = TRUE;
+
+    for (guint i = 0; i < server->pending_moves->len; i++) {
+        PendingMove *move = g_ptr_array_index(server->pending_moves, i);
 
         pending_move_destroy_source(&move->timeout_source);
         pending_move_destroy_source(&move->child_source);
         pending_move_kill(move);
-        do {
-            waited = waitpid((pid_t)move->child_pid, &wait_status, 0);
-        } while (waited < 0 && errno == EINTR);
+    }
+
+    while (server->pending_moves->len > 0 &&
+           g_get_monotonic_time() < deadline_us) {
+        for (gint i = (gint)server->pending_moves->len - 1; i >= 0; i--) {
+            PendingMove *move =
+                g_ptr_array_index(server->pending_moves, (guint)i);
+            gint wait_status;
+            pid_t waited;
+
+            do {
+                waited = waitpid((pid_t)move->child_pid,
+                                 &wait_status,
+                                 WNOHANG);
+            } while (waited < 0 && errno == EINTR);
+            if (waited != (pid_t)move->child_pid &&
+                !(waited < 0 && errno == ECHILD))
+                continue;
+            g_spawn_close_pid(move->child_pid);
+            move->child_pid = 0;
+            g_ptr_array_remove_index(server->pending_moves, (guint)i);
+        }
+        if (server->pending_moves->len > 0)
+            (void)poll(NULL, 0, 10);
+    }
+
+    while (server->pending_moves->len > 0) {
+        PendingMove *move = g_ptr_array_index(server->pending_moves, 0);
+
+        g_printerr("muxd: owned Kitty move child %ld was not reaped\n",
+                   (long)move->child_pid);
+        complete = FALSE;
         g_spawn_close_pid(move->child_pid);
         move->child_pid = 0;
         g_ptr_array_remove_index(server->pending_moves, 0);
     }
+    return complete;
 }
 
 static gint pending_move_poll_timeout(Server *server, gint fallback_ms)
@@ -1004,6 +1162,43 @@ static Client *control_target(Server *server, const gchar *encoded)
     return view;
 }
 
+static gboolean begin_controlled_stop(Server *server, Client *control)
+{
+    if (server->stopping) {
+        control_error(control, "daemon is already stopping");
+        return FALSE;
+    }
+    if (server->socket_path != NULL &&
+        unlink(server->socket_path) < 0 && errno != ENOENT) {
+        control_error(control, "cannot remove daemon socket");
+        return FALSE;
+    }
+    if (server->listener >= 0) {
+        close(server->listener);
+        server->listener = -1;
+    }
+
+    server->stopping = TRUE;
+    server->stop_client = control;
+    server->stop_deadline_us = g_get_monotonic_time() +
+        ((gint64)STOP_CLIENT_GRACE_MS * 1000);
+    control->request_pending = TRUE;
+
+    for (guint i = 0; i < server->clients->len; i++) {
+        Client *client = g_ptr_array_index(server->clients, i);
+
+        if (client == control)
+            continue;
+        if (client->kind == CLIENT_VIEW && !client->closing) {
+            if (!client_send_line(client, "DO\tQUIT\t"))
+                client->closing = TRUE;
+        } else {
+            client->closing = TRUE;
+        }
+    }
+    return TRUE;
+}
+
 static void handle_control(
     Server *server,
     Client *client,
@@ -1011,6 +1206,11 @@ static void handle_control(
     guint field_count)
 {
     const gchar *command = field_count > 1 ? fields[1] : "";
+
+    if (g_strcmp0(command, "STOP") == 0 && field_count == 2) {
+        (void)begin_controlled_stop(server, client);
+        return;
+    }
 
     if (g_strcmp0(command, "PING") == 0) {
         client_send_line(client, "PONG\t%d", MUX_PROTOCOL_VERSION);
@@ -1424,8 +1624,28 @@ static void remove_closed_clients(Server *server)
 
         pending_moves_detach_client(server, client);
 
+        if (server->stopping && client->kind == CLIENT_VIEW &&
+            !client->stop_abandon) {
+            if (client->fd >= 0) {
+                close(client->fd);
+                client->fd = -1;
+            }
+            if (!peer_pidfd_exited(client)) {
+                if (!client->graceful_bye &&
+                    !client->stop_term_sent &&
+                    signal_stopping_view(server, client, SIGTERM))
+                    client->stop_term_sent = TRUE;
+                if (!client->stop_abandon)
+                    continue;
+            }
+        }
+
+        if (client == server->stop_client)
+            server->stop_client = NULL;
+
         if (client->kind == CLIENT_VIEW) {
-            if (client->graceful_bye && client->persistable &&
+            if (!server->stopping && client->graceful_bye &&
+                client->persistable &&
                 client->session_view_id != 0 &&
                 mux_session_state_remove_view(server->session,
                                               client->session_view_id))
@@ -1435,6 +1655,90 @@ static void remove_closed_clients(Server *server)
         }
         g_ptr_array_remove_index(server->clients, (guint)i);
     }
+}
+
+static void update_controlled_stop(Server *server)
+{
+    gint64 now_us;
+
+    if (!server->stopping)
+        return;
+    if (view_count(server) == 0) {
+        server->running = FALSE;
+        return;
+    }
+
+    now_us = g_get_monotonic_time();
+    if (now_us < server->stop_deadline_us)
+        return;
+    if (!server->stop_term_sent) {
+        for (guint i = 0; i < server->clients->len; i++) {
+            Client *client = g_ptr_array_index(server->clients, i);
+
+            if (client->kind != CLIENT_VIEW)
+                continue;
+            if (peer_pidfd_exited(client)) {
+                client->closing = TRUE;
+                continue;
+            }
+            if (!client->stop_term_sent &&
+                signal_stopping_view(server, client, SIGTERM))
+                client->stop_term_sent = TRUE;
+            if (client->stop_abandon)
+                client->closing = TRUE;
+        }
+        server->stop_term_sent = TRUE;
+        server->stop_deadline_us = now_us +
+            ((gint64)STOP_CLIENT_TERM_GRACE_MS * 1000);
+        return;
+    }
+
+    if (!server->stop_kill_sent) {
+        for (guint i = 0; i < server->clients->len; i++) {
+            Client *client = g_ptr_array_index(server->clients, i);
+
+            if (client->kind != CLIENT_VIEW)
+                continue;
+            if (peer_pidfd_exited(client)) {
+                client->closing = TRUE;
+                continue;
+            }
+            if (!client->stop_kill_sent &&
+                signal_stopping_view(server, client, SIGKILL))
+                client->stop_kill_sent = TRUE;
+            client->closing = TRUE;
+        }
+        server->stop_kill_sent = TRUE;
+        server->stop_deadline_us = now_us +
+            ((gint64)STOP_CLIENT_KILL_GRACE_MS * 1000);
+        return;
+    }
+
+    for (guint i = 0; i < server->clients->len; i++) {
+        Client *client = g_ptr_array_index(server->clients, i);
+
+        if (client->kind != CLIENT_VIEW || peer_pidfd_exited(client))
+            continue;
+        server->stop_cleanup_failed = TRUE;
+        client->stop_abandon = TRUE;
+        g_warning("tracked pane %ld did not terminate within the stop deadline",
+                  (long)client->peer_pid);
+    }
+    server->running = FALSE;
+}
+
+static void send_controlled_stop_response(Server *server)
+{
+    Client *control = server->stop_client;
+
+    if (control == NULL || control->closing)
+        return;
+    if (server->stop_cleanup_failed)
+        control_error(control, "daemon stopped with incomplete cleanup");
+    else
+        client_send_line(control, "OK");
+    if (!client_flush_bounded(control, STOP_REPLY_FLUSH_MS))
+        g_printerr("muxd: stop response could not be delivered\n");
 }
 
 static gboolean accept_client(Server *server)
@@ -1467,6 +1771,7 @@ static gboolean accept_client(Server *server)
     Client *client = g_new0(Client, 1);
     client->fd = fd;
     client->peer_pid = credentials.pid;
+    client->peer_pidfd = peer_pidfd_open(credentials.pid);
     client->input = g_string_new(NULL);
     client->output = g_queue_new();
     g_ptr_array_add(server->clients, client);
@@ -1730,16 +2035,28 @@ static int run_server(void)
             ;
         remove_closed_clients(&server);
         flush_session_if_due(&server);
+        update_controlled_stop(&server);
     }
 
-    if (server.session_dirty)
-        persist_session_now(&server);
-    pending_moves_shutdown(&server);
+    if (server.session_dirty && !persist_session_now(&server) &&
+        server.stopping)
+        server.stop_cleanup_failed = TRUE;
+    if (!pending_moves_shutdown(&server) && server.stopping)
+        server.stop_cleanup_failed = TRUE;
     muxd_clipboard_free(server.clipboard);
     g_main_context_unref(server.main_context);
-    close(server.listener);
-    unlink(server.socket_path);
-    close(server.lock_fd);
+    if (server.listener >= 0)
+        close(server.listener);
+    if (unlink(server.socket_path) < 0 && errno != ENOENT &&
+        server.stopping)
+        server.stop_cleanup_failed = TRUE;
+    if (server.lock_fd >= 0) {
+        if (close(server.lock_fd) < 0 && server.stopping)
+            server.stop_cleanup_failed = TRUE;
+        server.lock_fd = -1;
+    }
+    if (server.stopping)
+        send_controlled_stop_response(&server);
     g_ptr_array_unref(server.clients);
     g_ptr_array_unref(server.pending_moves);
     g_free(server.socket_path);
