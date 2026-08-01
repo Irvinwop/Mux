@@ -75,20 +75,21 @@ run JavaScript, network requests, audio, or media for the hidden page.
 
 ## Graceful close
 
-The first `Ctrl+Q` sends serial-bound `REQUEST_CLOSE`. `mux-engine` invokes
+The first `Super+Q` (`Ctrl+Q` Linux alias) sends serial-bound `REQUEST_CLOSE`.
+`mux-engine` invokes
 WebKit's graceful close path so `beforeunload` can ask whether to leave. A
 matching `CLOSE_READY` permits normal pane teardown.
 
 If the page chooses Stay or the close deadline expires, `mux-pane` sends
 matching `CANCEL_CLOSE`, clears the pending request, and stays open. A second
-`Ctrl+Q` while the request is pending is the explicit force-close action. Late
+`Super+Q` while the request is pending is the explicit force-close action. Late
 close responses are ignored by serial.
 
 ## Control integration
 
 `mux-pane` also registers as a normal view client with `muxd`. URI and title
-metadata update `mux-bar`; focus updates the active view and layer; `Ctrl+L`
-asks the daemon to focus the layer bar; and structured control commands are
+metadata update `mux-bar`; focus updates the active view and layer; `Super+L`
+(`Ctrl+L` Linux alias) asks the daemon to focus the layer bar; and structured control commands are
 translated into engine navigation.
 
 All daemon sockets and outbound queues are nonblocking and bounded. A stalled

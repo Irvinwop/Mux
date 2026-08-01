@@ -30,12 +30,12 @@ This document defines that boundary for the shared `mux-engine`, the thin
 
 ## Browser shortcut modifiers
 
-For browser-owned commands, `mux-pane` treats WPE's Meta modifier as an alias
-for Control. This covers the existing URL, close, reload, history, bookmark,
-command-palette, and clipboard commands. Kitty passes the corresponding Super
-combinations through where it has explicit Ctrl mappings. Unconsumed input is
-still sent to web content with its original modifier bits, so Meta is never
-rewritten to Control for a page.
+For browser-owned commands, WPE Meta (`Super`, or `Command` on an Apple keyboard
+mapped into Linux) is canonical. Conventional Control forms are matched only as
+explicit Linux compatibility aliases. Every shortcut requires an exact modifier
+set, and handled press, repeat, and release records are consumed together.
+Unmatched input is sent to web content with its original modifier bits, so Meta
+is never rewritten to Control for a page.
 
 On an Apple keyboard, Linux normally exposes the Command key as Super/Meta.
 This alias does not add native macOS support: Mux remains a Linux-only WPE and

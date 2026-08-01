@@ -466,7 +466,7 @@ wait_view_closed() {
         pid_alive "$MUXD_PID" || fail "muxd exited while closing $view_id"
         sleep 0.05
     done
-    fail "graceful Ctrl+Q did not close $view_id within 12 seconds"
+    fail "graceful Super+Q did not close $view_id within 12 seconds"
 }
 
 kitty_rc() {
@@ -715,17 +715,17 @@ wait_title "$BOOT_VIEW_ID" "$SECOND_URL" MUX_SMOKE_SECOND_LOADED
 run_muxctl focus "$ALT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "muxctl focus failed for $ALT_VIEW_ID"
 wait_active_view "$ALT_VIEW_ID"
-kitty_rc send-key --match "id:$ALT_KITTY_ID" ctrl+q \
+kitty_rc send-key --match "id:$ALT_KITTY_ID" super+q \
     >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
-    fail "encrypted Ctrl+Q injection failed for $ALT_VIEW_ID"
+    fail "encrypted Super+Q injection failed for $ALT_VIEW_ID"
 wait_view_closed "$ALT_VIEW_ID" "$ALT_PANE_PID"
 
 run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "muxctl focus failed for $BOOT_VIEW_ID"
 wait_active_view "$BOOT_VIEW_ID"
-kitty_rc send-key --match "id:$BOOT_KITTY_ID" ctrl+q \
+kitty_rc send-key --match "id:$BOOT_KITTY_ID" super+q \
     >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
-    fail "encrypted Ctrl+Q injection failed for $BOOT_VIEW_ID"
+    fail "encrypted Super+Q injection failed for $BOOT_VIEW_ID"
 wait_view_closed "$BOOT_VIEW_ID" "$BOOT_PANE_PID"
 
 final_status=$(run_muxctl status) || fail "muxctl status failed after pane closure"

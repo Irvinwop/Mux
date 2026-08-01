@@ -13,6 +13,7 @@ typedef struct _MuxDownloadManager MuxDownloadManager;
 #define MUX_DOWNLOAD_MAX_PENDING_GLOBAL 8U
 #define MUX_DOWNLOAD_MAX_ACTIVE_PER_VIEW 4U
 #define MUX_DOWNLOAD_MAX_ACTIVE_GLOBAL 16U
+#define MUX_DOWNLOAD_DESTINATION_TIMEOUT_MS 120000U
 
 typedef enum {
     MUX_DOWNLOAD_EVENT_STARTED,
@@ -65,6 +66,8 @@ gboolean mux_download_manager_handle_payload(MuxDownloadManager *manager,
 
 void mux_download_manager_cancel(MuxDownloadManager *manager,
                                  guint64 download_id);
+void mux_download_manager_cancel_view(MuxDownloadManager *manager,
+                                      WebKitWebView *source_view);
 void mux_download_manager_cancel_all(MuxDownloadManager *manager);
 guint mux_download_manager_count(const MuxDownloadManager *manager);
 

@@ -206,7 +206,8 @@ Page content cannot read or modify those credentials.
 ### URL bar
 
 `mux-bar` subscribes to `muxd` and displays the active page's sanitized URL and
-state for its layer. `Ctrl+L` asks `muxd` to focus that registered bar. Enter
+state for its layer. `Super+L` (`Ctrl+L` Linux alias) asks `muxd` to focus that
+registered bar. Enter
 sends the entered location as a structured control record; Escape cancels and
 returns focus. User input is never interpolated into a shell command.
 
@@ -309,10 +310,11 @@ Version 2 includes navigation, input, frame acknowledgement, explicit
 | Engine replaced | recreated from URL | DOM and JavaScript state are lost. |
 | Explicitly closed | destroyed | Clean `BYE` removes the live record. |
 
-The first `Ctrl+Q` requests WebKit's graceful close path so `beforeunload` can
+The first `Super+Q` (`Ctrl+Q` Linux alias) requests WebKit's graceful close path
+so `beforeunload` can
 run. If WebKit permits closure, the engine sends serial-matched `CLOSE_READY`.
 If the page chooses Stay or the request times out, the pane sends
-`CANCEL_CLOSE`, retires the request, and remains open. A second `Ctrl+Q` while a
+`CANCEL_CLOSE`, retires the request, and remains open. A second `Super+Q` while a
 request is pending is the explicit force-close operation.
 
 Persistent session metadata includes logical layer, stable view ID, last known

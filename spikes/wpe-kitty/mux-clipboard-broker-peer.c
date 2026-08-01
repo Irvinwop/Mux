@@ -127,10 +127,12 @@ send_error(MuxClipboardBrokerPeer *peer,
 static gboolean
 send_wire_ack(MuxClipboardBrokerPeer *peer,
               guint64 transaction_id,
+              guint32 flags,
               GError **error)
 {
     MuxClipboardWireRecord record = {
         .type = MUX_CLIPBOARD_WIRE_ACK,
+        .flags = flags,
         .transaction_id = transaction_id
     };
     GBytes *packet = mux_clipboard_wire_record_encode(&record, error);
@@ -292,6 +294,8 @@ send_summaries(MuxClipboardBrokerPeer *peer,
             .preview = source->preview,
             .source_view_id = source->source_view_id,
             .format_count = source->format_count,
+            .mime_types = source->mime_types,
+            .mime_type_count = source->mime_type_count,
             .total_bytes = source->total_bytes
         };
         GBytes *packet = mux_clipboard_control_summary_encode(
@@ -513,6 +517,7 @@ handle_snapshot(MuxClipboardBrokerPeer *peer,
     g_autoptr(GError) operation_error = NULL;
     g_autoptr(GError) feed_error = NULL;
     guint64 transaction_id;
+    MuxClipboardHistoryAddResult observe_result;
 
     if (peer->profile == NULL) {
         g_set_error_literal(error,
@@ -567,7 +572,7 @@ handle_snapshot(MuxClipboardBrokerPeer *peer,
 
     transaction_id =
         mux_clipboard_wire_transfer_get_transaction_id(transfer);
-    mux_clipboard_broker_observe(
+    observe_result = mux_clipboard_broker_observe(
         peer->broker,
         peer->profile,
         mux_clipboard_wire_transfer_get_snapshot(transfer),
@@ -580,7 +585,13 @@ handle_snapshot(MuxClipboardBrokerPeer *peer,
 
     if (operation_error != NULL)
         return send_wire_error(peer, transaction_id, error);
-    return send_wire_ack(peer, transaction_id, error);
+    return send_wire_ack(
+        peer,
+        transaction_id,
+        observe_result == MUX_CLIPBOARD_HISTORY_DEGRADED
+            ? MUX_CLIPBOARD_WIRE_FLAG_HISTORY_DEGRADED
+            : 0,
+        error);
 }
 
 gboolean

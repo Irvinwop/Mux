@@ -1,4 +1,5 @@
 #include "../src/mux-engine-protocol.h"
+#include "../src/mux-shortcuts.h"
 #include "../mux-uri.h"
 
 #include <glib.h>
@@ -12,12 +13,20 @@ gboolean mux_engine_test_prepare_initial_uri(gboolean popup_claim,
                                              const gchar *search_url,
                                              gchar **normalized_uri,
                                              GError **error);
+gboolean mux_engine_test_view_capacity(guint active_views,
+                                       guint pending_views);
+guint mux_engine_test_frame_backpressure_retry_delay_ms(
+    guint rejection_count);
 gboolean mux_pane_test_schedule_retry_at(gint64 now_us,
                                          gint64 *retry_us,
                                          guint *backoff_ms);
 gboolean mux_pane_test_decode_engine_error(GBytes *payload,
                                            guint32 *code,
                                            gchar **safe_detail);
+gint mux_pane_test_parse_kitty_graphics_response(const guint8 *sequence,
+                                                 gsize length,
+                                                 guint *image_id,
+                                                 gchar **detail);
 
 static void
 put_u16(guint8 *target, guint16 value)
@@ -341,6 +350,85 @@ test_visibility_round_trip(void)
 }
 
 static void
+test_layer_round_trip(void)
+{
+    int sockets[2];
+    MuxEngineBuilder builder = {0};
+    g_autoptr(GBytes) payload = NULL;
+    MuxEngineMessage outgoing = {0};
+    MuxEngineMessage incoming = {0};
+    MuxEngineCursor cursor;
+    g_autofree gchar *layer = NULL;
+    g_autoptr(GError) error = NULL;
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_string(&builder, "research");
+    payload = mux_engine_builder_finish(&builder);
+    open_socket_pair(sockets);
+    mux_engine_message_init(&outgoing,
+                            MUX_ENGINE_MESSAGE_SET_LAYER,
+                            MUX_ENGINE_FLAG_NONE,
+                            42,
+                            7,
+                            payload);
+    g_assert_true(mux_engine_send_message(sockets[0], &outgoing, &error));
+    g_assert_no_error(error);
+    g_assert_true(mux_engine_receive_message(sockets[1], &incoming, &error));
+    g_assert_no_error(error);
+    g_assert_cmpuint(incoming.type, ==, MUX_ENGINE_MESSAGE_SET_LAYER);
+    mux_engine_cursor_init(&cursor, incoming.payload);
+    g_assert_true(mux_engine_cursor_get_string(&cursor, &layer));
+    g_assert_cmpstr(layer, ==, "research");
+    g_assert_true(mux_engine_cursor_done(&cursor));
+    mux_engine_message_clear(&incoming);
+    mux_engine_message_clear(&outgoing);
+    close_socket_pair(sockets);
+}
+
+static void
+test_frame_rejected_round_trip(void)
+{
+    int sockets[2];
+    MuxEngineBuilder builder = {0};
+    g_autoptr(GBytes) payload = NULL;
+    MuxEngineMessage outgoing = {0};
+    MuxEngineMessage incoming = {0};
+    MuxEngineCursor cursor;
+    guint32 reason = 0;
+    g_autofree gchar *detail = NULL;
+    g_autoptr(GError) error = NULL;
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder,
+                               MUX_ENGINE_FRAME_REJECTED_KITTY);
+    mux_engine_builder_put_string(&builder, "EINVAL: bad image");
+    payload = mux_engine_builder_finish(&builder);
+    open_socket_pair(sockets);
+    mux_engine_message_init(&outgoing,
+                            MUX_ENGINE_MESSAGE_FRAME_REJECTED,
+                            MUX_ENGINE_FLAG_NONE,
+                            42,
+                            99,
+                            payload);
+    g_assert_true(mux_engine_send_message(sockets[0], &outgoing, &error));
+    g_assert_no_error(error);
+    g_assert_true(mux_engine_receive_message(sockets[1], &incoming, &error));
+    g_assert_no_error(error);
+    g_assert_cmpuint(incoming.type,
+                     ==,
+                     MUX_ENGINE_MESSAGE_FRAME_REJECTED);
+    mux_engine_cursor_init(&cursor, incoming.payload);
+    g_assert_true(mux_engine_cursor_get_u32(&cursor, &reason));
+    g_assert_cmpuint(reason, ==, MUX_ENGINE_FRAME_REJECTED_KITTY);
+    g_assert_true(mux_engine_cursor_get_string(&cursor, &detail));
+    g_assert_cmpstr(detail, ==, "EINVAL: bad image");
+    g_assert_true(mux_engine_cursor_done(&cursor));
+    mux_engine_message_clear(&incoming);
+    mux_engine_message_clear(&outgoing);
+    close_socket_pair(sockets);
+}
+
+static void
 test_cancel_close_round_trip(void)
 {
     int sockets[2];
@@ -558,6 +646,197 @@ test_engine_error_payload_validation(void)
     g_assert_null(safe_detail);
 }
 
+static void
+test_kitty_graphics_response_classification(void)
+{
+    static const guint8 success[] = "\033_Ga=T,i=42;OK\033\\";
+    static const guint8 failure[] =
+        "\033_Gi=42;EINVAL:\033[31mbad image\033\\";
+    static const guint8 missing_id[] = "\033_Ga=T;OK\033\\";
+    guint image_id = 0;
+    g_autofree gchar *detail = NULL;
+
+    g_assert_cmpint(mux_pane_test_parse_kitty_graphics_response(
+                        success,
+                        sizeof(success) - 1,
+                        &image_id,
+                        &detail),
+                    ==,
+                    1);
+    g_assert_cmpuint(image_id, ==, 42);
+    g_assert_null(detail);
+
+    image_id = 0;
+    g_assert_cmpint(mux_pane_test_parse_kitty_graphics_response(
+                        failure,
+                        sizeof(failure) - 1,
+                        &image_id,
+                        &detail),
+                    ==,
+                    2);
+    g_assert_cmpuint(image_id, ==, 42);
+    g_assert_cmpstr(detail, ==, "EINVAL:");
+    g_clear_pointer(&detail, g_free);
+
+    g_assert_cmpint(mux_pane_test_parse_kitty_graphics_response(
+                        missing_id,
+                        sizeof(missing_id) - 1,
+                        &image_id,
+                        &detail),
+                    ==,
+                    0);
+    g_assert_null(detail);
+}
+
+static void
+test_engine_global_view_capacity(void)
+{
+    g_assert_true(mux_engine_test_view_capacity(0, 0));
+    g_assert_true(mux_engine_test_view_capacity(31, 0));
+    g_assert_false(mux_engine_test_view_capacity(31, 1));
+    g_assert_false(mux_engine_test_view_capacity(0, 32));
+    g_assert_false(mux_engine_test_view_capacity(32, 0));
+    g_assert_false(mux_engine_test_view_capacity(G_MAXUINT, 1));
+}
+
+static void
+test_frame_backpressure_retry_is_bounded(void)
+{
+    g_assert_cmpuint(mux_engine_test_frame_backpressure_retry_delay_ms(0),
+                     ==,
+                     50);
+    g_assert_cmpuint(mux_engine_test_frame_backpressure_retry_delay_ms(1),
+                     ==,
+                     50);
+    g_assert_cmpuint(mux_engine_test_frame_backpressure_retry_delay_ms(2),
+                     ==,
+                     100);
+    g_assert_cmpuint(mux_engine_test_frame_backpressure_retry_delay_ms(5),
+                     ==,
+                     800);
+    g_assert_cmpuint(mux_engine_test_frame_backpressure_retry_delay_ms(6),
+                     ==,
+                     1000);
+    g_assert_cmpuint(
+        mux_engine_test_frame_backpressure_retry_delay_ms(G_MAXUINT),
+        ==,
+        1000);
+}
+
+static void
+test_shortcut_exact_modifier_matching(void)
+{
+    const guint control = MUX_SHORTCUT_MODIFIER_CONTROL;
+    const guint shift = MUX_SHORTCUT_MODIFIER_SHIFT;
+    const guint alt = MUX_SHORTCUT_MODIFIER_ALT;
+    const guint meta = MUX_SHORTCUT_MODIFIER_META;
+
+    g_assert_cmpuint(mux_shortcut_match_pane(meta, 'q'),
+                     ==,
+                     MUX_SHORTCUT_CLOSE);
+    g_assert_cmpuint(mux_shortcut_match_pane(control, 'q'),
+                     ==,
+                     MUX_SHORTCUT_CLOSE);
+    g_assert_cmpuint(mux_shortcut_match_pane(meta | shift, 'q'),
+                     ==,
+                     MUX_SHORTCUT_NONE);
+    g_assert_cmpuint(mux_shortcut_match_pane(control | alt, 'q'),
+                     ==,
+                     MUX_SHORTCUT_NONE);
+    g_assert_cmpuint(mux_shortcut_match_pane(meta | shift, 'v'),
+                     ==,
+                     MUX_SHORTCUT_CLIPBOARD_HISTORY);
+    g_assert_cmpuint(mux_shortcut_match_pane(control | shift, 'v'),
+                     ==,
+                     MUX_SHORTCUT_CLIPBOARD_HISTORY);
+    g_assert_cmpuint(mux_shortcut_match_pane(meta | shift | alt, 'v'),
+                     ==,
+                     MUX_SHORTCUT_NONE);
+
+    g_assert_cmpuint(mux_shortcut_match_engine(meta | shift, 'p'),
+                     ==,
+                     MUX_SHORTCUT_COMMAND_PALETTE);
+    g_assert_cmpuint(mux_shortcut_match_engine(control | shift, 'p'),
+                     ==,
+                     MUX_SHORTCUT_COMMAND_PALETTE);
+    g_assert_cmpuint(mux_shortcut_match_engine(meta, 'd'),
+                     ==,
+                     MUX_SHORTCUT_BOOKMARK);
+    g_assert_cmpuint(mux_shortcut_match_engine(control, 'd'),
+                     ==,
+                     MUX_SHORTCUT_BOOKMARK);
+    g_assert_cmpuint(mux_shortcut_match_engine(meta | shift, 'd'),
+                     ==,
+                     MUX_SHORTCUT_NONE);
+    g_assert_cmpuint(mux_shortcut_match_engine(alt, 0xff51u),
+                     ==,
+                     MUX_SHORTCUT_HISTORY_BACK);
+    g_assert_cmpuint(mux_shortcut_match_engine(alt | shift, 0xff51u),
+                     ==,
+                     MUX_SHORTCUT_NONE);
+
+    g_assert_cmpuint(mux_shortcut_match_bar(meta, 'l'),
+                     ==,
+                     MUX_SHORTCUT_LOCATION);
+    g_assert_cmpuint(mux_shortcut_match_bar(control, 'l'),
+                     ==,
+                     MUX_SHORTCUT_LOCATION);
+    g_assert_cmpuint(mux_shortcut_match_bar(meta, 'u'),
+                     ==,
+                     MUX_SHORTCUT_BAR_CLEAR);
+    g_assert_cmpuint(mux_shortcut_match_bar(meta | alt, 'u'),
+                     ==,
+                     MUX_SHORTCUT_NONE);
+}
+
+static void
+test_shortcut_lifecycle_and_unmatched_meta(void)
+{
+    MuxShortcut close = mux_shortcut_match_pane(
+        MUX_SHORTCUT_MODIFIER_META,
+        'q');
+    gboolean execute = FALSE;
+
+    g_assert_true(mux_shortcut_handle_event(close,
+                                            MUX_SHORTCUT_EVENT_PRESS,
+                                            &execute));
+    g_assert_true(execute);
+    g_assert_true(mux_shortcut_handle_event(close,
+                                            MUX_SHORTCUT_EVENT_REPEAT,
+                                            &execute));
+    g_assert_false(execute);
+    g_assert_true(mux_shortcut_handle_event(close,
+                                            MUX_SHORTCUT_EVENT_RELEASE,
+                                            &execute));
+    g_assert_false(execute);
+
+    g_assert_cmpuint(mux_shortcut_match_pane(
+                         MUX_SHORTCUT_MODIFIER_META,
+                         'x'),
+                     ==,
+                     MUX_SHORTCUT_NONE);
+    g_assert_false(mux_shortcut_handle_event(MUX_SHORTCUT_NONE,
+                                             MUX_SHORTCUT_EVENT_PRESS,
+                                             &execute));
+    g_assert_false(execute);
+    g_assert_true(mux_shortcut_is_page_paste(
+        MUX_SHORTCUT_MODIFIER_META,
+        'v'));
+    g_assert_true(mux_shortcut_is_page_paste(
+        MUX_SHORTCUT_MODIFIER_CONTROL,
+        'v'));
+    g_assert_false(mux_shortcut_is_page_paste(
+        MUX_SHORTCUT_MODIFIER_META | MUX_SHORTCUT_MODIFIER_ALT,
+        'v'));
+
+    g_assert_cmpuint(mux_shortcut_modifiers_from_kitty(8 + 1),
+                     ==,
+                     MUX_SHORTCUT_MODIFIER_META);
+    g_assert_cmpuint(mux_shortcut_modifiers_from_kitty(32 + 1),
+                     ==,
+                     MUX_SHORTCUT_MODIFIER_META);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -588,6 +867,10 @@ main(int argc, char **argv)
                     test_close_handshake_round_trip);
     g_test_add_func("/engine-protocol/packet/visibility",
                     test_visibility_round_trip);
+    g_test_add_func("/engine-protocol/packet/layer",
+                    test_layer_round_trip);
+    g_test_add_func("/engine-protocol/packet/frame-rejected",
+                    test_frame_rejected_round_trip);
     g_test_add_func("/engine-protocol/packet/cancel-close",
                     test_cancel_close_round_trip);
     g_test_add_func("/engine-protocol/packet/reject-v1",
@@ -598,6 +881,16 @@ main(int argc, char **argv)
                     test_pane_retry_backoff);
     g_test_add_func("/engine-runtime/error/bounded-sanitized-payload",
                     test_engine_error_payload_validation);
+    g_test_add_func("/engine-runtime/graphics/kitty-response",
+                    test_kitty_graphics_response_classification);
+    g_test_add_func("/engine-runtime/popup/global-view-capacity",
+                    test_engine_global_view_capacity);
+    g_test_add_func("/engine-runtime/graphics/backpressure-retry",
+                    test_frame_backpressure_retry_is_bounded);
+    g_test_add_func("/engine-runtime/shortcuts/exact-modifiers",
+                    test_shortcut_exact_modifier_matching);
+    g_test_add_func("/engine-runtime/shortcuts/lifecycle-and-forwarding",
+                    test_shortcut_lifecycle_and_unmatched_meta);
 
     for (index = 0; index < G_N_ELEMENTS(malformed_cases); index++) {
         g_test_add_data_func(malformed_cases[index].path,

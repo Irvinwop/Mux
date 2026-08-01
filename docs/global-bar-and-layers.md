@@ -7,7 +7,8 @@ in the bar, layer process, pane, or `muxd`.
 
 ## URL bar
 
-`Ctrl+L` in a browser pane sends `PROMPT` to `muxd`. The daemon identifies the
+`Super+L` in a browser pane (`Ctrl+L` as a Linux compatibility alias) sends
+`PROMPT` to `muxd`. The daemon identifies the
 registered bar on the same Kitty control socket and layer, focuses it, and asks
 it to enter edit mode. Enter sends the location as a structured request to the
 active view. Escape cancels and returns focus without navigation.

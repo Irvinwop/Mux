@@ -582,6 +582,117 @@ static gchar *query_view_layer(const gchar *socket_path,
     return layer;
 }
 
+static gboolean query_active_state(const gchar *socket_path,
+                                   gchar **active_id,
+                                   gchar **current_layer,
+                                   GError **error)
+{
+    int fd = connect_unix_socket(socket_path,
+                                 RESPONSE_TIMEOUT_MS,
+                                 error);
+    g_autofree gchar *line = NULL;
+    g_auto(GStrv) fields = NULL;
+
+    *active_id = NULL;
+    *current_layer = NULL;
+    if (fd < 0)
+        return FALSE;
+    if (!mux_send_line(fd, "CTL\tSTATUS")) {
+        int saved_errno = errno;
+
+        close(fd);
+        set_errno_error(error, "send STATUS", saved_errno);
+        return FALSE;
+    }
+    line = mux_read_line(fd, RESPONSE_TIMEOUT_MS);
+    close(fd);
+    if (line == NULL) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_TIMED_OUT,
+                            "timed out waiting for STATUS response");
+        return FALSE;
+    }
+    fields = g_strsplit(line, "\t", -1);
+    if (g_strv_length(fields) < 5 ||
+        g_strcmp0(fields[0], "STATUS") != 0) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    G_IO_ERROR_INVALID_DATA,
+                    "unexpected STATUS response: %s",
+                    line);
+        return FALSE;
+    }
+    *active_id = mux_decode(fields[2]);
+    *current_layer = mux_decode(fields[3]);
+    return TRUE;
+}
+
+static gboolean wait_for_active_state(const gchar *socket_path,
+                                      const gchar *expected_active,
+                                      const gchar *expected_layer,
+                                      guint timeout_ms,
+                                      GError **error)
+{
+    gint64 deadline_us =
+        g_get_monotonic_time() + ((gint64)timeout_ms * 1000);
+
+    while (remaining_ms(deadline_us) > 0) {
+        g_autofree gchar *active = NULL;
+        g_autofree gchar *layer = NULL;
+        g_autoptr(GError) local_error = NULL;
+
+        if (query_active_state(socket_path,
+                               &active,
+                               &layer,
+                               &local_error) &&
+            g_strcmp0(active, expected_active) == 0 &&
+            g_strcmp0(layer, expected_layer) == 0)
+            return TRUE;
+        (void)poll(NULL, 0, MIN(remaining_ms(deadline_us), 10));
+    }
+
+    g_set_error(error,
+                G_IO_ERROR,
+                G_IO_ERROR_TIMED_OUT,
+                "active state did not become active=%s layer=%s",
+                expected_active,
+                expected_layer);
+    return FALSE;
+}
+
+static gboolean set_current_layer(const gchar *socket_path,
+                                  const gchar *layer,
+                                  GError **error)
+{
+    int fd = connect_unix_socket(socket_path,
+                                 RESPONSE_TIMEOUT_MS,
+                                 error);
+    g_autofree gchar *encoded_layer = mux_encode(layer);
+    g_autofree gchar *response = NULL;
+
+    if (fd < 0)
+        return FALSE;
+    if (!mux_send_line(fd, "CTL\tLAYER\t%s", encoded_layer)) {
+        int saved_errno = errno;
+
+        close(fd);
+        set_errno_error(error, "send LAYER", saved_errno);
+        return FALSE;
+    }
+    response = mux_read_line(fd, RESPONSE_TIMEOUT_MS);
+    close(fd);
+    if (g_strcmp0(response, "OK") != 0) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    G_IO_ERROR_INVALID_DATA,
+                    "unexpected LAYER response: %s",
+                    response != NULL ? response : "(none)");
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static int request_move(const gchar *socket_path,
                         const gchar *view_id,
                         const gchar *layer,
@@ -619,6 +730,79 @@ static gboolean wait_for_path(const gchar *path, guint timeout_ms)
         (void)poll(NULL, 0, MIN(remaining_ms(deadline_us), 10));
     }
     return g_file_test(path, G_FILE_TEST_EXISTS);
+}
+
+static gboolean wait_for_path_absent(const gchar *path, guint timeout_ms)
+{
+    gint64 deadline_us =
+        g_get_monotonic_time() + ((gint64)timeout_ms * 1000);
+
+    while (remaining_ms(deadline_us) > 0) {
+        if (!g_file_test(path, G_FILE_TEST_EXISTS))
+            return TRUE;
+        (void)poll(NULL, 0, MIN(remaining_ms(deadline_us), 10));
+    }
+    return !g_file_test(path, G_FILE_TEST_EXISTS);
+}
+
+static pid_t spawn_silent_muxd(const gchar *socket_path,
+                               guint hold_ms,
+                               GError **error)
+{
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    int listener;
+    pid_t pid;
+
+    listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0) {
+        set_errno_error(error, "create fake muxd socket", errno);
+        return -1;
+    }
+    g_strlcpy(address.sun_path, socket_path, sizeof(address.sun_path));
+    (void)g_unlink(socket_path);
+    if (bind(listener,
+             (const struct sockaddr *)&address,
+             sizeof(address)) < 0 ||
+        listen(listener, 1) < 0 || g_chmod(socket_path, 0600) < 0) {
+        int saved_errno = errno;
+
+        close(listener);
+        (void)g_unlink(socket_path);
+        set_errno_error(error, "start fake muxd", saved_errno);
+        return -1;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        int saved_errno = errno;
+
+        close(listener);
+        (void)g_unlink(socket_path);
+        set_errno_error(error, "fork fake muxd", saved_errno);
+        return -1;
+    }
+    if (pid == 0) {
+        gchar request[256];
+        int client;
+
+        do {
+            client = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+        } while (client < 0 && errno == EINTR);
+        if (client < 0)
+            _exit(1);
+        do {
+            errno = 0;
+        } while (recv(client, request, sizeof(request), 0) < 0 &&
+                 errno == EINTR);
+        if (hold_ms > 0)
+            (void)poll(NULL, 0, (gint)hold_ms);
+        close(client);
+        close(listener);
+        _exit(0);
+    }
+
+    close(listener);
+    return pid;
 }
 
 static gboolean wait_for_view_count(const gchar *socket_path,
@@ -996,6 +1180,7 @@ static void test_muxd_async_move_and_queued_replies(void)
     gchar *target_id = NULL;
     gchar *source_id = NULL;
     gchar *timeout_source_id = NULL;
+    gchar *fallback_id = NULL;
     gchar *move_response = NULL;
     gchar *observed_layer = NULL;
     gchar *error_message = NULL;
@@ -1010,6 +1195,7 @@ static void test_muxd_async_move_and_queued_replies(void)
     int target_fd = -1;
     int source_fd = -1;
     int timeout_source_fd = -1;
+    int fallback_fd = -1;
     int move_fd = -1;
     pid_t daemon_pid = -1;
     mode_t old_umask = umask(0077);
@@ -1105,18 +1291,39 @@ static void test_muxd_async_move_and_queued_replies(void)
                                              &timeout_source_id,
                                              &error),
                  "register timeout source view");
+    fallback_fd = connect_unix_socket(socket_path,
+                                      RESPONSE_TIMEOUT_MS,
+                                      &error);
+    REQUIRE_CALL(fallback_fd >= 0, "connect fallback view");
+    REQUIRE_CALL(register_view_with_identity(fallback_fd,
+                                             "",
+                                             "303",
+                                             "integration-kitty",
+                                             "main",
+                                             &fallback_id,
+                                             &error),
+                 "register fallback view");
 
     move_fd = request_move(socket_path, source_id, "target", &error);
     REQUIRE_CALL(move_fd >= 0, "request successful move");
     REQUIRE(wait_for_path(marker_path, 1000),
             "fake kitten did not start successful move");
+    REQUIRE(mux_send_line(source_fd, "FOCUS\t1"),
+            "send delayed source focus: %s",
+            g_strerror(errno));
+    REQUIRE_CALL(wait_for_active_state(socket_path,
+                                       source_id,
+                                       "main",
+                                       STATE_TIMEOUT_MS,
+                                       &error),
+                 "observe delayed focus during move");
     {
         guint count = 0;
         gint64 started_us = g_get_monotonic_time();
 
         REQUIRE_CALL(query_view_count(socket_path, &count, &error),
                      "query status while move is pending");
-        REQUIRE(count == 3, "pending move changed view count to %u", count);
+        REQUIRE(count == 4, "pending move changed view count to %u", count);
         REQUIRE(g_get_monotonic_time() - started_us < 500 * 1000,
                 "pending move blocked daemon control traffic");
     }
@@ -1133,6 +1340,52 @@ static void test_muxd_async_move_and_queued_replies(void)
             "successful move recorded layer %s",
             observed_layer);
     g_clear_pointer(&observed_layer, g_free);
+    REQUIRE_CALL(wait_for_active_state(socket_path,
+                                       timeout_source_id,
+                                       "main",
+                                       STATE_TIMEOUT_MS,
+                                       &error),
+                 "reconcile active view after move");
+
+    REQUIRE_CALL(set_current_layer(socket_path, "empty", &error),
+                 "select empty layer");
+    REQUIRE_CALL(wait_for_active_state(socket_path,
+                                       "",
+                                       "empty",
+                                       STATE_TIMEOUT_MS,
+                                       &error),
+                 "clear active view on empty layer");
+    REQUIRE_CALL(set_current_layer(socket_path, "main", &error),
+                 "restore main layer");
+    REQUIRE_CALL(wait_for_active_state(socket_path,
+                                       timeout_source_id,
+                                       "main",
+                                       STATE_TIMEOUT_MS,
+                                       &error),
+                 "select deterministic main-layer view");
+
+    REQUIRE(mux_send_line(fallback_fd, "FOCUS\t1"),
+            "focus fallback view: %s",
+            g_strerror(errno));
+    REQUIRE_CALL(wait_for_active_state(socket_path,
+                                       fallback_id,
+                                       "main",
+                                       STATE_TIMEOUT_MS,
+                                       &error),
+                 "observe focused fallback view");
+    close(fallback_fd);
+    fallback_fd = -1;
+    REQUIRE_CALL(wait_for_view_count(socket_path,
+                                     3,
+                                     STATE_TIMEOUT_MS,
+                                     &error),
+                 "wait for focused fallback removal");
+    REQUIRE_CALL(wait_for_active_state(socket_path,
+                                       timeout_source_id,
+                                       "main",
+                                       STATE_TIMEOUT_MS,
+                                       &error),
+                 "reconcile active view after removal");
 
     (void)g_unlink(marker_path);
     move_fd = request_move(socket_path,
@@ -1171,6 +1424,8 @@ static void test_muxd_async_move_and_queued_replies(void)
 cleanup:
     if (move_fd >= 0)
         close(move_fd);
+    if (fallback_fd >= 0)
+        close(fallback_fd);
     if (timeout_source_fd >= 0)
         close(timeout_source_fd);
     if (source_fd >= 0)
@@ -1204,6 +1459,7 @@ cleanup:
     g_free(error_message);
     g_free(observed_layer);
     g_free(move_response);
+    g_free(fallback_id);
     g_free(timeout_source_id);
     g_free(source_id);
     g_free(target_id);
@@ -1218,6 +1474,198 @@ cleanup:
     g_free(old_marker);
     g_free(old_path);
     g_free(old_ephemeral);
+    g_free(old_state);
+    g_free(old_runtime);
+}
+
+static void test_muxctl_requires_complete_response(void)
+{
+    gchar *root = NULL;
+    gchar *runtime_dir = NULL;
+    gchar *mux_dir = NULL;
+    gchar *socket_path = NULL;
+    gchar *old_runtime = g_strdup(g_getenv("XDG_RUNTIME_DIR"));
+    GError *error = NULL;
+    pid_t server_pid = -1;
+    mode_t old_umask = umask(0077);
+
+    root = g_dir_make_tmp("muxctl-response-integration-XXXXXX", &error);
+    REQUIRE_CALL(root != NULL, "create muxctl response root");
+    runtime_dir = g_build_filename(root, "runtime", NULL);
+    mux_dir = g_build_filename(runtime_dir, "mux", NULL);
+    socket_path = g_build_filename(mux_dir, "muxd.sock", NULL);
+    REQUIRE(g_mkdir(runtime_dir, 0700) == 0,
+            "create runtime directory: %s",
+            g_strerror(errno));
+    REQUIRE(g_mkdir(mux_dir, 0700) == 0,
+            "create mux runtime directory: %s",
+            g_strerror(errno));
+    REQUIRE(g_setenv("XDG_RUNTIME_DIR", runtime_dir, TRUE),
+            "set XDG_RUNTIME_DIR");
+
+    server_pid = spawn_silent_muxd(socket_path, 0, &error);
+    REQUIRE_CALL(server_pid > 0, "start EOF fake muxd");
+    REQUIRE(!run_command(muxctl_executable,
+                         "status",
+                         CHILD_TIMEOUT_MS,
+                         &error),
+            "muxctl accepted EOF without a complete response");
+    g_clear_error(&error);
+    REQUIRE_CALL(wait_child_success(server_pid,
+                                    CHILD_TIMEOUT_MS,
+                                    &error),
+                 "reap EOF fake muxd");
+    server_pid = -1;
+    (void)g_unlink(socket_path);
+
+    server_pid = spawn_silent_muxd(socket_path, 5500, &error);
+    REQUIRE_CALL(server_pid > 0, "start timeout fake muxd");
+    {
+        gint64 started_us = g_get_monotonic_time();
+
+        REQUIRE(!run_command(muxctl_executable,
+                             "status",
+                             7000,
+                             &error),
+                "muxctl accepted a response timeout as success");
+        REQUIRE(g_get_monotonic_time() - started_us >= 4500 * 1000,
+                "muxctl response deadline was not above muxd move timeout");
+    }
+    g_clear_error(&error);
+    REQUIRE_CALL(wait_child_success(server_pid,
+                                    CHILD_TIMEOUT_MS,
+                                    &error),
+                 "reap timeout fake muxd");
+    server_pid = -1;
+
+cleanup:
+    if (server_pid > 0)
+        reap_forcefully(server_pid);
+    g_clear_error(&error);
+    remove_tree(root);
+    restore_environment("XDG_RUNTIME_DIR", old_runtime);
+    (void)umask(old_umask);
+    g_free(socket_path);
+    g_free(mux_dir);
+    g_free(runtime_dir);
+    g_free(root);
+    g_free(old_runtime);
+}
+
+static void test_muxd_ensure_timeout_reaps_owned_child(void)
+{
+    gchar *root = NULL;
+    gchar *runtime_dir = NULL;
+    gchar *state_dir = NULL;
+    gchar *socket_path = NULL;
+    gchar *pid_path = NULL;
+    gchar *pid_text = NULL;
+    gchar *old_runtime = g_strdup(g_getenv("XDG_RUNTIME_DIR"));
+    gchar *old_state = g_strdup(g_getenv("XDG_STATE_HOME"));
+    gchar *old_delay =
+        g_strdup(g_getenv("MUX_TEST_ENSURE_STARTUP_DELAY_MS"));
+    gchar *old_pid_file =
+        g_strdup(g_getenv("MUX_TEST_ENSURE_CHILD_PID_FILE"));
+    GError *error = NULL;
+    struct ucred daemon_credentials;
+    int guard_fd = -1;
+    pid_t daemon_pid = -1;
+    pid_t delayed_pid = -1;
+    mode_t old_umask = umask(0077);
+
+    root = g_dir_make_tmp("muxd-ensure-timeout-XXXXXX", &error);
+    REQUIRE_CALL(root != NULL, "create ensure timeout root");
+    runtime_dir = g_build_filename(root, "runtime", NULL);
+    state_dir = g_build_filename(root, "state", NULL);
+    socket_path =
+        g_build_filename(runtime_dir, "mux", "muxd.sock", NULL);
+    pid_path = g_build_filename(root, "delayed-child.pid", NULL);
+    REQUIRE(g_mkdir(runtime_dir, 0700) == 0,
+            "create runtime directory: %s",
+            g_strerror(errno));
+    REQUIRE(g_mkdir(state_dir, 0700) == 0,
+            "create state directory: %s",
+            g_strerror(errno));
+    REQUIRE(g_setenv("XDG_RUNTIME_DIR", runtime_dir, TRUE),
+            "set XDG_RUNTIME_DIR");
+    REQUIRE(g_setenv("XDG_STATE_HOME", state_dir, TRUE),
+            "set XDG_STATE_HOME");
+    REQUIRE(g_setenv("MUX_TEST_ENSURE_STARTUP_DELAY_MS", "10000", TRUE),
+            "set ensure startup delay");
+    REQUIRE(g_setenv("MUX_TEST_ENSURE_CHILD_PID_FILE", pid_path, TRUE),
+            "set ensure child pid file");
+
+    REQUIRE(!run_command(muxd_executable,
+                         "--ensure",
+                         CHILD_TIMEOUT_MS,
+                         &error),
+            "delayed muxd --ensure unexpectedly succeeded");
+    g_clear_error(&error);
+    REQUIRE(wait_for_path(pid_path, STATE_TIMEOUT_MS),
+            "delayed ensure child did not publish its pid");
+    REQUIRE_CALL(g_file_get_contents(pid_path,
+                                     &pid_text,
+                                     NULL,
+                                     &error),
+                 "read delayed ensure child pid");
+    delayed_pid = (pid_t)g_ascii_strtoll(pid_text, NULL, 10);
+    REQUIRE(delayed_pid > 1, "invalid delayed child pid: %s", pid_text);
+    errno = 0;
+    REQUIRE(kill(delayed_pid, 0) < 0 && errno == ESRCH,
+            "delayed ensure child %ld was not terminated and reaped",
+            (long)delayed_pid);
+    REQUIRE(wait_for_path_absent(socket_path, STATE_TIMEOUT_MS),
+            "owned stale muxd socket was not removed");
+
+    g_unsetenv("MUX_TEST_ENSURE_STARTUP_DELAY_MS");
+    g_unsetenv("MUX_TEST_ENSURE_CHILD_PID_FILE");
+    REQUIRE_CALL(run_command(muxd_executable,
+                             "--ensure",
+                             CHILD_TIMEOUT_MS,
+                             &error),
+                 "start muxd after failed ensure cleanup");
+    guard_fd = connect_unix_socket(socket_path,
+                                   CONNECT_TIMEOUT_MS,
+                                   &error);
+    REQUIRE_CALL(guard_fd >= 0, "connect replacement muxd");
+    REQUIRE_CALL(get_peer_credentials(guard_fd,
+                                      &daemon_credentials,
+                                      &error),
+                 "identify replacement muxd");
+    daemon_pid = daemon_credentials.pid;
+
+cleanup:
+    if (daemon_pid > 1 && socket_path != NULL) {
+        GError *stop_error = NULL;
+
+        if (!stop_identified_daemon(socket_path,
+                                    daemon_pid,
+                                    &stop_error)) {
+            g_test_message("stop replacement muxd: %s",
+                           stop_error != NULL
+                               ? stop_error->message
+                               : "unknown error");
+            g_test_fail();
+        }
+        g_clear_error(&stop_error);
+    }
+    if (guard_fd >= 0)
+        close(guard_fd);
+    g_clear_error(&error);
+    remove_tree(root);
+    restore_environment("XDG_RUNTIME_DIR", old_runtime);
+    restore_environment("XDG_STATE_HOME", old_state);
+    restore_environment("MUX_TEST_ENSURE_STARTUP_DELAY_MS", old_delay);
+    restore_environment("MUX_TEST_ENSURE_CHILD_PID_FILE", old_pid_file);
+    (void)umask(old_umask);
+    g_free(pid_text);
+    g_free(pid_path);
+    g_free(socket_path);
+    g_free(state_dir);
+    g_free(runtime_dir);
+    g_free(root);
+    g_free(old_pid_file);
+    g_free(old_delay);
     g_free(old_state);
     g_free(old_runtime);
 }
@@ -1242,6 +1690,10 @@ int main(int argc, char **argv)
                     test_muxd_identity_lifecycle);
     g_test_add_func("/muxd/integration/async-move-and-queued-replies",
                     test_muxd_async_move_and_queued_replies);
+    g_test_add_func("/muxd/integration/muxctl-complete-response",
+                    test_muxctl_requires_complete_response);
+    g_test_add_func("/muxd/integration/ensure-timeout-reaps-owned-child",
+                    test_muxd_ensure_timeout_reaps_owned_child);
     result = g_test_run();
 
     g_free(muxctl_executable);

@@ -60,9 +60,11 @@
                   gst_all_1.gstreamer
                   gst_all_1.gst-plugins-base
                   gst_all_1.gst-plugins-bad
-                  harfbuzz
+                  harfbuzzFull
+                  harfbuzzFull.dev
                   hyphen
                   icu
+                  icu.dev
                   lcms2
                   libGL
                   libGLU
@@ -92,8 +94,12 @@
                   nettle
                   openjpeg
                   p11-kit
+                  pcre2
+                  pcre2.dev
                   sqlite
                   systemdLibs
+                  util-linux
+                  util-linux.dev
                   wayland
                   wayland-protocols
                   woff2

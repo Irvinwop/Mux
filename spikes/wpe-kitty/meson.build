@@ -34,6 +34,7 @@ executable(
     'src/main.c',
     'src/mux-ipc.c',
     'src/mux-protocol.c',
+    'src/mux-shortcuts.c',
   ],
   dependencies: view_deps,
   install: false,
@@ -79,6 +80,7 @@ executable(
   [
     'src/mux-bar.c',
     'src/mux-protocol.c',
+    'src/mux-shortcuts.c',
   ],
   dependencies: [glib_dep],
   install: true,
@@ -103,6 +105,7 @@ executable(
   [
     'src/mux-engine.c',
     'src/mux-engine-protocol.c',
+    'src/mux-shortcuts.c',
     'mux-clipboard.c',
     'mux-clipboard-wire.c',
     'mux-wpe-clipboard.c',
@@ -134,6 +137,7 @@ executable(
   [
     'src/mux-pane.c',
     'src/mux-engine-protocol.c',
+    'src/mux-shortcuts.c',
     'src/mux-protocol.c',
     'mux-pane-clipboard.c',
     'mux-clipboard.c',
@@ -201,6 +205,7 @@ engine_protocol_test = executable(
       'src/mux-engine-protocol.c',
       'src/mux-engine.c',
       'src/mux-pane.c',
+      'src/mux-shortcuts.c',
       'mux-uri.c',
     ],
     c_args: [
@@ -319,3 +324,18 @@ browser_store_test = executable(
 )
 
 test('browser-store', browser_store_test)
+
+file_chooser_engine_test = executable(
+  'test-file-chooser-engine',
+  [
+    'tests/test-file-chooser-engine.c',
+    'mux-ui-protocol.c',
+  ],
+  dependencies: engine_dependencies,
+)
+
+test(
+  'file-chooser-engine',
+  file_chooser_engine_test,
+  timeout: 20,
+)

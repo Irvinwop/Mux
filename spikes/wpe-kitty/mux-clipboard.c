@@ -159,6 +159,39 @@ mux_clipboard_snapshot_add(MuxClipboardSnapshot *snapshot,
     return TRUE;
 }
 
+MuxClipboardSnapshot *
+mux_clipboard_snapshot_new_sealed_from_items(
+    guint64 serial,
+    const MuxClipboardSnapshotItem *items,
+    guint item_count,
+    GError **error)
+{
+    MuxClipboardSnapshot *snapshot;
+    guint i;
+
+    if (item_count > MUX_CLIPBOARD_MAX_ITEMS ||
+        (item_count > 0 && items == NULL)) {
+        g_set_error_literal(error,
+                            MUX_CLIPBOARD_ERROR,
+                            MUX_CLIPBOARD_ERROR_LIMIT,
+                            "clipboard snapshot has too many items");
+        return NULL;
+    }
+
+    snapshot = mux_clipboard_snapshot_new(serial);
+    for (i = 0; i < item_count; i++) {
+        if (!mux_clipboard_snapshot_add(snapshot,
+                                        items[i].mime,
+                                        items[i].bytes,
+                                        error)) {
+            mux_clipboard_snapshot_unref(snapshot);
+            return NULL;
+        }
+    }
+    mux_clipboard_snapshot_seal(snapshot);
+    return snapshot;
+}
+
 void
 mux_clipboard_snapshot_seal(MuxClipboardSnapshot *snapshot)
 {

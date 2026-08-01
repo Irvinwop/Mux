@@ -97,6 +97,11 @@ typedef struct {
 #define MAX_CLIENT_OUTPUT_BYTES (1024u * 1024u)
 #define MAX_CLIENT_IO_BYTES_PER_TICK (64u * 1024u)
 #define KITTY_MOVE_TIMEOUT_MS 2500u
+#define ENSURE_STARTUP_TIMEOUT_MS 2000u
+#define ENSURE_PING_TIMEOUT_MS 50
+#define ENSURE_STARTUP_POLL_US 10000u
+#define ENSURE_TERMINATE_GRACE_MS 500u
+#define ENSURE_KILL_GRACE_MS 500u
 
 static volatile sig_atomic_t stop_requested;
 
@@ -489,6 +494,7 @@ static Client *find_layer_view(Server *server, const gchar *layer)
     for (guint i = 0; i < server->clients->len; i++) {
         Client *client = g_ptr_array_index(server->clients, i);
         if (client->kind == CLIENT_VIEW &&
+            !client->closing && client->fd >= 0 &&
             g_strcmp0(client->layer, layer) == 0) {
             return client;
         }
@@ -537,6 +543,7 @@ static gboolean kitty_window_id_is_valid(const gchar *id)
 
 static void control_error(Client *client, const gchar *message);
 static void broadcast_view(Server *server, Client *view, const gchar *event);
+static void reconcile_active(Server *server, Client *preferred);
 
 static void pending_move_destroy_source(GSource **source)
 {
@@ -595,6 +602,7 @@ static void kitty_move_child_exited(GPid child_pid,
         replace_string(&source->layer, g_steal_pointer(&move->layer));
         update_persisted_view(move->server, source);
         broadcast_view(move->server, source, "UPSERT");
+        reconcile_active(move->server, NULL);
         if (control != NULL && !control->closing) {
             client_send_line(control, "OK");
             client_close_after_flush(control);
@@ -878,7 +886,7 @@ static void broadcast_layer(Server *server)
 
 static void set_active(Server *server, Client *view)
 {
-    if (!view || view->kind != CLIENT_VIEW)
+    if (!view || view->kind != CLIENT_VIEW || view->closing || view->fd < 0)
         return;
 
     if (g_strcmp0(server->current_layer, view->layer) != 0) {
@@ -889,19 +897,43 @@ static void set_active(Server *server, Client *view)
         broadcast_layer(server);
     }
 
+    reconcile_active(server, view);
+}
+
+static gboolean view_is_live_in_current_layer(Server *server, Client *view)
+{
+    return view != NULL && view->kind == CLIENT_VIEW && !view->closing &&
+           view->fd >= 0 &&
+           g_strcmp0(view->layer, server->current_layer) == 0;
+}
+
+static void reconcile_active(Server *server, Client *preferred)
+{
+    Client *selected = preferred;
+
+    if (!view_is_live_in_current_layer(server, selected)) {
+        selected = find_view(server, server->active_id);
+        if (!view_is_live_in_current_layer(server, selected))
+            selected = find_layer_view(server, server->current_layer);
+    }
+
     for (guint i = 0; i < server->clients->len; i++) {
         Client *candidate = g_ptr_array_index(server->clients, i);
-        if (candidate->kind != CLIENT_VIEW)
+        gboolean focused;
+
+        if (candidate->kind != CLIENT_VIEW || candidate->closing)
             continue;
-        gboolean focused = candidate == view;
+        focused = candidate == selected;
         if (candidate->focused != focused) {
             candidate->focused = focused;
             broadcast_view(server, candidate, "UPSERT");
         }
     }
 
-    if (g_strcmp0(server->active_id, view->id) != 0) {
-        replace_string(&server->active_id, g_strdup(view->id));
+    if (g_strcmp0(server->active_id,
+                  selected != NULL ? selected->id : NULL) != 0) {
+        replace_string(&server->active_id,
+                       selected != NULL ? g_strdup(selected->id) : NULL);
         broadcast_active(server);
     }
 }
@@ -1018,8 +1050,8 @@ static void handle_control(
                                          NULL);
         broadcast_layer(server);
         Client *view = find_layer_view(server, server->current_layer);
+        reconcile_active(server, view);
         if (view) {
-            set_active(server, view);
             kitty_focus(view);
         }
         client_send_line(client, "OK");
@@ -1193,6 +1225,7 @@ static void handle_view(
         replace_string(&client->layer, layer);
         update_persisted_view(server, client);
         broadcast_view(server, client, "UPSERT");
+        reconcile_active(server, NULL);
         return;
     }
     if (g_strcmp0(fields[0], "PROMPT") == 0) {
@@ -1398,20 +1431,7 @@ static void remove_closed_clients(Server *server)
                                               client->session_view_id))
                 schedule_session_write(server);
             broadcast_view(server, client, "REMOVE");
-            if (g_strcmp0(server->active_id, client->id) == 0) {
-                g_clear_pointer(&server->active_id, g_free);
-                for (guint j = 0; j < server->clients->len; j++) {
-                    Client *candidate = g_ptr_array_index(server->clients, j);
-                    if (candidate != client &&
-                        candidate->kind == CLIENT_VIEW &&
-                        !candidate->closing) {
-                        server->active_id = g_strdup(candidate->id);
-                        candidate->focused = TRUE;
-                        break;
-                    }
-                }
-                broadcast_active(server);
-            }
+            reconcile_active(server, NULL);
         }
         g_ptr_array_remove_index(server->clients, (guint)i);
     }
@@ -1572,6 +1592,30 @@ static int create_listener(gchar **path_out, int *lock_fd_out)
     return fd;
 }
 
+static void ensure_startup_test_hook(void)
+{
+    const gchar *pid_path = g_getenv("MUX_TEST_ENSURE_CHILD_PID_FILE");
+    const gchar *delay_value = g_getenv("MUX_TEST_ENSURE_STARTUP_DELAY_MS");
+
+    if (pid_path != NULL && *pid_path != '\0') {
+        g_autofree gchar *pid_text =
+            g_strdup_printf("%ld\n", (long)getpid());
+
+        (void)g_file_set_contents(pid_path, pid_text, -1, NULL);
+    }
+
+    if (delay_value != NULL && *delay_value != '\0') {
+        gchar *end = NULL;
+        guint64 delay_ms;
+
+        errno = 0;
+        delay_ms = g_ascii_strtoull(delay_value, &end, 10);
+        if (errno == 0 && end != delay_value && *end == '\0' &&
+            delay_ms <= 60000u)
+            g_usleep(delay_ms * 1000u);
+    }
+}
+
 static int run_server(void)
 {
     Server server = {
@@ -1595,6 +1639,8 @@ static int run_server(void)
         g_main_context_unref(server.main_context);
         return EXIT_FAILURE;
     }
+
+    ensure_startup_test_hook();
 
     server.session_path = mux_session_state_default_path();
     g_autoptr(GError) session_error = NULL;
@@ -1704,17 +1750,106 @@ static int run_server(void)
     return EXIT_SUCCESS;
 }
 
-static gboolean daemon_alive(void)
+static gboolean daemon_alive_with_timeout(gint timeout_ms)
 {
     int fd = mux_connect_socket();
     if (fd < 0)
         return FALSE;
     gboolean sent = mux_send_line(fd, "CTL\tPING");
-    gchar *response = sent ? mux_read_line(fd, 500) : NULL;
+    gchar *response = sent ? mux_read_line(fd, timeout_ms) : NULL;
     gboolean alive = response && g_str_has_prefix(response, "PONG\t");
     g_free(response);
     close(fd);
     return alive;
+}
+
+static gboolean daemon_alive(void)
+{
+    return daemon_alive_with_timeout(500);
+}
+
+typedef struct {
+    gchar *path;
+    dev_t device;
+    ino_t inode;
+    gboolean captured;
+} EnsureOwnedSocket;
+
+static void ensure_owned_socket_capture(EnsureOwnedSocket *owned, pid_t pid)
+{
+    struct ucred credentials;
+    socklen_t credentials_size = sizeof(credentials);
+    struct stat status;
+    int fd;
+
+    owned->path = mux_socket_path();
+    fd = mux_connect_socket();
+    if (fd < 0)
+        return;
+    if (getsockopt(fd,
+                   SOL_SOCKET,
+                   SO_PEERCRED,
+                   &credentials,
+                   &credentials_size) == 0 &&
+        credentials_size == sizeof(credentials) &&
+        credentials.pid == pid && credentials.uid == geteuid() &&
+        lstat(owned->path, &status) == 0 && S_ISSOCK(status.st_mode) &&
+        status.st_uid == geteuid()) {
+        owned->device = status.st_dev;
+        owned->inode = status.st_ino;
+        owned->captured = TRUE;
+    }
+    close(fd);
+}
+
+static void ensure_owned_socket_cleanup(EnsureOwnedSocket *owned)
+{
+    struct stat status;
+
+    if (owned->captured && lstat(owned->path, &status) == 0 &&
+        S_ISSOCK(status.st_mode) && status.st_uid == geteuid() &&
+        status.st_dev == owned->device && status.st_ino == owned->inode &&
+        unlink(owned->path) < 0 && errno != ENOENT) {
+        g_printerr("muxd: failed to remove owned stale socket: %s\n",
+                   g_strerror(errno));
+    }
+    g_clear_pointer(&owned->path, g_free);
+}
+
+static gboolean terminate_and_reap_ensure_child(pid_t pid)
+{
+    gint64 deadline_us =
+        g_get_monotonic_time() +
+        ((gint64)ENSURE_TERMINATE_GRACE_MS * 1000);
+    int status;
+
+    if (kill(pid, SIGTERM) < 0 && errno != ESRCH)
+        return FALSE;
+
+    while (g_get_monotonic_time() < deadline_us) {
+        pid_t result = waitpid(pid, &status, WNOHANG);
+
+        if (result == pid)
+            return TRUE;
+        if (result < 0 && errno != EINTR)
+            return errno == ECHILD;
+        g_usleep(10000);
+    }
+
+    if (kill(pid, SIGKILL) < 0 && errno != ESRCH)
+        return FALSE;
+    deadline_us = g_get_monotonic_time() +
+        ((gint64)ENSURE_KILL_GRACE_MS * 1000);
+    while (g_get_monotonic_time() < deadline_us) {
+        pid_t result = waitpid(pid, &status, WNOHANG);
+
+        if (result == pid)
+            return TRUE;
+        if (result < 0 && errno != EINTR)
+            return errno == ECHILD;
+        g_usleep(10000);
+    }
+    return FALSE;
 }
 
 static int ensure_daemon(void)
@@ -1742,10 +1877,37 @@ static int ensure_daemon(void)
         _exit(run_server());
     }
 
-    for (guint attempt = 0; attempt < 200; attempt++) {
-        if (daemon_alive())
+    gint64 startup_deadline_us =
+        g_get_monotonic_time() +
+        ((gint64)ENSURE_STARTUP_TIMEOUT_MS * 1000);
+
+    while (g_get_monotonic_time() < startup_deadline_us) {
+        int status;
+        pid_t wait_result;
+
+        if (daemon_alive_with_timeout(ENSURE_PING_TIMEOUT_MS))
             return EXIT_SUCCESS;
-        g_usleep(10000);
+        wait_result = waitpid(pid, &status, WNOHANG);
+        if (wait_result == pid) {
+            g_printerr("muxd: daemon exited before becoming ready\n");
+            return EXIT_FAILURE;
+        }
+        if (wait_result < 0 && errno != EINTR) {
+            g_printerr("muxd: cannot monitor daemon startup: %s\n",
+                       g_strerror(errno));
+            return EXIT_FAILURE;
+        }
+        g_usleep(ENSURE_STARTUP_POLL_US);
+    }
+
+    EnsureOwnedSocket owned = { 0 };
+
+    ensure_owned_socket_capture(&owned, pid);
+    if (!terminate_and_reap_ensure_child(pid)) {
+        g_printerr("muxd: failed to terminate startup child %ld\n", (long)pid);
+        g_clear_pointer(&owned.path, g_free);
+    } else {
+        ensure_owned_socket_cleanup(&owned);
     }
     g_printerr("muxd: daemon did not become ready\n");
     return EXIT_FAILURE;

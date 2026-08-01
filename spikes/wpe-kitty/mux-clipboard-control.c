@@ -218,10 +218,16 @@ mux_clipboard_control_summary_encode(
     GBytes *packet;
     gsize origin_length;
     gsize preview_length;
+    gsize mime_bytes = 0;
+    guint32 encoded_mime_count = 0;
+    guint32 i;
 
     g_return_val_if_fail(summary != NULL, NULL);
     if (summary->entry_id == 0 || summary->created_us < 0 ||
         summary->source_origin == NULL || summary->preview == NULL ||
+        summary->mime_type_count > summary->format_count ||
+        summary->format_count > MUX_CLIPBOARD_MAX_ITEMS ||
+        (summary->mime_type_count > 0 && summary->mime_types == NULL) ||
         !g_utf8_validate(summary->source_origin, -1, NULL) ||
         !g_utf8_validate(summary->preview, -1, NULL)) {
         set_invalid(error, "invalid clipboard summary");
@@ -230,9 +236,25 @@ mux_clipboard_control_summary_encode(
 
     origin_length = strlen(summary->source_origin);
     preview_length = strlen(summary->preview);
+    for (i = 0; i < summary->mime_type_count; i++) {
+        gsize mime_length;
+
+        if (!mux_clipboard_mime_is_valid(summary->mime_types[i])) {
+            set_invalid(error, "invalid MIME type in clipboard summary");
+            return NULL;
+        }
+        mime_length = strlen(summary->mime_types[i]);
+        if (SUMMARY_FIXED_SIZE + origin_length + preview_length +
+                mime_bytes + 2 + mime_length >
+            MUX_CLIPBOARD_CONTROL_MAX_PAYLOAD)
+            break;
+        mime_bytes += 2 + mime_length;
+        encoded_mime_count++;
+    }
+
     if (origin_length > MUX_CLIPBOARD_CONTROL_MAX_TEXT ||
         preview_length > MUX_CLIPBOARD_CONTROL_MAX_TEXT ||
-        SUMMARY_FIXED_SIZE + origin_length + preview_length >
+        SUMMARY_FIXED_SIZE + origin_length + preview_length + mime_bytes >
             MUX_CLIPBOARD_CONTROL_MAX_PAYLOAD) {
         g_set_error_literal(error,
                             MUX_CLIPBOARD_CONTROL_ERROR,
@@ -244,10 +266,11 @@ mux_clipboard_control_summary_encode(
     write_u32(fixed + 0, origin_length);
     write_u32(fixed + 4, preview_length);
     write_u32(fixed + 8, summary->format_count);
+    write_u32(fixed + 12, encoded_mime_count);
     write_u64(fixed + 16, summary->source_view_id);
     write_u64(fixed + 24, summary->total_bytes);
-    payload = g_byte_array_sized_new(SUMMARY_FIXED_SIZE +
-                                     origin_length + preview_length);
+    payload = g_byte_array_sized_new(SUMMARY_FIXED_SIZE + origin_length +
+                                     preview_length + mime_bytes);
     g_byte_array_append(payload, fixed, sizeof(fixed));
     g_byte_array_append(payload,
                         (const guint8 *)summary->source_origin,
@@ -255,6 +278,16 @@ mux_clipboard_control_summary_encode(
     g_byte_array_append(payload,
                         (const guint8 *)summary->preview,
                         preview_length);
+    for (i = 0; i < encoded_mime_count; i++) {
+        guint8 encoded_length[2];
+        gsize mime_length = strlen(summary->mime_types[i]);
+
+        write_u16(encoded_length, (guint16)mime_length);
+        g_byte_array_append(payload, encoded_length, sizeof(encoded_length));
+        g_byte_array_append(payload,
+                            (const guint8 *)summary->mime_types[i],
+                            mime_length);
+    }
     payload_bytes = g_byte_array_free_to_bytes(payload);
 
     record.type = MUX_CLIPBOARD_CONTROL_SUMMARY;
@@ -280,6 +313,9 @@ mux_clipboard_control_summary_decode(
     gsize length;
     guint32 origin_length;
     guint32 preview_length;
+    guint32 mime_type_count;
+    gsize offset;
+    guint32 i;
 
     g_return_val_if_fail(record != NULL, FALSE);
     g_return_val_if_fail(summary != NULL, FALSE);
@@ -290,13 +326,16 @@ mux_clipboard_control_summary_decode(
         return set_invalid(error, "record is not a clipboard summary");
 
     data = g_bytes_get_data(record->payload, &length);
-    if (length < SUMMARY_FIXED_SIZE || read_u32(data + 12) != 0)
+    if (length < SUMMARY_FIXED_SIZE)
         return set_invalid(error, "clipboard summary is truncated");
     origin_length = read_u32(data + 0);
     preview_length = read_u32(data + 4);
+    mime_type_count = read_u32(data + 12);
     if (origin_length > MUX_CLIPBOARD_CONTROL_MAX_TEXT ||
         preview_length > MUX_CLIPBOARD_CONTROL_MAX_TEXT ||
-        length != SUMMARY_FIXED_SIZE + origin_length + preview_length)
+        read_u32(data + 8) > MUX_CLIPBOARD_MAX_ITEMS ||
+        mime_type_count > read_u32(data + 8) ||
+        length < SUMMARY_FIXED_SIZE + origin_length + preview_length)
         return set_invalid(error, "clipboard summary length mismatch");
     if ((origin_length > 0 &&
          (memchr(data + SUMMARY_FIXED_SIZE, '\0', origin_length) != NULL ||
@@ -325,7 +364,34 @@ mux_clipboard_control_summary_decode(
     summary->format_count = read_u32(data + 8);
     summary->source_view_id = read_u64(data + 16);
     summary->total_bytes = read_u64(data + 24);
+    summary->mime_type_count = mime_type_count;
+    summary->mime_types = g_new0(gchar *, mime_type_count + 1);
+    offset = SUMMARY_FIXED_SIZE + origin_length + preview_length;
+    for (i = 0; i < mime_type_count; i++) {
+        guint16 mime_length;
+
+        if (offset + 2 > length)
+            goto invalid_mimes;
+        mime_length = read_u16(data + offset);
+        offset += 2;
+        if (mime_length == 0 || mime_length > MUX_CLIPBOARD_MAX_MIME ||
+            offset + mime_length > length ||
+            memchr(data + offset, '\0', mime_length) != NULL) {
+            goto invalid_mimes;
+        }
+        summary->mime_types[i] =
+            g_strndup((const gchar *)data + offset, mime_length);
+        if (!mux_clipboard_mime_is_valid(summary->mime_types[i]))
+            goto invalid_mimes;
+        offset += mime_length;
+    }
+    if (offset != length)
+        goto invalid_mimes;
     return TRUE;
+
+invalid_mimes:
+    mux_clipboard_control_summary_clear(summary);
+    return set_invalid(error, "clipboard summary MIME list is invalid");
 }
 
 void
@@ -335,5 +401,6 @@ mux_clipboard_control_summary_clear(MuxClipboardControlSummary *summary)
         return;
     g_free(summary->source_origin);
     g_free(summary->preview);
+    g_strfreev(summary->mime_types);
     memset(summary, 0, sizeof(*summary));
 }

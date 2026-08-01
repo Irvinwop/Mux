@@ -227,6 +227,7 @@ mux_clipboard_broker_summary_free(MuxClipboardBrokerSummary *summary)
         return;
     g_free(summary->source_origin);
     g_free(summary->preview);
+    g_strfreev(summary->mime_types);
     g_free(summary);
 }
 
@@ -253,6 +254,7 @@ mux_clipboard_broker_list(MuxClipboardBroker *broker,
             mux_clipboard_history_entry_get_snapshot(entry);
         MuxClipboardBrokerSummary *summary =
             g_new0(MuxClipboardBrokerSummary, 1);
+        guint format_index;
 
         summary->id = mux_clipboard_history_entry_get_id(entry);
         summary->created_us =
@@ -265,6 +267,19 @@ mux_clipboard_broker_list(MuxClipboardBroker *broker,
             mux_clipboard_history_entry_get_pinned(entry);
         summary->format_count =
             mux_clipboard_snapshot_get_count(snapshot);
+        summary->mime_type_count = summary->format_count;
+        summary->mime_types = g_new0(gchar *, summary->format_count + 1);
+        for (format_index = 0;
+             format_index < summary->format_count;
+             format_index++) {
+            const gchar *mime = NULL;
+
+            mux_clipboard_snapshot_get_item(snapshot,
+                                            format_index,
+                                            &mime,
+                                            NULL);
+            summary->mime_types[format_index] = g_strdup(mime);
+        }
         summary->total_bytes =
             mux_clipboard_snapshot_get_total_bytes(snapshot);
         summary->preview =

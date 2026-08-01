@@ -86,17 +86,18 @@ events between Kitty panes and WPE views. It also has trusted request paths for
 dialogs, permission decisions, authentication, file selection, downloads,
 menus, popups, notifications, clipboard operations, and renderer crashes.
 
-The intended browser bindings are:
+The browser bindings use `Super` as the canonical Mux modifier. The listed
+`Ctrl` forms are explicit Linux compatibility aliases:
 
-- `Ctrl+L`: edit the global URL bar
-- `Ctrl+R`: reload
+- `Super+L` (`Ctrl+L`): edit the global URL bar
+- `Super+R` (`Ctrl+R`): reload
 - `Alt+Left` and `Alt+Right`: navigate page history
-- `Ctrl+Shift+V`: open profile clipboard history
-- `Ctrl+Shift+P`: open commands, bookmarks, history, and recently closed pages
-- `Ctrl+D`: toggle a bookmark for the current page
-- `Ctrl+Q`: close the pane
-- `Ctrl+Shift+Enter`: open a split
-- `Ctrl+Shift+T`: open a layer in another Kitty tab
+- `Super+Shift+V` (`Ctrl+Shift+V`): open profile clipboard history
+- `Super+Shift+P` (`Ctrl+Shift+P`): open commands, bookmarks, history, and recently closed pages
+- `Super+D` (`Ctrl+D`): toggle a bookmark for the current page
+- `Super+Q` (`Ctrl+Q`): close the pane
+- `Super+Shift+Enter` (`Ctrl+Shift+Enter`): open a split
+- `Super+Shift+T` (`Ctrl+Shift+T`): open a layer in another Kitty tab
 
 These paths are not all release-qualified. User Kitty mappings may override or
 conflict with Mux bindings.

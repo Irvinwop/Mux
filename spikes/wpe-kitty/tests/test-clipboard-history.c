@@ -346,7 +346,7 @@ test_entry_and_total_bounds(void)
   snapshot = test_sized_snapshot_new(
       100,
       "application/x-oversized",
-      MUX_CLIPBOARD_HISTORY_MAX_ITEM_BYTES + 1,
+      MUX_CLIPBOARD_HISTORY_MAX_BYTES,
       0xaa);
   g_assert_cmpint(mux_clipboard_history_add(history,
                                             snapshot,
@@ -356,16 +356,16 @@ test_entry_and_total_bounds(void)
                                             NULL,
                                             &error),
                   ==,
-                  MUX_CLIPBOARD_HISTORY_IGNORED);
-  g_assert_error(error, G_IO_ERROR, G_IO_ERROR_NO_SPACE);
-  g_clear_error(&error);
+                  MUX_CLIPBOARD_HISTORY_ADDED);
+  g_assert_no_error(error);
   mux_clipboard_snapshot_unref(snapshot);
+  g_assert_cmpuint(mux_clipboard_history_clear(history, TRUE), ==, 1);
 
   for (i = 0; i < 2; i++) {
     snapshot = test_sized_snapshot_new(
         200 + i,
         i == 0 ? "application/x-first" : "application/x-second",
-        MUX_CLIPBOARD_HISTORY_MAX_ITEM_BYTES,
+        MUX_CLIPBOARD_HISTORY_MAX_BYTES / 2,
         (guint8)(i + 1));
     g_assert_cmpint(mux_clipboard_history_add(history,
                                               snapshot,
@@ -404,6 +404,56 @@ test_entry_and_total_bounds(void)
   mux_clipboard_history_free(history);
 }
 
+static void
+test_large_variant_keeps_text_fallback(void)
+{
+  MuxClipboardHistory *history;
+  MuxClipboardSnapshot *snapshot = mux_clipboard_snapshot_new(400);
+  const MuxClipboardHistoryEntry *entry;
+  const MuxClipboardSnapshot *stored;
+  GBytes *bytes;
+  GError *error = NULL;
+  guint64 entry_id = 0;
+
+  bytes = g_bytes_new_take(g_malloc0(MUX_CLIPBOARD_HISTORY_MAX_BYTES),
+                           MUX_CLIPBOARD_HISTORY_MAX_BYTES);
+  g_assert_true(mux_clipboard_snapshot_add(snapshot,
+                                           "image/png",
+                                           bytes,
+                                           &error));
+  g_assert_no_error(error);
+  g_bytes_unref(bytes);
+  bytes = g_bytes_new_static("fallback", 8);
+  g_assert_true(mux_clipboard_snapshot_add(snapshot,
+                                           "text/plain",
+                                           bytes,
+                                           &error));
+  g_assert_no_error(error);
+  g_bytes_unref(bytes);
+  mux_clipboard_snapshot_seal(snapshot);
+
+  history = mux_clipboard_history_new("fallback",
+                                      MUX_CLIPBOARD_HISTORY_MEMORY);
+  g_assert_cmpint(mux_clipboard_history_add(history,
+                                            snapshot,
+                                            10,
+                                            "https://fallback.test",
+                                            1,
+                                            &entry_id,
+                                            &error),
+                  ==,
+                  MUX_CLIPBOARD_HISTORY_DEGRADED);
+  g_assert_no_error(error);
+  entry = mux_clipboard_history_lookup(history, entry_id);
+  g_assert_nonnull(entry);
+  stored = mux_clipboard_history_entry_get_snapshot(entry);
+  g_assert_nonnull(mux_clipboard_snapshot_find(stored, "text/plain"));
+  g_assert_null(mux_clipboard_snapshot_find(stored, "image/png"));
+
+  mux_clipboard_snapshot_unref(snapshot);
+  mux_clipboard_history_free(history);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -418,5 +468,7 @@ main(int argc, char **argv)
                   test_namespace_isolation);
   g_test_add_func("/clipboard/history/bounds",
                   test_entry_and_total_bounds);
+  g_test_add_func("/clipboard/history/large-variant-text-fallback",
+                  test_large_variant_keeps_text_fallback);
   return g_test_run();
 }

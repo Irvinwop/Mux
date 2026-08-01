@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "mux-engine-protocol.h"
+#include "mux-shortcuts.h"
 #include "mux-kitty-chooser.h"
 #include "mux-protocol.h"
 #include "mux-pane-clipboard.h"
@@ -61,6 +62,13 @@
 #define TERMINAL_OUTPUT_DRAIN_TIMEOUT_MS 250
 #define ENGINE_ERROR_DETAIL_MAX_BYTES 4096u
 #define ENGINE_ERROR_WIRE_MAX_BYTES (8u + ENGINE_ERROR_DETAIL_MAX_BYTES)
+#define KITTY_GRAPHICS_RESPONSE_MAX_BYTES 2048u
+
+typedef enum {
+    KITTY_GRAPHICS_RESPONSE_IGNORE,
+    KITTY_GRAPHICS_RESPONSE_SUCCESS,
+    KITTY_GRAPHICS_RESPONSE_ERROR,
+} KittyGraphicsResponseResult;
 
 static gboolean
 schedule_retry_at(gint64 now_us, gint64 *retry_us, guint *backoff_ms)
@@ -130,6 +138,101 @@ decode_engine_error_payload(GBytes *payload,
     return TRUE;
 }
 
+static gchar *
+sanitize_kitty_graphics_detail(const gchar *detail)
+{
+    g_autofree gchar *valid = g_utf8_make_valid(detail ? detail : "", -1);
+    GString *safe = g_string_sized_new(strlen(valid));
+    const gchar *cursor;
+
+    for (cursor = valid; *cursor; cursor = g_utf8_next_char(cursor)) {
+        gunichar character = g_utf8_get_char(cursor);
+        GUnicodeType type = g_unichar_type(character);
+
+        if (g_unichar_iscntrl(character) || type == G_UNICODE_FORMAT)
+            g_string_append_c(safe, '?');
+        else
+            g_string_append_unichar(safe, character);
+    }
+    if (safe->len > MUX_ENGINE_MAX_FRAME_REJECTION_BYTES) {
+        gsize length = MUX_ENGINE_MAX_FRAME_REJECTION_BYTES;
+
+        while (length && !g_utf8_validate(safe->str, length, NULL))
+            length--;
+        g_string_truncate(safe, length);
+    }
+    if (!safe->len)
+        g_string_append(safe, "Kitty graphics error");
+    return g_string_free(safe, FALSE);
+}
+
+static KittyGraphicsResponseResult
+parse_kitty_graphics_response(const guint8 *sequence,
+                              gsize length,
+                              guint *image_id,
+                              gchar **detail)
+{
+    g_autofree gchar *response = NULL;
+    g_auto(GStrv) parameters = NULL;
+    gchar *start;
+    gchar *status;
+    gchar *semicolon;
+    gchar *terminator;
+    guint64 parsed_id = 0;
+    gboolean found_id = FALSE;
+
+    g_return_val_if_fail(image_id != NULL,
+                         KITTY_GRAPHICS_RESPONSE_IGNORE);
+    g_return_val_if_fail(detail != NULL,
+                         KITTY_GRAPHICS_RESPONSE_IGNORE);
+    *image_id = 0;
+    *detail = NULL;
+    if (!sequence || !length ||
+        length > KITTY_GRAPHICS_RESPONSE_MAX_BYTES)
+        return KITTY_GRAPHICS_RESPONSE_IGNORE;
+
+    response = g_strndup((const gchar *)sequence, length);
+    start = response;
+    if (length >= 3 && start[0] == '\033' && start[1] == '_' &&
+        start[2] == 'G')
+        start += 3;
+    semicolon = strchr(start, ';');
+    if (!semicolon)
+        return KITTY_GRAPHICS_RESPONSE_IGNORE;
+    *semicolon = '\0';
+    status = semicolon + 1;
+    terminator = strpbrk(status, "\033\a");
+    if (terminator)
+        *terminator = '\0';
+    if (!*status)
+        return KITTY_GRAPHICS_RESPONSE_IGNORE;
+
+    parameters = g_strsplit(start, ",", -1);
+    for (guint index = 0; parameters[index]; index++) {
+        gchar *end = NULL;
+        guint64 value;
+
+        if (!g_str_has_prefix(parameters[index], "i="))
+            continue;
+        if (found_id || !parameters[index][2])
+            return KITTY_GRAPHICS_RESPONSE_IGNORE;
+        errno = 0;
+        value = g_ascii_strtoull(parameters[index] + 2, &end, 10);
+        if (errno || !end || *end || !value || value > G_MAXUINT)
+            return KITTY_GRAPHICS_RESPONSE_IGNORE;
+        parsed_id = value;
+        found_id = TRUE;
+    }
+    if (!found_id)
+        return KITTY_GRAPHICS_RESPONSE_IGNORE;
+
+    *image_id = (guint)parsed_id;
+    if (g_str_equal(status, "OK"))
+        return KITTY_GRAPHICS_RESPONSE_SUCCESS;
+    *detail = sanitize_kitty_graphics_detail(status);
+    return KITTY_GRAPHICS_RESPONSE_ERROR;
+}
+
 #ifdef MUX_PANE_LOGIC_TEST
 
 gboolean
@@ -146,6 +249,18 @@ mux_pane_test_decode_engine_error(GBytes *payload,
                                   gchar **safe_detail)
 {
     return decode_engine_error_payload(payload, code, safe_detail);
+}
+
+gint
+mux_pane_test_parse_kitty_graphics_response(const guint8 *sequence,
+                                            gsize length,
+                                            guint *image_id,
+                                            gchar **detail)
+{
+    return parse_kitty_graphics_response(sequence,
+                                         length,
+                                         image_id,
+                                         detail);
 }
 
 #else
@@ -1172,6 +1287,7 @@ request_close(Pane *pane)
         return;
     }
     if (pane->engine_fd < 0 || !pane->view_id) {
+        pane->quit = TRUE;
         return;
     }
 
@@ -1182,6 +1298,7 @@ request_close(Pane *pane)
                     MUX_ENGINE_MESSAGE_REQUEST_CLOSE,
                     pane->view_id,
                     serial)) {
+        pane->quit = TRUE;
         return;
     }
     pane->close_request_serial = serial;
@@ -1512,29 +1629,11 @@ terminal_disable(Pane *pane, GError **error)
 static guint
 kitty_modifiers_to_wpe(guint encoded)
 {
+    guint modifiers = mux_shortcut_modifiers_from_kitty(encoded);
     guint kitty = encoded ? encoded - 1 : 0;
-    guint modifiers = 0;
 
-    if (kitty & 1)
-        modifiers |= WPE_MODIFIER_SHIFT;
-    if (kitty & 2)
-        modifiers |= WPE_MODIFIER_ALT;
-    if (kitty & 4)
-        modifiers |= WPE_MODIFIER_CONTROL;
-    if (kitty & (8 | 32))
-        modifiers |= WPE_MODIFIER_META;
     if (kitty & 64)
         modifiers |= WPE_MODIFIER_CAPS_LOCK;
-    return modifiers;
-}
-
-static guint
-browser_shortcut_modifiers(guint modifiers)
-{
-    if ((modifiers & WPE_MODIFIER_CONTROL) == 0 &&
-        (modifiers & WPE_MODIFIER_META) != 0)
-        return (modifiers & ~WPE_MODIFIER_META) |
-            WPE_MODIFIER_CONTROL;
     return modifiers;
 }
 
@@ -1785,6 +1884,27 @@ send_engine_visibility(Pane *pane)
 }
 
 static void
+send_engine_layer(Pane *pane)
+{
+    MuxEngineBuilder builder;
+    GBytes *payload;
+
+    if (pane->engine_fd < 0 || !pane->view_id || !pane->layer ||
+        !*pane->layer)
+        return;
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_string(&builder, pane->layer);
+    payload = mux_engine_builder_finish(&builder);
+    send_message(pane,
+                 MUX_ENGINE_MESSAGE_SET_LAYER,
+                 MUX_ENGINE_FLAG_NONE,
+                 pane->view_id,
+                 ++pane->next_serial,
+                 payload);
+    g_bytes_unref(payload);
+}
+
+static void
 send_focus(Pane *pane, gboolean focused)
 {
     pane->focused = focused;
@@ -1915,18 +2035,53 @@ queue_frame_response(Pane *pane, guint64 frame_serial)
 }
 
 static void
+send_frame_rejected(Pane *pane,
+                    guint64 frame_serial,
+                    MuxEngineFrameRejection reason,
+                    const gchar *detail)
+{
+    MuxEngineBuilder builder;
+    GBytes *payload;
+
+    if (pane->engine_fd < 0 || !pane->view_id)
+        return;
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, reason);
+    mux_engine_builder_put_string(&builder,
+                                  detail ? detail : "frame rejected");
+    payload = mux_engine_builder_finish(&builder);
+    send_message(pane,
+                 MUX_ENGINE_MESSAGE_FRAME_REJECTED,
+                 MUX_ENGINE_FLAG_NONE,
+                 pane->view_id,
+                 frame_serial,
+                 payload);
+    g_bytes_unref(payload);
+}
+
+static gboolean
+take_graphics_response(Pane *pane,
+                       guint image_id,
+                       KittyFrameResponse *response)
+{
+    if (!pane->frame_response_count)
+        return FALSE;
+    *response = pane->frame_responses[pane->frame_response_head];
+    if (response->image_id != image_id)
+        return FALSE;
+    pane->frame_response_head = (pane->frame_response_head + 1) %
+        KITTY_FRAME_RESPONSE_CAPACITY;
+    pane->frame_response_count--;
+    return TRUE;
+}
+
+static void
 acknowledge_graphics_response(Pane *pane, guint image_id)
 {
     KittyFrameResponse response;
 
-    if (!pane->frame_response_count)
+    if (!take_graphics_response(pane, image_id, &response))
         return;
-    response = pane->frame_responses[pane->frame_response_head];
-    if (response.image_id != image_id)
-        return;
-    pane->frame_response_head = (pane->frame_response_head + 1) %
-        KITTY_FRAME_RESPONSE_CAPACITY;
-    pane->frame_response_count--;
     if (response.retired)
         return;
     if (!pane->frame_waiting ||
@@ -1940,6 +2095,29 @@ acknowledge_graphics_response(Pane *pane, guint image_id)
                    response.frame_serial);
     pane->frame_waiting = FALSE;
     pane->pending_frame_serial = 0;
+}
+
+static void
+reject_graphics_response(Pane *pane,
+                         guint image_id,
+                         const gchar *detail)
+{
+    KittyFrameResponse response;
+
+    if (!take_graphics_response(pane, image_id, &response))
+        return;
+    if (response.retired)
+        return;
+    if (!pane->frame_waiting ||
+        pane->pending_frame_serial != response.frame_serial)
+        return;
+
+    pane->frame_waiting = FALSE;
+    pane->pending_frame_serial = 0;
+    send_frame_rejected(pane,
+                        response.frame_serial,
+                        MUX_ENGINE_FRAME_REJECTED_KITTY,
+                        detail);
 }
 
 static gboolean
@@ -1988,10 +2166,10 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
     if (!pane_page_is_visible(pane) || !pane->terminal_active) {
         pane->width = width;
         pane->height = height;
-        send_empty(pane,
-                   MUX_ENGINE_MESSAGE_FRAME_ACK,
-                   pane->view_id,
-                   message->serial);
+        send_frame_rejected(pane,
+                            message->serial,
+                            MUX_ENGINE_FRAME_REJECTED_NOT_VISIBLE,
+                            "pane is not visible");
         g_free(shm_name);
         return TRUE;
     }
@@ -2001,10 +2179,10 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
         return FALSE;
     }
     if (pane->frame_response_count >= KITTY_FRAME_RESPONSE_CAPACITY) {
-        send_empty(pane,
-                   MUX_ENGINE_MESSAGE_FRAME_ACK,
-                   pane->view_id,
-                   message->serial);
+        send_frame_rejected(pane,
+                            message->serial,
+                            MUX_ENGINE_FRAME_REJECTED_BACKPRESSURE,
+                            "Kitty response queue is full");
         g_free(shm_name);
         return TRUE;
     }
@@ -2521,16 +2699,21 @@ handle_graphics_response(Pane *pane,
                          const guint8 *sequence,
                          gsize length)
 {
-    gchar *response = g_strndup((const gchar *)sequence, length);
-    gchar *image = strstr(response, "i=");
+    g_autofree gchar *detail = NULL;
+    guint image_id = 0;
+    KittyGraphicsResponseResult result =
+        parse_kitty_graphics_response(sequence,
+                                      length,
+                                      &image_id,
+                                      &detail);
 
-    if (image) {
-        guint64 image_id = g_ascii_strtoull(image + 2, NULL, 10);
-
-        if (image_id <= G_MAXUINT)
-            acknowledge_graphics_response(pane, (guint)image_id);
+    if (result == KITTY_GRAPHICS_RESPONSE_SUCCESS)
+        acknowledge_graphics_response(pane, image_id);
+    else if (result == KITTY_GRAPHICS_RESPONSE_ERROR) {
+        g_printerr("mux-pane: Kitty graphics rejected frame: %s\n",
+                   detail);
+        reject_graphics_response(pane, image_id, detail);
     }
-    g_free(response);
 }
 
 static guint
@@ -2675,8 +2858,10 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
     guint encoded_modifiers = 1;
     guint event_type = 1;
     guint modifiers;
-    guint browser_modifiers;
     guint keyval;
+    MuxShortcut owned_shortcut;
+    gboolean execute_owned_shortcut = FALSE;
+    gboolean owned_shortcut_handled;
 
     if (!fields[0] || !*fields[0]) {
         g_strfreev(fields);
@@ -2697,20 +2882,20 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
         text_codepoint = g_utf8_get_char(committed_text);
 
     modifiers = kitty_modifiers_to_wpe(encoded_modifiers);
-    /* Normalize only for Mux-owned matching; forward modifiers unchanged. */
-    browser_modifiers = browser_shortcut_modifiers(modifiers);
     keyval = key_number_to_keyval(key_number);
+    owned_shortcut = mux_shortcut_match_pane(modifiers, key_number);
+    owned_shortcut_handled = mux_shortcut_handle_event(
+        owned_shortcut,
+        event_type,
+        &execute_owned_shortcut);
     if (handle_ui_key(pane,
                       event_type,
                       modifiers,
                       keyval,
                       text_codepoint)) {
     } else if (pane->clipboard != NULL &&
-        (browser_modifiers &
-         (WPE_MODIFIER_CONTROL | WPE_MODIFIER_SHIFT)) ==
-            (WPE_MODIFIER_CONTROL | WPE_MODIFIER_SHIFT) &&
-        (key_number == 'v' || key_number == 'V')) {
-        if (event_type == 1) {
+               owned_shortcut == MUX_SHORTCUT_CLIPBOARD_HISTORY) {
+        if (execute_owned_shortcut) {
             mux_pane_clipboard_open_picker(pane->clipboard);
             send_engine_visibility(pane);
             send_engine_focus(pane,
@@ -2720,6 +2905,8 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
     } else if (pane->clipboard != NULL &&
                mux_pane_clipboard_picker_is_open(pane->clipboard)) {
         MuxClipboardPickerKey picker_key;
+        MuxShortcut picker_shortcut =
+            mux_shortcut_match_picker(modifiers, key_number);
         gboolean mapped = TRUE;
 
         if (event_type == 3) {
@@ -2742,20 +2929,20 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
             picker_key = MUX_CLIPBOARD_PICKER_KEY_HOME;
         } else if (keyval == KEY_END) {
             picker_key = MUX_CLIPBOARD_PICKER_KEY_END;
-        } else if ((browser_modifiers & WPE_MODIFIER_CONTROL) &&
-                   (key_number == 'w' || key_number == 'W')) {
+        } else if (picker_shortcut ==
+                   MUX_SHORTCUT_PICKER_DELETE_WORD) {
             picker_key = MUX_CLIPBOARD_PICKER_KEY_DELETE_WORD;
-        } else if ((browser_modifiers & WPE_MODIFIER_CONTROL) &&
-                   (key_number == 'u' || key_number == 'U')) {
+        } else if (picker_shortcut ==
+                   MUX_SHORTCUT_PICKER_CLEAR_QUERY) {
             picker_key = MUX_CLIPBOARD_PICKER_KEY_CLEAR_QUERY;
-        } else if ((modifiers & WPE_MODIFIER_ALT) &&
-                   (key_number == 'p' || key_number == 'P')) {
+        } else if (picker_shortcut ==
+                   MUX_SHORTCUT_PICKER_TOGGLE_PIN) {
             picker_key = MUX_CLIPBOARD_PICKER_KEY_TOGGLE_PIN;
-        } else if ((modifiers & WPE_MODIFIER_ALT) &&
-                   (key_number == 'd' || key_number == 'D')) {
+        } else if (picker_shortcut ==
+                   MUX_SHORTCUT_PICKER_DELETE_ENTRY) {
             picker_key = MUX_CLIPBOARD_PICKER_KEY_DELETE_ENTRY;
-        } else if ((modifiers & WPE_MODIFIER_ALT) &&
-                   (key_number == 'c' || key_number == 'C')) {
+        } else if (picker_shortcut ==
+                   MUX_SHORTCUT_PICKER_CLEAR_HISTORY) {
             picker_key = MUX_CLIPBOARD_PICKER_KEY_CLEAR_HISTORY;
         } else if ((modifiers & (WPE_MODIFIER_CONTROL |
                                  WPE_MODIFIER_ALT |
@@ -2775,29 +2962,25 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
                     : 0);
     } else if (pane->clipboard != NULL &&
                (key_number == 'v' || key_number == 'V') &&
-               ((browser_modifiers & (WPE_MODIFIER_CONTROL |
-                                      WPE_MODIFIER_SHIFT |
-                                      WPE_MODIFIER_ALT |
-                                      WPE_MODIFIER_META)) ==
-                    WPE_MODIFIER_CONTROL ||
-                (event_type == 3 && pane->fresh_paste_request_id != 0)) &&
+               (mux_shortcut_is_page_paste(modifiers, key_number) ||
+                (event_type == MUX_SHORTCUT_EVENT_RELEASE &&
+                 pane->fresh_paste_request_id != 0)) &&
                defer_page_paste_key(pane,
                                     event_type,
                                     modifiers,
                                     keyval)) {
-    } else if (event_type == 1 &&
-        (browser_modifiers & WPE_MODIFIER_CONTROL) &&
-        (key_number == 'q' || key_number == 'Q'))
-        request_close(pane);
-    else if (event_type == 1 &&
-             (browser_modifiers & WPE_MODIFIER_CONTROL) &&
-             (key_number == 'l' || key_number == 'L'))
-        control_write(pane, "PROMPT");
-    else if (event_type == 1 &&
-             (browser_modifiers & WPE_MODIFIER_CONTROL) &&
-             (key_number == 'r' || key_number == 'R'))
-        send_navigation(pane, MUX_ENGINE_NAVIGATE_RELOAD, NULL);
-    else {
+    } else if (owned_shortcut_handled) {
+        if (execute_owned_shortcut) {
+            if (owned_shortcut == MUX_SHORTCUT_CLOSE)
+                request_close(pane);
+            else if (owned_shortcut == MUX_SHORTCUT_LOCATION)
+                control_write(pane, "PROMPT");
+            else if (owned_shortcut == MUX_SHORTCUT_RELOAD)
+                send_navigation(pane,
+                                MUX_ENGINE_NAVIGATE_RELOAD,
+                                NULL);
+        }
+    } else {
         if (event_type != 3 && committed_text && *committed_text &&
             !(modifiers & (WPE_MODIFIER_CONTROL |
                            WPE_MODIFIER_ALT |
@@ -3007,6 +3190,9 @@ handle_csi(Pane *pane,
         break;
     }
     if (keyval) {
+        MuxShortcut navigation_shortcut =
+            mux_shortcut_match_engine(modifiers, keyval);
+
         if (pane->clipboard != NULL &&
             mux_pane_clipboard_picker_is_open(pane->clipboard)) {
             MuxClipboardPickerKey picker_key;
@@ -3030,10 +3216,9 @@ handle_csi(Pane *pane,
             mux_pane_clipboard_handle_picker_key(pane->clipboard,
                                                  picker_key,
                                                  0);
-        } else if ((modifiers & WPE_MODIFIER_ALT) && keyval == KEY_LEFT)
+        } else if (navigation_shortcut == MUX_SHORTCUT_HISTORY_BACK)
             send_navigation(pane, MUX_ENGINE_NAVIGATE_BACK, NULL);
-        else if ((modifiers & WPE_MODIFIER_ALT) &&
-                 keyval == KEY_RIGHT)
+        else if (navigation_shortcut == MUX_SHORTCUT_HISTORY_FORWARD)
             send_navigation(pane,
                             MUX_ENGINE_NAVIGATE_FORWARD,
                             NULL);
@@ -3362,8 +3547,13 @@ update_own_layer(Pane *pane,
     if (g_strcmp0(id, pane->control_id) == 0) {
         gchar *layer = mux_decode(encoded_layer);
 
-        g_free(pane->layer);
-        pane->layer = layer;
+        if (g_strcmp0(layer, pane->layer) != 0) {
+            g_free(pane->layer);
+            pane->layer = layer;
+            layer = NULL;
+            send_engine_layer(pane);
+        }
+        g_free(layer);
         update_visibility(pane);
     }
     g_free(id);

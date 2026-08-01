@@ -17,6 +17,7 @@ struct _MuxClipboardPickerItem {
     gchar *preview;
     gchar **mime_types;
     gsize mime_type_count;
+    gsize format_count;
     gchar *search_text;
 };
 
@@ -97,11 +98,36 @@ mux_clipboard_picker_item_new(guint64 id,
                               const gchar *const *mime_types,
                               gsize mime_type_count)
 {
+    return mux_clipboard_picker_item_new_full(id,
+                                              created_us,
+                                              origin,
+                                              source_view_id,
+                                              pinned,
+                                              total_size,
+                                              preview,
+                                              mime_types,
+                                              mime_type_count,
+                                              mime_type_count);
+}
+
+MuxClipboardPickerItem *
+mux_clipboard_picker_item_new_full(guint64 id,
+                                   gint64 created_us,
+                                   const gchar *origin,
+                                   guint64 source_view_id,
+                                   gboolean pinned,
+                                   gsize total_size,
+                                   const gchar *preview,
+                                   const gchar *const *mime_types,
+                                   gsize mime_type_count,
+                                   gsize format_count)
+{
     MuxClipboardPickerItem *item;
     gsize index;
 
     g_return_val_if_fail(id != 0, NULL);
     g_return_val_if_fail(mime_type_count == 0 || mime_types != NULL, NULL);
+    g_return_val_if_fail(format_count >= mime_type_count, NULL);
 
     item = g_new0(MuxClipboardPickerItem, 1);
     g_atomic_ref_count_init(&item->references);
@@ -113,6 +139,7 @@ mux_clipboard_picker_item_new(guint64 id,
     item->total_size = total_size;
     item->preview = normalise_visible_text(preview);
     item->mime_type_count = mime_type_count;
+    item->format_count = format_count;
     item->mime_types = g_new0(gchar *, mime_type_count + 1);
 
     for (index = 0; index < mime_type_count; index++)
@@ -595,7 +622,8 @@ clip_text(const gchar *text, guint maximum_width)
 static gchar *
 format_age(gint64 created_us)
 {
-    gint64 elapsed = MAX((g_get_real_time() - created_us) / G_USEC_PER_SEC,
+    gint64 elapsed = MAX((g_get_monotonic_time() - created_us) /
+                             G_USEC_PER_SEC,
                          (gint64) 0);
 
     if (elapsed < 60)
@@ -714,7 +742,7 @@ mux_clipboard_picker_render(MuxClipboardPicker *picker,
                 size,
                 *item->origin != '\0' ? item->origin : "unknown",
                 *item->preview != '\0' ? item->preview : "[binary data]",
-                item->mime_type_count);
+                item->format_count);
 
             append_panel_line(output,
                               line,

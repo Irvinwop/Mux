@@ -89,49 +89,56 @@ scope_name(MuxClipboardHistoryScope scope)
 }
 
 static MuxClipboardSnapshot *
-history_snapshot(const MuxClipboardSnapshot *source, GError **error)
+history_snapshot(const MuxClipboardSnapshot *source,
+                 gboolean *degraded,
+                 GError **error)
 {
     MuxClipboardSnapshot *copy;
+    gboolean omitted = FALSE;
+    guint pass;
     guint i;
 
     copy = mux_clipboard_snapshot_new(
         mux_clipboard_snapshot_get_serial(source));
-    for (i = 0; i < mux_clipboard_snapshot_get_count(source); i++) {
-        const gchar *mime = NULL;
-        GBytes *bytes = NULL;
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i < mux_clipboard_snapshot_get_count(source); i++) {
+            const gchar *mime = NULL;
+            GBytes *bytes = NULL;
+            gboolean is_text;
+            gsize length;
 
-        mux_clipboard_snapshot_get_item(source, i, &mime, &bytes);
-        if (g_bytes_get_size(bytes) >
-            MUX_CLIPBOARD_HISTORY_MAX_ITEM_BYTES) {
-            g_set_error(error,
-                        G_IO_ERROR,
-                        G_IO_ERROR_NO_SPACE,
-                        "clipboard format %s exceeds the 8 MiB item limit",
-                        mime);
-            mux_clipboard_snapshot_unref(copy);
-            return NULL;
-        }
-        if (!mux_clipboard_snapshot_add(copy, mime, bytes, error)) {
-            mux_clipboard_snapshot_unref(copy);
-            return NULL;
+            mux_clipboard_snapshot_get_item(source, i, &mime, &bytes);
+            is_text = g_ascii_strncasecmp(mime, "text/", 5) == 0;
+            if (is_text != (pass == 0))
+                continue;
+
+            length = g_bytes_get_size(bytes);
+            if (length > MUX_CLIPBOARD_HISTORY_MAX_ITEM_BYTES ||
+                length > MUX_CLIPBOARD_HISTORY_MAX_BYTES -
+                             mux_clipboard_snapshot_get_total_bytes(copy)) {
+                omitted = TRUE;
+                continue;
+            }
+            if (!mux_clipboard_snapshot_add(copy, mime, bytes, error)) {
+                mux_clipboard_snapshot_unref(copy);
+                return NULL;
+            }
         }
     }
 
     if (mux_clipboard_snapshot_get_count(copy) == 0) {
-        mux_clipboard_snapshot_unref(copy);
-        return NULL;
-    }
-    if (mux_clipboard_snapshot_get_total_bytes(copy) >
-        MUX_CLIPBOARD_HISTORY_MAX_BYTES) {
-        g_set_error_literal(error,
-                            G_IO_ERROR,
-                            G_IO_ERROR_NO_SPACE,
-                            "clipboard history entry exceeds 16 MiB");
+        if (mux_clipboard_snapshot_get_count(source) > 0)
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_NO_SPACE,
+                                "no clipboard format fits in history");
         mux_clipboard_snapshot_unref(copy);
         return NULL;
     }
 
     mux_clipboard_snapshot_seal(copy);
+    if (degraded != NULL)
+        *degraded = omitted;
     return copy;
 }
 
@@ -310,6 +317,7 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
     GList *link;
     MuxClipboardHistoryEntry *entry;
     gsize bytes;
+    gboolean degraded = FALSE;
 
     g_return_val_if_fail(history != NULL,
                          MUX_CLIPBOARD_HISTORY_IGNORED);
@@ -328,7 +336,7 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
         return MUX_CLIPBOARD_HISTORY_IGNORED;
     }
 
-    filtered = history_snapshot(snapshot, error);
+    filtered = history_snapshot(snapshot, &degraded, error);
     if (filtered == NULL)
         return MUX_CLIPBOARD_HISTORY_IGNORED;
 
@@ -348,7 +356,8 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
         if (entry_id != NULL)
             *entry_id = entry->id;
         mux_clipboard_snapshot_unref(filtered);
-        return MUX_CLIPBOARD_HISTORY_DEDUPLICATED;
+        return degraded ? MUX_CLIPBOARD_HISTORY_DEGRADED
+                        : MUX_CLIPBOARD_HISTORY_DEDUPLICATED;
     }
 
     bytes = mux_clipboard_snapshot_get_total_bytes(filtered);
@@ -374,7 +383,8 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
     history->total_bytes += bytes;
     if (entry_id != NULL)
         *entry_id = entry->id;
-    return MUX_CLIPBOARD_HISTORY_ADDED;
+    return degraded ? MUX_CLIPBOARD_HISTORY_DEGRADED
+                    : MUX_CLIPBOARD_HISTORY_ADDED;
 }
 
 guint

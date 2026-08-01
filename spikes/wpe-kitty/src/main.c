@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 
+#include "mux-shortcuts.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <glib-unix.h>
@@ -804,15 +806,9 @@ static guint32 event_time_ms(void)
 
 static WPEModifiers kitty_modifiers(guint kitty_bits)
 {
-    WPEModifiers modifiers = 0;
-    if (kitty_bits & 1)
-        modifiers |= WPE_MODIFIER_KEYBOARD_SHIFT;
-    if (kitty_bits & 2)
-        modifiers |= WPE_MODIFIER_KEYBOARD_ALT;
-    if (kitty_bits & 4)
-        modifiers |= WPE_MODIFIER_KEYBOARD_CONTROL;
-    if (kitty_bits & 8)
-        modifiers |= WPE_MODIFIER_KEYBOARD_META;
+    WPEModifiers modifiers = (WPEModifiers)
+        mux_shortcut_modifiers_from_kitty(kitty_bits + 1);
+
     if (kitty_bits & 64)
         modifiers |= WPE_MODIFIER_KEYBOARD_CAPS_LOCK;
     return modifiers;
@@ -931,45 +927,66 @@ static gboolean browser_shortcut(
     guint event_type)
 {
     guint normalized = key;
+    WPEModifiers modifiers = kitty_modifiers(kitty_bits);
+    MuxShortcut pane_shortcut;
+    MuxShortcut engine_shortcut;
+    gboolean execute = FALSE;
+    guint shortcut_modifiers;
+    gboolean inspector;
+
     if (normalized >= 'A' && normalized <= 'Z')
         normalized += 'a' - 'A';
 
-    gboolean control = kitty_bits & 4;
-    gboolean alt = kitty_bits & 2;
-    gboolean shift = kitty_bits & 1;
-    gboolean pressed = event_type != 3;
-
-    if (control && normalized == 'q') {
-        if (pressed)
+    pane_shortcut = mux_shortcut_match_pane(modifiers, normalized);
+    if (pane_shortcut == MUX_SHORTCUT_CLOSE ||
+        pane_shortcut == MUX_SHORTCUT_LOCATION ||
+        pane_shortcut == MUX_SHORTCUT_RELOAD) {
+        (void)mux_shortcut_handle_event(pane_shortcut,
+                                        event_type,
+                                        &execute);
+        if (execute && pane_shortcut == MUX_SHORTCUT_CLOSE)
             request_quit(app);
-        return TRUE;
-    }
-    if (control && normalized == 'l') {
-        if (pressed) {
+        else if (execute && pane_shortcut == MUX_SHORTCUT_LOCATION) {
             if (app->global_bar && app->ipc)
                 mux_ipc_prompt(app->ipc);
             else
                 enter_url_mode(app);
+        } else if (execute && pane_shortcut == MUX_SHORTCUT_RELOAD) {
+            webkit_web_view_reload(app->web_view);
         }
         return TRUE;
     }
-    if (control && normalized == 'r') {
-        if (pressed)
-            webkit_web_view_reload(app->web_view);
-        return TRUE;
-    }
-    if (control && shift && normalized == 'i') {
-        if (pressed)
+
+    shortcut_modifiers = modifiers &
+        (MUX_SHORTCUT_MODIFIER_CONTROL |
+         MUX_SHORTCUT_MODIFIER_SHIFT |
+         MUX_SHORTCUT_MODIFIER_ALT |
+         MUX_SHORTCUT_MODIFIER_META);
+    inspector = normalized == 'i' &&
+        (shortcut_modifiers ==
+             (MUX_SHORTCUT_MODIFIER_META |
+              MUX_SHORTCUT_MODIFIER_SHIFT) ||
+         shortcut_modifiers ==
+             (MUX_SHORTCUT_MODIFIER_CONTROL |
+              MUX_SHORTCUT_MODIFIER_SHIFT));
+    if (inspector) {
+        if (event_type == MUX_SHORTCUT_EVENT_PRESS)
             webkit_web_view_toggle_inspector(app->web_view);
         return TRUE;
     }
-    if (alt && keyval == WPE_KEY_Left) {
-        if (pressed && webkit_web_view_can_go_back(app->web_view))
+
+    engine_shortcut = mux_shortcut_match_engine(modifiers, keyval);
+    if (engine_shortcut == MUX_SHORTCUT_HISTORY_BACK ||
+        engine_shortcut == MUX_SHORTCUT_HISTORY_FORWARD) {
+        (void)mux_shortcut_handle_event(engine_shortcut,
+                                        event_type,
+                                        &execute);
+        if (execute && engine_shortcut == MUX_SHORTCUT_HISTORY_BACK &&
+            webkit_web_view_can_go_back(app->web_view))
             webkit_web_view_go_back(app->web_view);
-        return TRUE;
-    }
-    if (alt && keyval == WPE_KEY_Right) {
-        if (pressed && webkit_web_view_can_go_forward(app->web_view))
+        else if (execute &&
+                 engine_shortcut == MUX_SHORTCUT_HISTORY_FORWARD &&
+                 webkit_web_view_can_go_forward(app->web_view))
             webkit_web_view_go_forward(app->web_view);
         return TRUE;
     }
@@ -1009,6 +1026,8 @@ static gboolean handle_url_key(
     guint event_type,
     const gchar *text_field)
 {
+    WPEModifiers modifiers = kitty_modifiers(kitty_bits);
+
     if (!app->url_mode)
         return FALSE;
     if (event_type == 3)
@@ -1026,14 +1045,18 @@ static gboolean handle_url_key(
         url_backspace(app);
         return TRUE;
     }
-    if ((kitty_bits & 4) && (keyval == 'u' || keyval == 'U')) {
+    if (mux_shortcut_match_bar(modifiers, keyval) ==
+        MUX_SHORTCUT_BAR_CLEAR) {
         g_string_truncate(app->url_input, 0);
         app->replace_url_on_type = FALSE;
         draw_url_bar(app);
         return TRUE;
     }
 
-    if (!(kitty_bits & 4) && text_field && *text_field)
+    if (!(modifiers & (MUX_SHORTCUT_MODIFIER_CONTROL |
+                       MUX_SHORTCUT_MODIFIER_ALT |
+                       MUX_SHORTCUT_MODIFIER_META)) &&
+        text_field && *text_field)
         append_text_field_to_url(app, text_field);
     return TRUE;
 }

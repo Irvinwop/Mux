@@ -356,6 +356,35 @@ mux_clipboard_picker_broker_add_summary(
     gsize mime_type_count,
     GError **error)
 {
+    return mux_clipboard_picker_broker_add_summary_full(broker,
+                                                        id,
+                                                        created_us,
+                                                        origin,
+                                                        source_view_id,
+                                                        pinned,
+                                                        total_size,
+                                                        preview,
+                                                        mime_types,
+                                                        mime_type_count,
+                                                        mime_type_count,
+                                                        error);
+}
+
+gboolean
+mux_clipboard_picker_broker_add_summary_full(
+    MuxClipboardPickerBroker *broker,
+    guint64 id,
+    gint64 created_us,
+    const gchar *origin,
+    guint64 source_view_id,
+    gboolean pinned,
+    gsize total_size,
+    const gchar *preview,
+    const gchar *const *mime_types,
+    gsize mime_type_count,
+    gsize format_count,
+    GError **error)
+{
     MuxClipboardPickerItem *item;
 
     g_return_val_if_fail(broker != NULL, FALSE);
@@ -370,15 +399,16 @@ mux_clipboard_picker_broker_add_summary(
         return FALSE;
     }
 
-    item = mux_clipboard_picker_item_new(id,
-                                         created_us,
-                                         origin,
-                                         source_view_id,
-                                         pinned,
-                                         total_size,
-                                         preview,
-                                         mime_types,
-                                         mime_type_count);
+    item = mux_clipboard_picker_item_new_full(id,
+                                              created_us,
+                                              origin,
+                                              source_view_id,
+                                              pinned,
+                                              total_size,
+                                              preview,
+                                              mime_types,
+                                              mime_type_count,
+                                              format_count);
     if (item == NULL) {
         g_set_error(error,
                     G_IO_ERROR,

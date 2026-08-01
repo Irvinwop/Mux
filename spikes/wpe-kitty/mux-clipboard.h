@@ -21,6 +21,11 @@ GQuark mux_clipboard_error_quark(void);
 
 typedef struct _MuxClipboardSnapshot MuxClipboardSnapshot;
 
+typedef struct {
+    const gchar *mime;
+    GBytes *bytes;
+} MuxClipboardSnapshotItem;
+
 MuxClipboardSnapshot *mux_clipboard_snapshot_new(guint64 serial);
 MuxClipboardSnapshot *mux_clipboard_snapshot_ref(MuxClipboardSnapshot *snapshot);
 void mux_clipboard_snapshot_unref(MuxClipboardSnapshot *snapshot);
@@ -29,6 +34,13 @@ gboolean mux_clipboard_snapshot_add(MuxClipboardSnapshot *snapshot,
                                     const gchar *mime,
                                     GBytes *bytes,
                                     GError **error);
+
+/* Builds and seals the snapshot atomically, returning NULL on any bad item. */
+MuxClipboardSnapshot *mux_clipboard_snapshot_new_sealed_from_items(
+    guint64 serial,
+    const MuxClipboardSnapshotItem *items,
+    guint item_count,
+    GError **error);
 
 void mux_clipboard_snapshot_seal(MuxClipboardSnapshot *snapshot);
 gboolean mux_clipboard_snapshot_is_sealed(const MuxClipboardSnapshot *snapshot);

@@ -13,24 +13,58 @@ struct _MuxWpeClipboard {
 
 G_DEFINE_TYPE(MuxWpeClipboard, mux_wpe_clipboard, WPE_TYPE_CLIPBOARD)
 
+static gpointer
+bounded_realloc(gpointer data, gsize size)
+{
+    if (size > MUX_CLIPBOARD_MAX_ITEM_BYTES)
+        return NULL;
+    return g_realloc(data, size);
+}
+
 static GBytes *
-serialize_content(WPEClipboardContent *content, const gchar *format)
+serialize_content(WPEClipboardContent *content,
+                  const gchar *format,
+                  GError **error)
 {
     GBytes *bytes;
     const gchar *text;
     GOutputStream *stream;
+    gsize length;
 
     bytes = wpe_clipboard_content_get_bytes(content, format);
-    if (bytes != NULL)
+    if (bytes != NULL) {
+        if (g_bytes_get_size(bytes) > MUX_CLIPBOARD_MAX_ITEM_BYTES) {
+            g_set_error_literal(error,
+                                MUX_CLIPBOARD_ERROR,
+                                MUX_CLIPBOARD_ERROR_LIMIT,
+                                "WebKit clipboard format exceeds 16 MiB");
+            return NULL;
+        }
         return g_bytes_ref(bytes);
+    }
 
     text = wpe_clipboard_content_get_text(content);
-    if (text != NULL && g_str_has_prefix(format, "text/plain"))
-        return g_bytes_new(text, strlen(text));
+    if (text != NULL && g_str_has_prefix(format, "text/plain")) {
+        length = strlen(text);
+        if (length > MUX_CLIPBOARD_MAX_ITEM_BYTES) {
+            g_set_error_literal(error,
+                                MUX_CLIPBOARD_ERROR,
+                                MUX_CLIPBOARD_ERROR_LIMIT,
+                                "WebKit clipboard text exceeds 16 MiB");
+            return NULL;
+        }
+        return g_bytes_new(text, length);
+    }
 
-    stream = g_memory_output_stream_new_resizable();
+    stream = g_memory_output_stream_new(NULL, 0, bounded_realloc, g_free);
     if (!wpe_clipboard_content_serialize(content, format, stream) ||
-        !g_output_stream_close(stream, NULL, NULL)) {
+        !g_output_stream_close(stream, NULL, error)) {
+        if (error != NULL && *error == NULL)
+            g_set_error_literal(
+                error,
+                MUX_CLIPBOARD_ERROR,
+                MUX_CLIPBOARD_ERROR_LIMIT,
+                "WebKit clipboard format could not be serialized within 16 MiB");
         g_object_unref(stream);
         return NULL;
     }
@@ -44,41 +78,93 @@ serialize_content(WPEClipboardContent *content, const gchar *format)
 static MuxClipboardSnapshot *
 snapshot_from_content(MuxWpeClipboard *clipboard,
                       GPtrArray *formats,
-                      WPEClipboardContent *content)
+                      WPEClipboardContent *content,
+                      GError **error)
 {
-    MuxClipboardSnapshot *snapshot;
-    g_autoptr(GError) error = NULL;
+    MuxClipboardSnapshotItem items[MUX_CLIPBOARD_MAX_ITEMS] = { 0 };
+    g_autoptr(GHashTable) seen = NULL;
+    g_autoptr(GPtrArray) selected = NULL;
+    MuxClipboardSnapshot *snapshot = NULL;
+    gsize total = 0;
+    guint item_count = 0;
+    guint pass;
     guint i;
 
-    snapshot = mux_clipboard_snapshot_new(++clipboard->next_serial);
     if (formats == NULL || content == NULL) {
-        mux_clipboard_snapshot_seal(snapshot);
+        snapshot = mux_clipboard_snapshot_new_sealed_from_items(
+            clipboard->next_serial + 1,
+            items,
+            0,
+            error);
+        if (snapshot != NULL)
+            clipboard->next_serial++;
         return snapshot;
     }
 
+    seen = g_hash_table_new(g_str_hash, g_str_equal);
+    selected = g_ptr_array_new();
+
     for (i = 0; i < formats->len; i++) {
         const gchar *format = g_ptr_array_index(formats, i);
-        g_autoptr(GBytes) bytes = NULL;
 
         if (format == NULL)
             break;
-        if (!mux_clipboard_mime_is_valid(format))
+        if (!mux_clipboard_mime_is_valid(format)) {
+            g_warning("WebKit clipboard omitted an invalid MIME type");
             continue;
-        if (mux_clipboard_snapshot_find(snapshot, format) != NULL)
+        }
+        if (g_hash_table_contains(seen, format))
             continue;
-
-        bytes = serialize_content(content, format);
-        if (bytes == NULL)
-            continue;
-        if (!mux_clipboard_snapshot_add(snapshot, format, bytes, &error)) {
-            g_warning("could not export WebKit clipboard: %s", error->message);
-            mux_clipboard_snapshot_unref(snapshot);
-            snapshot = mux_clipboard_snapshot_new(++clipboard->next_serial);
+        if (selected->len >= MUX_CLIPBOARD_MAX_ITEMS) {
+            g_warning("WebKit clipboard omitted excess MIME variants");
             break;
+        }
+        g_hash_table_add(seen, (gpointer)format);
+        g_ptr_array_add(selected, (gpointer)format);
+    }
+
+    /* Prefer text when bounded policy requires omitting MIME variants. */
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i < selected->len; i++) {
+            const gchar *format = g_ptr_array_index(selected, i);
+            g_autoptr(GError) item_error = NULL;
+            gboolean is_text =
+                g_ascii_strncasecmp(format, "text/", 5) == 0;
+            GBytes *bytes;
+            gsize length;
+
+            if (is_text != (pass == 0))
+                continue;
+            bytes = serialize_content(content, format, &item_error);
+            if (bytes == NULL) {
+                g_warning("WebKit clipboard MIME variant omitted: %s",
+                          item_error != NULL ? item_error->message
+                                             : "serialization failed");
+                continue;
+            }
+            length = g_bytes_get_size(bytes);
+            if (length > MUX_CLIPBOARD_MAX_TOTAL_BYTES - total) {
+                g_warning("WebKit clipboard MIME variant omitted: total exceeds 32 MiB");
+                g_bytes_unref(bytes);
+                continue;
+            }
+            items[item_count].mime = format;
+            items[item_count].bytes = bytes;
+            item_count++;
+            total += length;
         }
     }
 
-    mux_clipboard_snapshot_seal(snapshot);
+    snapshot = mux_clipboard_snapshot_new_sealed_from_items(
+        clipboard->next_serial + 1,
+        items,
+        item_count,
+        error);
+    if (snapshot != NULL)
+        clipboard->next_serial++;
+
+    for (i = 0; i < item_count; i++)
+        g_bytes_unref(items[i].bytes);
     return snapshot;
 }
 
@@ -105,12 +191,19 @@ mux_wpe_clipboard_changed(WPEClipboard *base,
     WPEClipboardClass *parent_class =
         WPE_CLIPBOARD_CLASS(mux_wpe_clipboard_parent_class);
     g_autoptr(MuxClipboardSnapshot) snapshot = NULL;
+    g_autoptr(GError) error = NULL;
 
     parent_class->changed(base, formats, is_local, content);
     if (!is_local || clipboard->publish_func == NULL)
         return;
 
-    snapshot = snapshot_from_content(clipboard, formats, content);
+    snapshot = snapshot_from_content(clipboard, formats, content, &error);
+    if (snapshot == NULL) {
+        if (error != NULL)
+            g_warning("WebKit clipboard publication rejected: %s",
+                      error->message);
+        return;
+    }
     clipboard->publish_func(clipboard, snapshot, clipboard->user_data);
 }
 

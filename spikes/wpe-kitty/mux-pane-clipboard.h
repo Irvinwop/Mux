@@ -21,6 +21,9 @@ typedef void (*MuxPaneClipboardFailureFunc)(MuxPaneClipboard *clipboard,
 
 #define MUX_PANE_CLIPBOARD_FRESH_PASTE_TIMEOUT_MS 2000U
 #define MUX_PANE_CLIPBOARD_MAX_PENDING_PASTES 4U
+#define MUX_PANE_CLIPBOARD_MAX_PENDING_OBSERVATIONS 25U
+#define MUX_PANE_CLIPBOARD_MAX_OBSERVATION_BYTES \
+    MUX_CLIPBOARD_MAX_TOTAL_BYTES
 
 typedef void (*MuxPaneClipboardFreshPasteFunc)(
     MuxPaneClipboard *clipboard,

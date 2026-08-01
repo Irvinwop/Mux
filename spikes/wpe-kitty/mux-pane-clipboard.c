@@ -1,4 +1,5 @@
 #include "mux-pane-clipboard.h"
+#include "mux-clipboard-lifetime.h"
 
 #include <gio/gio.h>
 
@@ -16,7 +17,19 @@ typedef struct {
     guint64 view_id;
 } SummaryMetadata;
 
+typedef struct {
+    MuxClipboardSnapshot *snapshot;
+    gchar *origin;
+    guint64 view_id;
+    guint32 flags;
+    gsize bytes;
+    guint64 fresh_request_id;
+    guint64 transaction_id;
+    gboolean submitted;
+} PendingObservation;
+
 struct _MuxPaneClipboard {
+    MuxClipboardLifetime lifetime;
     gchar *profile;
     gchar *broker_profile;
     gboolean ephemeral;
@@ -33,10 +46,8 @@ struct _MuxPaneClipboard {
     GHashTable *summary_metadata;
     gchar *selected_origin;
     guint64 selected_view_id;
-    MuxClipboardSnapshot *pending_snapshot;
-    gchar *pending_origin;
-    guint64 pending_view_id;
-    guint32 pending_flags;
+    GQueue observations;
+    gsize observation_bytes;
     FreshPasteState fresh_state;
     guint64 fresh_request_id;
     gint64 fresh_deadline_us;
@@ -58,6 +69,61 @@ struct _MuxPaneClipboard {
     GDestroyNotify user_data_destroy;
 };
 
+static void pane_clipboard_destroy(MuxPaneClipboard *clipboard);
+
+static MuxPaneClipboard *
+pane_clipboard_acquire(MuxPaneClipboard *clipboard)
+{
+    mux_clipboard_lifetime_acquire(&clipboard->lifetime);
+    return clipboard;
+}
+
+static void
+pane_clipboard_release(MuxPaneClipboard *clipboard)
+{
+    if (mux_clipboard_lifetime_release(&clipboard->lifetime))
+        pane_clipboard_destroy(clipboard);
+}
+
+typedef MuxPaneClipboard MuxPaneClipboardOperation;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxPaneClipboardOperation,
+                              pane_clipboard_release)
+
+static void
+pending_observation_free(PendingObservation *observation)
+{
+    if (observation == NULL)
+        return;
+    mux_clipboard_snapshot_unref(observation->snapshot);
+    g_free(observation->origin);
+    g_free(observation);
+}
+
+static void
+reset_submitted_observation(MuxPaneClipboard *clipboard)
+{
+    PendingObservation *observation =
+        g_queue_peek_head(&clipboard->observations);
+
+    if (observation != NULL) {
+        observation->submitted = FALSE;
+        observation->transaction_id = 0;
+    }
+}
+
+static gboolean queue_observation(MuxPaneClipboard *clipboard,
+                                  const gchar *origin,
+                                  guint64 view_id,
+                                  guint32 flags,
+                                  const MuxClipboardSnapshot *snapshot,
+                                  guint64 fresh_request_id,
+                                  GError **error);
+static void broker_observation_result(
+    MuxClipboardBrokerClient *client,
+    guint64 transaction_id,
+    MuxClipboardBrokerObservationResult result,
+    const GError *error,
+    gpointer user_data);
 static gboolean connect_broker(MuxPaneClipboard *clipboard, GError **error);
 
 static guint32
@@ -292,20 +358,17 @@ flush_fresh_observation(MuxPaneClipboard *clipboard)
 
     if (clipboard->fresh_state != FRESH_PASTE_SYNCING ||
         clipboard->fresh_snapshot == NULL ||
-        clipboard->fresh_broker_submitted ||
-        !clipboard->broker_ready || clipboard->client == NULL ||
-        mux_clipboard_broker_client_request_pending(clipboard->client))
+        clipboard->fresh_broker_submitted)
         return;
 
-    if (!mux_clipboard_broker_client_observe(
-            clipboard->client,
-            fresh_snapshot_flags(clipboard),
-            "external",
-            clipboard->view_id,
-            clipboard->fresh_snapshot,
-            &error)) {
-        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_PENDING))
-            fail_fresh_paste(clipboard, "fresh-paste-broker", error);
+    if (!queue_observation(clipboard,
+                           "external",
+                           clipboard->view_id,
+                           fresh_snapshot_flags(clipboard),
+                           clipboard->fresh_snapshot,
+                           clipboard->fresh_request_id,
+                           &error)) {
+        fail_fresh_paste(clipboard, "fresh-paste-broker", error);
         return;
     }
     clipboard->fresh_broker_submitted = TRUE;
@@ -343,25 +406,47 @@ link_wire_output(MuxClipboardPaneLink *link,
                                        error);
 }
 
-static void
+static gboolean
 queue_observation(MuxPaneClipboard *clipboard,
                   const gchar *origin,
                   guint64 view_id,
                   guint32 flags,
-                  const MuxClipboardSnapshot *snapshot)
+                  const MuxClipboardSnapshot *snapshot,
+                  guint64 fresh_request_id,
+                  GError **error)
 {
-    MuxClipboardSnapshot *copy =
-        mux_clipboard_snapshot_dup_sealed(snapshot);
+    PendingObservation *observation;
+    gsize bytes = mux_clipboard_snapshot_get_total_bytes(snapshot);
 
-    if (copy == NULL)
-        return;
-    g_clear_pointer(&clipboard->pending_snapshot,
-                    mux_clipboard_snapshot_unref);
-    clipboard->pending_snapshot = copy;
-    g_free(clipboard->pending_origin);
-    clipboard->pending_origin = g_strdup(origin != NULL ? origin : "");
-    clipboard->pending_view_id = view_id;
-    clipboard->pending_flags = flags;
+    if (clipboard->observations.length >=
+            MUX_PANE_CLIPBOARD_MAX_PENDING_OBSERVATIONS ||
+        bytes > MUX_PANE_CLIPBOARD_MAX_OBSERVATION_BYTES -
+                    clipboard->observation_bytes) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "clipboard observation queue is full");
+        return FALSE;
+    }
+
+    observation = g_new0(PendingObservation, 1);
+    observation->snapshot = mux_clipboard_snapshot_dup_sealed(snapshot);
+    if (observation->snapshot == NULL) {
+        pending_observation_free(observation);
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_DATA,
+                            "clipboard observation is invalid");
+        return FALSE;
+    }
+    observation->origin = g_strdup(origin != NULL ? origin : "");
+    observation->view_id = view_id;
+    observation->flags = flags;
+    observation->bytes = bytes;
+    observation->fresh_request_id = fresh_request_id;
+    g_queue_push_tail(&clipboard->observations, observation);
+    clipboard->observation_bytes += bytes;
+    return TRUE;
 }
 
 static void
@@ -374,14 +459,18 @@ link_observe(MuxClipboardPaneLink *link,
              gpointer user_data)
 {
     MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(GError) error = NULL;
 
     (void) link;
     (void) profile;
-    queue_observation(clipboard,
-                      source_origin,
-                      source_view_id,
-                      flags,
-                      snapshot);
+    if (!queue_observation(clipboard,
+                           source_origin,
+                           source_view_id,
+                           flags,
+                           snapshot,
+                           0,
+                           &error))
+        report_failure(clipboard, "observe-queue", error);
 }
 
 static void
@@ -497,6 +586,7 @@ disconnect_broker(MuxPaneClipboard *clipboard)
 {
     clipboard->broker_ready = FALSE;
     clipboard->client = NULL;
+    reset_submitted_observation(clipboard);
     if (clipboard->transport != NULL) {
         mux_clipboard_broker_transport_close(clipboard->transport);
         mux_clipboard_broker_transport_unref(clipboard->transport);
@@ -516,7 +606,10 @@ static gboolean
 apply_selection(gpointer snapshot, gpointer user_data, GError **error)
 {
     MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(MuxPaneClipboardOperation) operation =
+        pane_clipboard_acquire(clipboard);
 
+    (void)operation;
     return mux_clipboard_pane_link_apply_history(
         clipboard->link,
         snapshot,
@@ -532,7 +625,10 @@ static void
 picker_changed(MuxClipboardPickerBroker *picker, gpointer user_data)
 {
     MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(MuxPaneClipboardOperation) operation =
+        pane_clipboard_acquire(clipboard);
 
+    (void)operation;
     (void) picker;
     if (clipboard->changed_func != NULL)
         clipboard->changed_func(clipboard, clipboard->user_data);
@@ -542,7 +638,10 @@ static void
 picker_closed(MuxClipboardPickerBroker *picker, gpointer user_data)
 {
     MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(MuxPaneClipboardOperation) operation =
+        pane_clipboard_acquire(clipboard);
 
+    (void)operation;
     (void) picker;
     g_clear_pointer(&clipboard->selected_origin, g_free);
     clipboard->selected_view_id = 0;
@@ -554,8 +653,14 @@ static void
 broker_ready(MuxClipboardBrokerClient *client, gpointer user_data)
 {
     MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(MuxPaneClipboardOperation) operation =
+        pane_clipboard_acquire(clipboard);
 
+    (void)operation;
     clipboard->client = client;
+    mux_clipboard_broker_client_set_observation_func(
+        client,
+        broker_observation_result);
     clipboard->broker_ready = TRUE;
     clipboard->reconnect_after_us = 0;
     if (clipboard->open_when_ready) {
@@ -570,9 +675,12 @@ broker_list(MuxClipboardBrokerClient *client,
             gpointer user_data)
 {
     MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(MuxPaneClipboardOperation) operation =
+        pane_clipboard_acquire(clipboard);
     g_autoptr(GError) error = NULL;
     guint index;
 
+    (void)operation;
     (void) client;
     g_hash_table_remove_all(clipboard->summary_metadata);
     for (index = 0; index < summaries->len; index++) {
@@ -581,7 +689,7 @@ broker_list(MuxClipboardBrokerClient *client,
         SummaryMetadata *metadata;
         guint64 *key;
 
-        if (!mux_clipboard_picker_broker_add_summary(
+        if (!mux_clipboard_picker_broker_add_summary_full(
                 clipboard->picker,
                 summary->entry_id,
                 summary->created_us,
@@ -590,8 +698,9 @@ broker_list(MuxClipboardBrokerClient *client,
                 summary->pinned,
                 (gsize) summary->total_bytes,
                 summary->preview,
-                NULL,
-                0,
+                (const gchar *const *)summary->mime_types,
+                summary->mime_type_count,
+                summary->format_count,
                 &error))
             break;
 
@@ -613,7 +722,10 @@ broker_select(MuxClipboardBrokerClient *client,
               gpointer user_data)
 {
     MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(MuxPaneClipboardOperation) operation =
+        pane_clipboard_acquire(clipboard);
 
+    (void)operation;
     (void) client;
     (void) entry_id;
     (void) paste;
@@ -629,7 +741,10 @@ broker_mutation(MuxClipboardBrokerClient *client,
                 gpointer user_data)
 {
     MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(MuxPaneClipboardOperation) lifetime_operation =
+        pane_clipboard_acquire(clipboard);
 
+    (void)lifetime_operation;
     (void) client;
     (void) operation;
     (void) result_value;
@@ -643,18 +758,87 @@ broker_failure(MuxClipboardBrokerClient *client,
                gpointer user_data)
 {
     MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(MuxPaneClipboardOperation) lifetime_operation =
+        pane_clipboard_acquire(clipboard);
 
+    (void)lifetime_operation;
     (void) client;
     if (g_strcmp0(operation, "transport") == 0) {
         clipboard->broker_ready = FALSE;
         clipboard->client = NULL;
         clipboard->reconnect_after_us =
             g_get_monotonic_time() + MUX_PANE_CLIPBOARD_RECONNECT_US;
+        reset_submitted_observation(clipboard);
     }
-    if (clipboard->fresh_broker_submitted)
-        fail_fresh_paste(clipboard, "fresh-paste-broker", error);
     mux_clipboard_picker_broker_fail_active(clipboard->picker, error);
     report_failure(clipboard, operation, error);
+}
+
+static void
+broker_observation_result(
+    MuxClipboardBrokerClient *client,
+    guint64 transaction_id,
+    MuxClipboardBrokerObservationResult result,
+    const GError *error,
+    gpointer user_data)
+{
+    MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(MuxPaneClipboardOperation) operation =
+        pane_clipboard_acquire(clipboard);
+    PendingObservation *observation =
+        g_queue_peek_head(&clipboard->observations);
+    gboolean fresh;
+
+    (void)operation;
+    (void)client;
+    if (observation == NULL || !observation->submitted ||
+        observation->transaction_id != transaction_id) {
+        g_autoptr(GError) protocol_error = g_error_new_literal(
+            G_IO_ERROR,
+            G_IO_ERROR_INVALID_DATA,
+            "clipboard observation result arrived out of order");
+
+        report_failure(clipboard, "observe-result", protocol_error);
+        return;
+    }
+
+    g_queue_pop_head(&clipboard->observations);
+    clipboard->observation_bytes -= observation->bytes;
+    fresh = observation->fresh_request_id != 0 &&
+            observation->fresh_request_id == clipboard->fresh_request_id;
+    pending_observation_free(observation);
+
+    if (result == MUX_CLIPBOARD_BROKER_OBSERVATION_REJECTED) {
+        if (fresh) {
+            fail_fresh_paste(clipboard, "fresh-paste-broker", error);
+            complete_failed_fresh_paste(clipboard);
+        } else {
+            report_failure(clipboard, "observe", error);
+        }
+        return;
+    }
+    if (result == MUX_CLIPBOARD_BROKER_OBSERVATION_DEGRADED) {
+        g_autoptr(GError) degraded = g_error_new_literal(
+            G_IO_ERROR,
+            G_IO_ERROR_PARTIAL_INPUT,
+            "clipboard history stored only eligible fallback formats");
+
+        if (fresh) {
+            report_failure(clipboard, "fresh-paste-history", degraded);
+            if (!mux_clipboard_lifetime_owner_released(
+                    &clipboard->lifetime)) {
+                clipboard->fresh_broker_acked = TRUE;
+                maybe_complete_fresh_paste(clipboard);
+            }
+        } else {
+            report_failure(clipboard, "observe-degraded", degraded);
+        }
+        return;
+    }
+    if (fresh) {
+        clipboard->fresh_broker_acked = TRUE;
+        maybe_complete_fresh_paste(clipboard);
+    }
 }
 
 static gboolean
@@ -692,6 +876,9 @@ connect_broker(MuxPaneClipboard *clipboard, GError **error)
     clipboard->client =
         mux_clipboard_broker_client_transport_get_client(
             clipboard->transport);
+    mux_clipboard_broker_client_set_observation_func(
+        clipboard->client,
+        broker_observation_result);
     return TRUE;
 }
 
@@ -699,28 +886,33 @@ static void
 flush_observation(MuxPaneClipboard *clipboard)
 {
     g_autoptr(GError) error = NULL;
+    PendingObservation *observation =
+        g_queue_peek_head(&clipboard->observations);
+    guint64 transaction_id = 0;
 
-    if (clipboard->pending_snapshot == NULL || !clipboard->broker_ready ||
-        clipboard->client == NULL ||
-        mux_clipboard_broker_client_request_pending(clipboard->client))
+    if (observation == NULL || observation->submitted ||
+        !clipboard->broker_ready || clipboard->client == NULL)
         return;
 
-    if (!mux_clipboard_broker_client_observe(
+    observation->submitted = TRUE;
+    if (!mux_clipboard_broker_client_observe_full(
             clipboard->client,
-            clipboard->pending_flags,
-            clipboard->pending_origin,
-            clipboard->pending_view_id,
-            clipboard->pending_snapshot,
+            observation->flags,
+            observation->origin,
+            observation->view_id,
+            observation->snapshot,
+            &observation->transaction_id,
             &error)) {
-        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_PENDING))
+        transaction_id = observation->transaction_id;
+        observation = g_queue_peek_head(&clipboard->observations);
+        if (observation != NULL &&
+            observation->transaction_id == transaction_id) {
+            observation->submitted = FALSE;
+            observation->transaction_id = 0;
+        }
+        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
             report_failure(clipboard, "observe", error);
-        return;
     }
-    g_clear_pointer(&clipboard->pending_snapshot,
-                    mux_clipboard_snapshot_unref);
-    g_clear_pointer(&clipboard->pending_origin, g_free);
-    clipboard->pending_view_id = 0;
-    clipboard->pending_flags = 0;
 }
 
 MuxPaneClipboard *
@@ -748,6 +940,7 @@ mux_pane_clipboard_new(
     };
     MuxPaneClipboard *clipboard;
     g_autoptr(GError) connect_error = NULL;
+    gboolean owner_released;
 
     g_return_val_if_fail(error == NULL || *error == NULL, NULL);
     if (profile == NULL || *profile == '\0' || context == NULL ||
@@ -760,6 +953,7 @@ mux_pane_clipboard_new(
     }
 
     clipboard = g_new0(MuxPaneClipboard, 1);
+    mux_clipboard_lifetime_init(&clipboard->lifetime);
     clipboard->profile = g_strdup(profile);
     clipboard->broker_profile = broker_profile_name(profile, ephemeral);
     clipboard->ephemeral = ephemeral;
@@ -777,6 +971,7 @@ mux_pane_clipboard_new(
         g_int64_equal,
         g_free,
         summary_metadata_free);
+    g_queue_init(&clipboard->observations);
     clipboard->next_fresh_wire_transaction =
         ((guint64)g_random_int() << 32) | g_random_int();
     clipboard->link = mux_clipboard_pane_link_new(
@@ -817,17 +1012,26 @@ mux_pane_clipboard_new(
         return NULL;
     }
 
+    pane_clipboard_acquire(clipboard);
     if (!connect_broker(clipboard, &connect_error))
         report_failure(clipboard, "broker-connect", connect_error);
+    owner_released = mux_clipboard_lifetime_owner_released(
+        &clipboard->lifetime);
+    if (owner_released && error != NULL && *error == NULL) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CANCELLED,
+                            "pane clipboard was destroyed during construction");
+    }
+    pane_clipboard_release(clipboard);
+    if (owner_released)
+        return NULL;
     return clipboard;
 }
 
-void
-mux_pane_clipboard_free(MuxPaneClipboard *clipboard)
+static void
+pane_clipboard_destroy(MuxPaneClipboard *clipboard)
 {
-    if (clipboard == NULL)
-        return;
-
     if (clipboard->link != NULL)
         mux_clipboard_pane_link_set_enabled(clipboard->link, FALSE, NULL);
     clear_fresh_paste(clipboard);
@@ -838,9 +1042,8 @@ mux_pane_clipboard_free(MuxPaneClipboard *clipboard)
     disconnect_broker(clipboard);
     g_clear_pointer(&clipboard->link, mux_clipboard_pane_link_free);
     g_clear_pointer(&clipboard->summary_metadata, g_hash_table_unref);
-    g_clear_pointer(&clipboard->pending_snapshot,
-                    mux_clipboard_snapshot_unref);
-    g_free(clipboard->pending_origin);
+    g_queue_clear_full(&clipboard->observations,
+                       (GDestroyNotify)pending_observation_free);
     g_free(clipboard->selected_origin);
     g_free(clipboard->broker_profile);
     g_free(clipboard->profile);
@@ -850,12 +1053,24 @@ mux_pane_clipboard_free(MuxPaneClipboard *clipboard)
     g_free(clipboard);
 }
 
+void
+mux_pane_clipboard_free(MuxPaneClipboard *clipboard)
+{
+    if (clipboard != NULL &&
+        mux_clipboard_lifetime_release_owner(&clipboard->lifetime))
+        pane_clipboard_destroy(clipboard);
+}
+
 gboolean
 mux_pane_clipboard_set_enabled(MuxPaneClipboard *clipboard,
                                gboolean enabled,
                                GError **error)
 {
+    g_autoptr(MuxPaneClipboardOperation) operation = NULL;
+
     g_return_val_if_fail(clipboard != NULL, FALSE);
+    operation = pane_clipboard_acquire(clipboard);
+    (void)operation;
     return mux_clipboard_pane_link_set_enabled(clipboard->link,
                                               enabled,
                                               error);
@@ -867,7 +1082,11 @@ mux_pane_clipboard_handle_support(MuxPaneClipboard *clipboard,
                                   gsize length,
                                   GError **error)
 {
+    g_autoptr(MuxPaneClipboardOperation) operation = NULL;
+
     g_return_val_if_fail(clipboard != NULL, FALSE);
+    operation = pane_clipboard_acquire(clipboard);
+    (void)operation;
     return mux_clipboard_pane_link_handle_support(clipboard->link,
                                                  sequence,
                                                  length,
@@ -880,11 +1099,14 @@ mux_pane_clipboard_handle_osc(MuxPaneClipboard *clipboard,
                               gsize length,
                               GError **error)
 {
+    g_autoptr(MuxPaneClipboardOperation) operation = NULL;
     MuxOsc5522Event *event = NULL;
     g_autoptr(GError) probe_error = NULL;
     gboolean result;
 
     g_return_val_if_fail(clipboard != NULL, FALSE);
+    operation = pane_clipboard_acquire(clipboard);
+    (void)operation;
     if (clipboard->fresh_state != FRESH_PASTE_IDLE &&
         mux_osc5522_parse(sequence,
                           length,
@@ -918,10 +1140,13 @@ mux_pane_clipboard_handle_engine_packet(MuxPaneClipboard *clipboard,
                                         gsize packet_length,
                                         GError **error)
 {
+    g_autoptr(MuxPaneClipboardOperation) operation = NULL;
     MuxClipboardWireRecord record = { 0 };
     g_autoptr(GError) probe_error = NULL;
 
     g_return_val_if_fail(clipboard != NULL, FALSE);
+    operation = pane_clipboard_acquire(clipboard);
+    (void)operation;
     if (clipboard->fresh_state == FRESH_PASTE_SYNCING &&
         mux_clipboard_wire_record_decode(packet,
                                          packet_length,
@@ -960,7 +1185,11 @@ mux_pane_clipboard_request_fresh_paste(
     gpointer callback_data,
     GError **error)
 {
+    g_autoptr(MuxPaneClipboardOperation) operation = NULL;
+
     g_return_val_if_fail(clipboard != NULL, FALSE);
+    operation = pane_clipboard_acquire(clipboard);
+    (void)operation;
     if (request_id == 0 || callback == NULL) {
         g_set_error_literal(error,
                             G_IO_ERROR,
@@ -1000,9 +1229,12 @@ mux_pane_clipboard_fresh_paste_pending(
 void
 mux_pane_clipboard_open_picker(MuxPaneClipboard *clipboard)
 {
+    g_autoptr(MuxPaneClipboardOperation) operation = NULL;
     g_autoptr(GError) error = NULL;
 
     g_return_if_fail(clipboard != NULL);
+    operation = pane_clipboard_acquire(clipboard);
+    (void)operation;
     if (mux_pane_clipboard_picker_is_open(clipboard))
         return;
     if (!clipboard->broker_ready) {
@@ -1017,7 +1249,11 @@ mux_pane_clipboard_open_picker(MuxPaneClipboard *clipboard)
 void
 mux_pane_clipboard_close_picker(MuxPaneClipboard *clipboard)
 {
+    g_autoptr(MuxPaneClipboardOperation) operation = NULL;
+
     g_return_if_fail(clipboard != NULL);
+    operation = pane_clipboard_acquire(clipboard);
+    (void)operation;
     clipboard->open_when_ready = FALSE;
     mux_clipboard_picker_broker_close(clipboard->picker);
 }
@@ -1035,7 +1271,11 @@ mux_pane_clipboard_handle_picker_key(MuxPaneClipboard *clipboard,
                                      MuxClipboardPickerKey key,
                                      gunichar text)
 {
+    g_autoptr(MuxPaneClipboardOperation) operation = NULL;
+
     g_return_val_if_fail(clipboard != NULL, FALSE);
+    operation = pane_clipboard_acquire(clipboard);
+    (void)operation;
     return mux_clipboard_picker_broker_handle_key(clipboard->picker,
                                                  key,
                                                  text);
@@ -1055,9 +1295,12 @@ mux_pane_clipboard_render_picker(MuxPaneClipboard *clipboard,
 void
 mux_pane_clipboard_tick(MuxPaneClipboard *clipboard, gint64 monotonic_us)
 {
+    g_autoptr(MuxPaneClipboardOperation) operation = NULL;
     g_autoptr(GError) error = NULL;
 
     g_return_if_fail(clipboard != NULL);
+    operation = pane_clipboard_acquire(clipboard);
+    (void)operation;
     mux_clipboard_pane_link_tick(clipboard->link, monotonic_us);
     mux_kitty_clipboard_tick(clipboard->fresh_kitty, monotonic_us);
     if (clipboard->fresh_error != NULL) {
@@ -1077,6 +1320,7 @@ mux_pane_clipboard_tick(MuxPaneClipboard *clipboard, gint64 monotonic_us)
         clipboard->transport = NULL;
         clipboard->client = NULL;
         clipboard->broker_ready = FALSE;
+        reset_submitted_observation(clipboard);
     }
     if (clipboard->transport == NULL &&
         monotonic_us >= clipboard->reconnect_after_us &&
@@ -1092,12 +1336,5 @@ mux_pane_clipboard_tick(MuxPaneClipboard *clipboard, gint64 monotonic_us)
         g_clear_error(&error);
     }
     flush_fresh_observation(clipboard);
-    if (clipboard->fresh_state == FRESH_PASTE_SYNCING &&
-        clipboard->fresh_broker_submitted &&
-        clipboard->broker_ready && clipboard->client != NULL &&
-        !mux_clipboard_broker_client_request_pending(clipboard->client)) {
-        clipboard->fresh_broker_acked = TRUE;
-        maybe_complete_fresh_paste(clipboard);
-    }
     flush_observation(clipboard);
 }

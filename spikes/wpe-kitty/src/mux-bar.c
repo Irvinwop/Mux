@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "mux-protocol.h"
+#include "mux-shortcuts.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -144,7 +145,7 @@ static void redraw(Bar *bar)
         ? view->title
         : "No active page";
     gchar *header = g_strdup_printf(
-        " MUX/%s [%u]  C-l:url  C-S-p:cmd  C-S-v:clip | %s",
+        " MUX/%s [%u]  Super-L:url  Super-Shift-P:cmd  Super-Shift-V:clip | %s",
         bar->layer ? bar->layer : "main",
         g_hash_table_size(bar->views),
         title);
@@ -172,7 +173,7 @@ static void redraw(Bar *bar)
         append_padded(
             output,
             " ",
-            "C-d bookmark  C-S-enter split  C-S-t new layer  A-hjkl pane  A-[ / ] layer",
+            "Super-D bookmark  Super-Shift-Enter split  Super-Shift-T new layer  Alt-HJKL pane  Alt-[ / ] layer",
             bar->columns);
         rendered_rows = 3;
     }
@@ -296,14 +297,24 @@ static void handle_key(
     guint event_type,
     const gchar *text)
 {
-    if (event_type == 3)
-        return;
-    guint modifiers = encoded_modifiers ? encoded_modifiers - 1 : 0;
+    guint modifiers =
+        mux_shortcut_modifiers_from_kitty(encoded_modifiers);
+    MuxShortcut shortcut = mux_shortcut_match_bar(modifiers, key);
 
-    if ((modifiers & 4) && key == 'l') {
-        begin_edit(bar);
+    if (shortcut != MUX_SHORTCUT_NONE) {
+        if (event_type == MUX_SHORTCUT_EVENT_PRESS) {
+            if (shortcut == MUX_SHORTCUT_LOCATION)
+                begin_edit(bar);
+            else if (shortcut == MUX_SHORTCUT_BAR_CLEAR && bar->editing) {
+                g_string_truncate(bar->edit, 0);
+                bar->replace_on_type = FALSE;
+                redraw(bar);
+            }
+        }
         return;
     }
+    if (event_type == MUX_SHORTCUT_EVENT_RELEASE)
+        return;
     if (!bar->editing)
         return;
     if (key == 13) {
@@ -318,13 +329,10 @@ static void handle_key(
         backspace(bar);
         return;
     }
-    if ((modifiers & 4) && key == 'u') {
-        g_string_truncate(bar->edit, 0);
-        bar->replace_on_type = FALSE;
-        redraw(bar);
-        return;
-    }
-    if (!(modifiers & 4) && text && *text) {
+    if (!(modifiers & (MUX_SHORTCUT_MODIFIER_CONTROL |
+                       MUX_SHORTCUT_MODIFIER_ALT |
+                       MUX_SHORTCUT_MODIFIER_META)) &&
+        text && *text) {
         gchar **codepoints = g_strsplit(text, ":", -1);
         for (guint i = 0; codepoints[i]; i++)
             append_codepoint(bar, parse_uint(codepoints[i], 0));

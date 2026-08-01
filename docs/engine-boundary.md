@@ -105,13 +105,13 @@ NUL. Rectangles are four 32-bit values in `x`, `y`, `width`, `height` order.
 
 Close is serial-bound in protocol v2:
 
-1. The first `Ctrl+Q` causes the pane to send `REQUEST_CLOSE`.
+1. The first `Super+Q` (`Ctrl+Q` Linux alias) causes the pane to send `REQUEST_CLOSE`.
 2. The engine invokes WebKit's graceful close path, including `beforeunload`.
 3. If WebKit accepts closure, the engine returns matching `CLOSE_READY` and the
    pane performs normal teardown.
 4. If the page chooses Stay or the request deadline expires, the pane sends
    matching `CANCEL_CLOSE`, clears the pending request, and remains open.
-5. A second `Ctrl+Q` while a close request is pending is the explicit
+5. A second `Super+Q` while a close request is pending is the explicit
    force-close operation.
 
 Late close records are ignored by serial and cannot close a later page state.

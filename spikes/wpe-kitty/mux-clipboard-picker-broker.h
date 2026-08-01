@@ -80,6 +80,19 @@ gboolean mux_clipboard_picker_broker_add_summary(
     const gchar *const *mime_types,
     gsize mime_type_count,
     GError **error);
+gboolean mux_clipboard_picker_broker_add_summary_full(
+    MuxClipboardPickerBroker *broker,
+    guint64 id,
+    gint64 created_us,
+    const gchar *origin,
+    guint64 source_view_id,
+    gboolean pinned,
+    gsize total_size,
+    const gchar *preview,
+    const gchar *const *mime_types,
+    gsize mime_type_count,
+    gsize format_count,
+    GError **error);
 void mux_clipboard_picker_broker_complete_list(
     MuxClipboardPickerBroker *broker,
     const GError *error);

@@ -52,6 +52,7 @@ typedef struct {
     gboolean pending_slot_held;
     gboolean active_slot_held;
     gint64 last_progress_us;
+    guint destination_timeout_id;
     gulong decide_destination_handler;
     gulong created_destination_handler;
     gulong received_data_handler;
@@ -585,10 +586,19 @@ disconnect_download(PendingDownload *pending)
 }
 
 static void
+clear_destination_timeout(PendingDownload *pending)
+{
+    if (pending->destination_timeout_id)
+        g_source_remove(pending->destination_timeout_id);
+    pending->destination_timeout_id = 0;
+}
+
+static void
 pending_download_free(PendingDownload *pending)
 {
     if (!pending)
         return;
+    clear_destination_timeout(pending);
     release_download_slots(pending);
     disconnect_download(pending);
     if (pending->state != DOWNLOAD_STATE_FINISHED)
@@ -798,6 +808,7 @@ begin_destination(PendingDownload *pending,
     g_autofree gchar *basename = NULL;
     g_autofree gchar *partial_uri = NULL;
 
+    clear_destination_timeout(pending);
     if (!path || !g_path_is_absolute(path)) {
         g_set_error_literal(error,
                             G_IO_ERROR,
@@ -986,6 +997,21 @@ finalize_download(PendingDownload *pending, GError **error)
 }
 
 static gboolean
+destination_timeout(gpointer data)
+{
+    PendingDownload *pending = data;
+
+    pending->destination_timeout_id = 0;
+    if (pending->state != DOWNLOAD_STATE_WAITING_DESTINATION)
+        return G_SOURCE_REMOVE;
+    g_free(pending->failure_message);
+    pending->failure_message =
+        g_strdup("download destination prompt timed out");
+    webkit_download_cancel(pending->download);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean
 on_decide_destination(WebKitDownload *download,
                       const gchar *suggested_filename,
                       PendingDownload *pending)
@@ -1009,9 +1035,14 @@ on_decide_destination(WebKitDownload *download,
     g_free(pending->suggested_filename);
     pending->suggested_filename = g_strdup(safe_name);
     pending->state = DOWNLOAD_STATE_WAITING_DESTINATION;
+    clear_destination_timeout(pending);
+    pending->destination_timeout_id = g_timeout_add(
+        MUX_DOWNLOAD_DESTINATION_TIMEOUT_MS,
+        destination_timeout,
+        pending);
 
     request->request_id = pending->download_id;
-    request->deadline_ms = 300000;
+    request->deadline_ms = MUX_DOWNLOAD_DESTINATION_TIMEOUT_MS;
     request->origin = origin_for_view(pending->source_view);
     request->heading = g_strdup("Download");
     request->message =
@@ -1022,8 +1053,10 @@ on_decide_destination(WebKitDownload *download,
         !pending->manager->send_func(pending->source_view,
                                      payload,
                                      pending->manager->user_data,
-                                     &error))
+                                     &error)) {
+        clear_destination_timeout(pending);
         webkit_download_cancel(pending->download);
+    }
     return TRUE;
 }
 
@@ -1072,6 +1105,7 @@ on_failed(WebKitDownload *download,
     gboolean internal_failure = pending->failure_message != NULL;
 
     (void)download;
+    clear_destination_timeout(pending);
     pending->state = DOWNLOAD_STATE_FAILED;
     release_download_slots(pending);
     if (!internal_failure)
@@ -1098,6 +1132,7 @@ on_finished(WebKitDownload *download, PendingDownload *pending)
     gboolean emit_terminal = FALSE;
 
     (void)download;
+    clear_destination_timeout(pending);
     if (pending->state != DOWNLOAD_STATE_FAILED) {
         if (finalize_download(pending, &error)) {
             pending->state = DOWNLOAD_STATE_FINISHED;
@@ -1284,8 +1319,10 @@ mux_download_manager_handle_payload(MuxDownloadManager *manager,
                 data, length, &download_id, &reason, error))
             return FALSE;
         pending = g_hash_table_lookup(manager->by_id, &download_id);
-        if (pending)
+        if (pending) {
+            clear_destination_timeout(pending);
             webkit_download_cancel(pending->download);
+        }
         return TRUE;
     }
 
@@ -1301,10 +1338,12 @@ mux_download_manager_handle_payload(MuxDownloadManager *manager,
             return TRUE;
         if (response->action == MUX_UI_ACTION_CANCEL ||
             response->action == MUX_UI_ACTION_UNSUPPORTED) {
+            clear_destination_timeout(pending);
             webkit_download_cancel(pending->download);
             return TRUE;
         }
         if (response->action != MUX_UI_ACTION_SUBMIT) {
+            clear_destination_timeout(pending);
             webkit_download_cancel(pending->download);
             g_set_error_literal(
                 error,
@@ -1335,8 +1374,44 @@ mux_download_manager_cancel(MuxDownloadManager *manager,
 
     g_return_if_fail(manager);
     pending = g_hash_table_lookup(manager->by_id, &download_id);
-    if (pending)
+    if (pending) {
+        clear_destination_timeout(pending);
         webkit_download_cancel(pending->download);
+    }
+}
+
+void
+mux_download_manager_cancel_view(MuxDownloadManager *manager,
+                                 WebKitWebView *source_view)
+{
+    GHashTableIter iterator;
+    gpointer value;
+    g_autoptr(GPtrArray) downloads =
+        g_ptr_array_new_with_free_func(g_object_unref);
+
+    g_return_if_fail(manager);
+    g_return_if_fail(WEBKIT_IS_WEB_VIEW(source_view));
+
+    g_hash_table_iter_init(&iterator, manager->by_download);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        PendingDownload *pending = value;
+
+        if (pending->source_view == source_view)
+            g_ptr_array_add(downloads,
+                            g_object_ref(pending->download));
+    }
+    for (guint index = 0; index < downloads->len; index++) {
+        WebKitDownload *download = g_ptr_array_index(downloads, index);
+        PendingDownload *pending =
+            g_hash_table_lookup(manager->by_download, download);
+
+        if (!pending || pending->source_view != source_view)
+            continue;
+        clear_destination_timeout(pending);
+        disconnect_download(pending);
+        remove_pending(pending);
+        webkit_download_cancel(download);
+    }
 }
 
 void

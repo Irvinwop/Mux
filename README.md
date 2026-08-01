@@ -102,7 +102,7 @@ loopback HTTP fixtures because Mux intentionally rejects `data:` navigation.
 Through a real Kitty process it proves JavaScript title execution, the
 Kitty-to-pane process topology, muxd and engine connectivity, muxctl focus,
 physical layer switching, targeted navigation, and encrypted blank-password
-`Ctrl+Q` closure. The temporary Kitty copy adds only `send-key` and `get-text`;
+`Super+Q` closure. The temporary Kitty copy adds only `send-key` and `get-text`;
 the production ACL is unchanged.
 
 The gate does not expose Kitty's graphics `FRAME_ACK`, so it does not prove
@@ -133,21 +133,22 @@ actually observes.
 
 ## Intended controls
 
-Browser-owned `Ctrl` shortcuts also accept `Super` (`Command` on Apple
-keyboards) as an alias. This is only a keyboard alias on Linux; Mux remains
-Linux-only and does not support native macOS execution.
+`Super` (`Command` on an Apple keyboard mapped into Linux) is canonical for
+Mux-owned shortcuts. Conventional `Ctrl` equivalents are retained as explicit
+Linux compatibility aliases. This does not make Mux portable to macOS; the WPE
+runtime remains Linux-only.
 
 | Key | Action |
 | --- | --- |
-| `Ctrl+L` | Edit the global URL bar. |
-| `Ctrl+R` | Reload the focused page. |
+| `Super+L` (`Ctrl+L` Linux alias) | Edit the global URL bar. |
+| `Super+R` (`Ctrl+R` Linux alias) | Reload the focused page. |
 | `Alt+Left` / `Alt+Right` | Navigate page history. |
-| `Ctrl+Shift+V` | Open profile clipboard history. |
-| `Ctrl+Shift+P` | Open commands, bookmarks, history, and recently closed pages. |
-| `Ctrl+D` | Add or remove a bookmark for the current page. |
-| `Ctrl+Shift+Enter` | Open another browser split. |
-| `Ctrl+Shift+T` | Open another browser layer/tab. |
-| `Ctrl+Q` | Ask the page to close; press again to force it. |
+| `Super+Shift+V` (`Ctrl+Shift+V` Linux alias) | Open profile clipboard history. |
+| `Super+Shift+P` (`Ctrl+Shift+P` Linux alias) | Open commands, bookmarks, history, and recently closed pages. |
+| `Super+D` (`Ctrl+D` Linux alias) | Add or remove a bookmark for the current page. |
+| `Super+Shift+Enter` (`Ctrl+Shift+Enter` Linux alias) | Open another browser split. |
+| `Super+Shift+T` (`Ctrl+Shift+T` Linux alias) | Open another browser layer/tab. |
+| `Super+Q` (`Ctrl+Q` Linux alias) | Ask the page to close; press again to force it. |
 
 These bindings still need a full conflict and behavior pass against stock and
 user-customized Kitty configurations.

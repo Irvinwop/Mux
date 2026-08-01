@@ -138,7 +138,7 @@ that scheme.
 The gate starts foreground muxd and mux-engine processes followed by a real
 Kitty -> mux-layer -> mux-pane and mux-bar stack. It proves JavaScript page load
 through title metadata in `muxctl list`, process presence, physical focus and
-layer changes, targeted navigation to a second fixture, and graceful `Ctrl+Q`
+layer changes, targeted navigation to a second fixture, and graceful `Super+Q`
 for both panes. Kitty commands use encrypted blank-password remote control with
 the `KITTY_PUBLIC_KEY` read from the pane environment. Only the temporary Kitty
 config copy gains `send-key` and `get-text`, which are used for the close path
