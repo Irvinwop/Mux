@@ -32,8 +32,8 @@ DESTDIR is honored for staged installs and implies --no-launch.
 
 The automatic package recipe is release-qualified only for x86_64 Arch Linux.
 Official Arch Linux ARM repositories do not provide wpewebkit; ARM users must
-provide the WPE dependencies separately or use the currently unqualified Nix
-path.
+provide the WPE dependencies separately or use the aarch64 Nix path, whose full
+build is qualified but whose graphical launch remains unqualified.
 EOF
 }
 
@@ -161,7 +161,8 @@ setup: the automatic Arch recipe is x86_64-only.
 Official Arch Linux ARM repositories do not provide wpewebkit, so setup cannot
 satisfy the WPE dependency there. Use --skip-packages only after supplying
 wpe-webkit-2.0 and wpe-platform-2.0 >= 2.52.5 yourself. The aarch64 Nix output
-has been evaluation-checked but is not a release-qualified build path yet.
+has completed its full WPE, runtime, test, and app build, but its graphical
+launch is not release-qualified yet.
 EOF
     exit 1
   fi

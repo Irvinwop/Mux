@@ -70,8 +70,8 @@ unrelated packages. Review the transaction before accepting it.
 
 Official Arch Linux ARM repositories do not provide `wpewebkit`. Therefore
 Arch Linux ARM is not part of the automatic or release-qualified Arch path.
-The flake evaluates for `aarch64-linux` and can remain the prospective ARM path
-once its full custom WPE build is qualified; it is not qualified today.
+The flake's custom WPE, runtime, native tests, and default app have been fully
+realized on `aarch64-linux`; its graphical launch remains unqualified.
 
 ## Checkout development mode
 
@@ -104,9 +104,11 @@ experimental features; enable them for the invocation with:
 nix --extra-experimental-features 'nix-command flakes' run . -- https://example.com
 ```
 
-This Nix path is not release-qualified. A complete build of its custom WPE
-derivation has not finished locally or in CI; the evaluated build requires
-roughly 1.5 GiB of downloads and 6.1 GiB unpacked.
+The `aarch64-linux` path has completed a serialized custom WPE 2.52.5 build,
+the 146-step Mux build, all 16 native suites, the runtime output, and the
+default app output. `x86_64-linux` remains evaluation-checked rather than fully
+realized. A graphical launch through the Nix wrapper is still unqualified, so
+the automatic x86_64 Arch install remains the v0.1 release path.
 
 Run `./doctor` for a read-only dependency report. See
 [Installation](docs/install.md) for prefix, staging, uninstall, Arch Linux ARM,

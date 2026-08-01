@@ -115,8 +115,8 @@ can request only environment checking and installation with:
 ```
 
 That is an unqualified source path. The flake evaluates for `aarch64-linux` and
-can become the preferred ARM path after its full custom WPE build and runtime
-are qualified; evaluation alone is not that qualification.
+has now completed its full custom WPE 2.52.5, Mux runtime, 16-suite native test,
+and default app realization. A graphical Nix launch remains unqualified.
 
 ## Other Linux source installations
 
@@ -191,10 +191,11 @@ nix --extra-experimental-features 'nix-command flakes' develop
 Alternatively, enable `nix-command flakes` in the user's `nix.conf` and use
 the shorter commands.
 
-The Nix path is not release-qualified. A complete custom WPE build has not
-finished locally or in CI. Its evaluated closure requires roughly 1.5 GiB of
-downloads and 6.1 GiB unpacked, so successful evaluation is not evidence of a
-successful build. The Nix app includes common GStreamer plugin sets and remains
+The `aarch64-linux` Nix path has completed a serialized custom WPE 2.52.5
+build, the 146-step Mux build, all 16 native suites, the runtime output, and the
+default app output. The `x86_64-linux` path remains evaluation-checked rather
+than fully realized. A graphical launch through the Nix wrapper is still
+unqualified. The app includes common GStreamer plugin sets and remains
 Linux-only.
 
 ## Keyboard terminology
