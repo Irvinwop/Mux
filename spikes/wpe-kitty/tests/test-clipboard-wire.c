@@ -1665,6 +1665,37 @@ test_kitty_write_retries_would_block(void)
 }
 
 static void
+test_kitty_read_cancellation_ignores_late_response(void)
+{
+    KittyClipboardSink sink = { 0 };
+    g_autoptr(MuxKittyClipboard) clipboard = NULL;
+    g_autoptr(GError) error = NULL;
+
+    kitty_sink_init(&sink);
+    clipboard = mux_kitty_clipboard_new(collect_kitty_packet,
+                                        NULL,
+                                        collect_kitty_failure,
+                                        &sink,
+                                        NULL);
+    g_assert_true(mux_kitty_clipboard_request(
+        clipboard,
+        MUX_OSC5522_LOCATION_CLIPBOARD,
+        NULL,
+        NULL,
+        "fresh paste test",
+        FALSE,
+        &error));
+    g_assert_no_error(error);
+    g_assert_true(mux_kitty_clipboard_read_pending(clipboard));
+    g_assert_cmpuint(sink.packets->len, ==, 1);
+
+    mux_kitty_clipboard_cancel_read(clipboard);
+    g_assert_false(mux_kitty_clipboard_read_pending(clipboard));
+    g_assert_cmpuint(sink.failures, ==, 0);
+    kitty_sink_clear(&sink);
+}
+
+static void
 test_kitty_write_rejection_promotes_latest(void)
 {
     static const gchar winning_plain[] = "rejection winner";
@@ -1935,6 +1966,8 @@ main(int argc, char **argv)
                     test_kitty_write_queue_is_bounded_latest_wins);
     g_test_add_func("/clipboard/kitty-write/retry-would-block",
                     test_kitty_write_retries_would_block);
+    g_test_add_func("/clipboard/kitty-read/cancel",
+                    test_kitty_read_cancellation_ignores_late_response);
     g_test_add_func("/clipboard/kitty-write/rejection-promotes-latest",
                     test_kitty_write_rejection_promotes_latest);
     g_test_add_func("/clipboard/kitty-write/timeout-promotes-latest",

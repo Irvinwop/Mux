@@ -1,6 +1,8 @@
 #include <glib.h>
 #include <glib/gstdio.h>
 
+#include <string.h>
+
 #include "mux-permission-store.h"
 
 static void
@@ -35,6 +37,11 @@ test_private_namespace_never_persists(void)
                                          &error));
   g_assert_no_error(error);
   g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+  g_assert_cmpint(mux_permission_store_lookup(private_store,
+                                              "https://private.test",
+                                              "camera"),
+                  ==,
+                  MUX_PERMISSION_DECISION_ASK);
 
   persistent_store = mux_permission_store_new_for_namespace(
       directory,
@@ -165,7 +172,7 @@ test_decision_expiry(void)
       store,
       "https://expiry.test",
       "camera",
-      MUX_PERMISSION_DECISION_ALLOW,
+      MUX_PERMISSION_DECISION_DENY,
       1000,
       &error));
   g_assert_no_error(error);
@@ -173,7 +180,7 @@ test_decision_expiry(void)
                                               "https://expiry.test",
                                               "camera"),
                   ==,
-                  MUX_PERMISSION_DECISION_ALLOW);
+                  MUX_PERMISSION_DECISION_DENY);
   g_usleep(5000);
   g_assert_cmpint(mux_permission_store_lookup(store,
                                               "https://expiry.test",
@@ -186,12 +193,75 @@ test_decision_expiry(void)
       store,
       "https://expiry.test",
       "camera",
-      MUX_PERMISSION_DECISION_ALLOW,
+      MUX_PERMISSION_DECISION_DENY,
       MUX_PERMISSION_STORE_MAX_TTL_US + 1,
       &error));
   g_assert_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT);
   g_clear_error(&error);
   mux_permission_store_free(store);
+}
+
+static void
+test_allow_decisions_are_discarded(void)
+{
+  g_autofree gchar *directory = NULL;
+  g_autofree gchar *path = NULL;
+  g_autofree gchar *contents = NULL;
+  MuxPermissionStore *store;
+  GError *error = NULL;
+  gint64 now_us = g_get_real_time();
+
+  directory = g_dir_make_tmp("mux-permission-allow-XXXXXX", &error);
+  g_assert_no_error(error);
+  g_assert_nonnull(directory);
+  path = g_build_filename(directory, "permissions.ini", NULL);
+  contents = g_strdup_printf(
+      "[mux]\nversion=2\nnamespace=allow-test\n\n"
+      "[permission legacy]\n"
+      "origin=https://legacy-allow.test\n"
+      "category=camera\n"
+      "decision=allow\n"
+      "updated-us=%" G_GINT64_FORMAT "\n"
+      "expires-us=%" G_GINT64_FORMAT "\n",
+      now_us,
+      now_us + G_TIME_SPAN_DAY);
+  g_assert_true(g_file_set_contents(path, contents, -1, &error));
+  g_assert_no_error(error);
+  g_assert_cmpint(g_chmod(path, 0600), ==, 0);
+
+  store = mux_permission_store_new_for_namespace(
+      directory,
+      "allow-test",
+      MUX_PERMISSION_STORE_SCOPE_PERSISTENT,
+      &error);
+  g_assert_no_error(error);
+  g_assert_nonnull(store);
+  g_assert_cmpint(mux_permission_store_lookup(store,
+                                              "https://legacy-allow.test",
+                                              "camera"),
+                  ==,
+                  MUX_PERMISSION_DECISION_ASK);
+  g_assert_cmpuint(mux_permission_store_size(store), ==, 0);
+
+  g_assert_true(mux_permission_store_set(store,
+                                         "https://new-allow.test",
+                                         "microphone",
+                                         MUX_PERMISSION_DECISION_ALLOW,
+                                         &error));
+  g_assert_no_error(error);
+  g_assert_cmpint(mux_permission_store_lookup(store,
+                                              "https://new-allow.test",
+                                              "microphone"),
+                  ==,
+                  MUX_PERMISSION_DECISION_ASK);
+  g_clear_pointer(&contents, g_free);
+  g_assert_true(g_file_get_contents(path, &contents, NULL, &error));
+  g_assert_no_error(error);
+  g_assert_null(strstr(contents, "decision=allow"));
+
+  mux_permission_store_free(store);
+  g_assert_cmpint(g_remove(path), ==, 0);
+  g_assert_cmpint(g_rmdir(directory), ==, 0);
 }
 
 int
@@ -204,5 +274,7 @@ main(int argc, char **argv)
                   test_entry_bound_evicts_oldest);
   g_test_add_func("/permission-store/expiry",
                   test_decision_expiry);
+  g_test_add_func("/permission-store/allow-discarded",
+                  test_allow_decisions_are_discarded);
   return g_test_run();
 }

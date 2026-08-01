@@ -2,10 +2,13 @@
 
 #include <string.h>
 
+#define BEFORE_UNLOAD_STAY_DATA "mux-before-unload-stay"
+
 typedef struct {
     guint64 request_id;
     MuxUiRequestKind kind;
     WebKitScriptDialog *dialog;
+    WebKitWebView *web_view;
 } PendingDialog;
 
 typedef struct {
@@ -208,6 +211,10 @@ resolve_dialog(PendingDialog *pending,
     case MUX_UI_REQUEST_DIALOG_BEFORE_UNLOAD:
         webkit_script_dialog_confirm_set_confirmed(
             pending->dialog, action == MUX_UI_ACTION_LEAVE);
+        if (action != MUX_UI_ACTION_LEAVE && pending->web_view)
+            g_object_set_data(G_OBJECT(pending->web_view),
+                              BEFORE_UNLOAD_STAY_DATA,
+                              GINT_TO_POINTER(1));
         break;
     case MUX_UI_REQUEST_DIALOG_ALERT:
     default:
@@ -304,6 +311,7 @@ on_script_dialog(WebKitWebView *web_view,
     pending->request_id = request->request_id;
     pending->kind = kind;
     pending->dialog = webkit_script_dialog_ref(dialog);
+    pending->web_view = web_view;
     g_hash_table_insert(bridge->pending,
                         request_key_new(pending->request_id),
                         pending);
@@ -420,25 +428,19 @@ resolve_permission(PendingPermission *pending, MuxUiAction action)
     if (!pending || !pending->request)
         return;
     if (pending->persistence_available && pending->store &&
-        (action == MUX_UI_ACTION_ALLOW_ALWAYS ||
-         action == MUX_UI_ACTION_DENY_ALWAYS)) {
+        action == MUX_UI_ACTION_DENY_ALWAYS) {
         g_autoptr(GError) error = NULL;
-        MuxPermissionDecision decision =
-            action == MUX_UI_ACTION_ALLOW_ALWAYS
-                ? MUX_PERMISSION_DECISION_ALLOW
-                : MUX_PERMISSION_DECISION_DENY;
 
         if (!mux_permission_store_set(pending->store,
                                       pending->origin,
                                       pending->category,
-                                      decision,
+                                      MUX_PERMISSION_DECISION_DENY,
                                       &error))
             g_warning("could not persist permission decision: %s",
                       error->message);
     }
     allow = action == MUX_UI_ACTION_ALLOW_ONCE ||
-            (pending->persistence_available &&
-             action == MUX_UI_ACTION_ALLOW_ALWAYS);
+            action == MUX_UI_ACTION_ALLOW_ALWAYS;
     if (allow)
         webkit_permission_request_allow(pending->request);
     else
@@ -467,10 +469,6 @@ on_permission_request(WebKitWebView *web_view,
                            request->origin,
                            category)
                      : MUX_PERMISSION_DECISION_ASK;
-    if (remembered == MUX_PERMISSION_DECISION_ALLOW) {
-        webkit_permission_request_allow(permission);
-        return TRUE;
-    }
     if (remembered == MUX_PERMISSION_DECISION_DENY) {
         webkit_permission_request_deny(permission);
         return TRUE;

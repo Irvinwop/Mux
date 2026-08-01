@@ -22,7 +22,7 @@ software, not as a secure daily-driver browser.
 
 - Linux on x86-64 or ARM64
 - A Wayland or X11 desktop session
-- Kitty, including `kitten`
+- Kitty 0.45 or newer, including `kitten`
 - A C17 compiler, Meson, Ninja, and pkg-config
 - GLib and GIO 2.74 or newer
 - WPE WebKit 2.52 or newer, built with WPEPlatform enabled
@@ -31,27 +31,37 @@ software, not as a secure daily-driver browser.
 The decisive dependency check is that pkg-config can find both
 `wpe-webkit-2.0 >= 2.52` and `wpe-platform-2.0 >= 2.52`.
 
-## Start in one command
+## Release-qualified start path
 
-On Arch Linux or Arch Linux ARM, `setup` reconciles the required packages,
-runs the environment doctor, builds the WPE implementation incrementally, and
-opens its dedicated Kitty window:
+On Arch Linux or Arch Linux ARM, `setup` is the release-qualified installation
+and launch path. It reconciles the required packages, runs the environment
+doctor, builds the WPE implementation incrementally, and opens its dedicated
+Kitty window:
 
 ```sh
 ./setup
 ./setup https://example.com
 ```
 
-On other distributions, install the requirements yourself and use the same
-command. The script will not guess package names for an unmaintained distro
-recipe.
+The package step runs `pacman -Syu` interactively. Review the transaction before
+accepting it: this is a full system upgrade and may update the kernel or other
+packages unrelated to Mux.
 
-With Nix flakes, the default app builds and runs the same WPE implementation,
-not the old synthetic Kitty transport:
+On other distributions, install the requirements yourself and launch with
+`./mux`. Those source installations are supported for development but are not a
+release-qualified v0.1 path. Mux does not guess package names for unmaintained
+distribution recipes.
+
+The flake is pinned and evaluation-checked for `x86_64-linux` and
+`aarch64-linux`:
 
 ```sh
 nix run . -- https://example.com
 ```
+
+This Nix path is not release-qualified. A complete build of its custom WPE
+derivation has not finished locally or in CI; the evaluated build requires
+roughly 1.5 GiB of downloads and 6.1 GiB unpacked.
 
 After source dependencies are installed, normal starts use the incremental
 launcher:
@@ -85,6 +95,10 @@ image, and binary MIME variants, but Mux can only record clipboard traffic it
 actually observes.
 
 ## Intended controls
+
+Browser-owned `Ctrl` shortcuts also accept `Super` (`Command` on Apple
+keyboards) as an alias. This is only a keyboard alias on Linux; Mux remains
+Linux-only and does not support native macOS execution.
 
 | Key | Action |
 | --- | --- |

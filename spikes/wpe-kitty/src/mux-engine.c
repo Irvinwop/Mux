@@ -33,6 +33,7 @@
 #include <wpe/wpe-platform.h>
 
 #define MUX_ENGINE_MAX_CLIENTS 128u
+#define BEFORE_UNLOAD_STAY_DATA "mux-before-unload-stay"
 #define MUX_ENGINE_MAX_VIEWS 32u
 #define MUX_ENGINE_MAX_CLIENT_VIEWS 32u
 #define MUX_ENGINE_MAX_DIMENSION 8192u
@@ -142,6 +143,7 @@ struct _EngineView {
     gboolean close_pending;
     gboolean close_ready;
     guint64 pending_close_serial;
+    guint64 retired_close_serial;
 };
 
 struct _Engine {
@@ -1683,6 +1685,30 @@ view_close(WebKitWebView *web_view, gpointer data)
 }
 
 static void
+view_finish_close_cancellation(EngineView *view)
+{
+    guint64 serial;
+
+    if (!g_object_steal_data(G_OBJECT(view->web_view),
+                             BEFORE_UNLOAD_STAY_DATA) ||
+        !view->close_pending || view->close_ready ||
+        !view->pending_close_serial)
+        return;
+
+    serial = view->pending_close_serial;
+    view->close_pending = FALSE;
+    view->close_ready = FALSE;
+    view->pending_close_serial = 0;
+    if (serial > view->retired_close_serial)
+        view->retired_close_serial = serial;
+    if (view->owner && !view->owner->failed)
+        client_send_empty(view->owner,
+                          MUX_ENGINE_MESSAGE_CLOSE_CANCELLED,
+                          view->id,
+                          serial);
+}
+
+static void
 engine_view_free(gpointer data)
 {
     EngineView *view = data;
@@ -2263,6 +2289,7 @@ handle_request_close(Client *client, const MuxEngineMessage *request)
     view->close_pending = TRUE;
     view->pending_close_serial = request->serial;
     webkit_web_view_try_close(view->web_view);
+    view_finish_close_cancellation(view);
     return !client->failed;
 }
 
@@ -2287,6 +2314,10 @@ handle_cancel_close(Client *client, const MuxEngineMessage *request)
                           "invalid CANCEL_CLOSE record");
         return TRUE;
     }
+    if (close_serial <= view->retired_close_serial) {
+        client_send_ack(client, request);
+        return !client->failed;
+    }
     if ((!view->close_pending && !view->close_ready) ||
         close_serial != view->pending_close_serial) {
         client_send_error(client,
@@ -2299,6 +2330,7 @@ handle_cancel_close(Client *client, const MuxEngineMessage *request)
     view->close_pending = FALSE;
     view->close_ready = FALSE;
     view->pending_close_serial = 0;
+    view->retired_close_serial = close_serial;
     client_send_ack(client, request);
     return !client->failed;
 }
@@ -3187,6 +3219,7 @@ handle_extension(Client *client, const MuxEngineMessage *request)
                                                       packet,
                                                       packet_size,
                                                       &error);
+        view_finish_close_cancellation(view);
         if (handled && view->affordance_bridge)
             handled = mux_browser_affordance_bridge_handle_payload(
                 view->affordance_bridge,

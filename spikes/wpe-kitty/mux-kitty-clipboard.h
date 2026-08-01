@@ -63,6 +63,9 @@ gboolean mux_kitty_clipboard_request(MuxKittyClipboard *clipboard,
                                      gboolean is_paste,
                                      GError **error);
 
+/* Cancels only the current read transaction; late responses are ignored. */
+void mux_kitty_clipboard_cancel_read(MuxKittyClipboard *clipboard);
+
 gboolean mux_kitty_clipboard_publish(MuxKittyClipboard *clipboard,
                                      MuxOsc5522Location location,
                                      const MuxClipboardSnapshot *snapshot,

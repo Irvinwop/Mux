@@ -9,6 +9,24 @@ permissions:
   contents: read
 
 jobs:
+  nix-eval:
+    name: Nix flake evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Check all flake outputs without building
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/work:ro"
+          --workdir /work
+          nixos/nix:2.28.7
+          nix --extra-experimental-features "nix-command flakes"
+          flake check --no-build --all-systems path:/work
+
   wpe:
     name: Arch Linux / WPEPlatform
     runs-on: ubuntu-latest

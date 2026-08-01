@@ -363,6 +363,7 @@ load_store(MuxPermissionStore *store, GError **error)
     gboolean exists;
     gint version;
     gint64 now_us = g_get_real_time();
+    gboolean rewrite = FALSE;
     gsize count;
     gsize i;
 
@@ -437,7 +438,11 @@ load_store(MuxPermissionStore *store, GError **error)
         if (!decision_text)
             continue;
         decision = decision_from_name(decision_text);
-        if (decision == MUX_PERMISSION_DECISION_ASK ||
+        if (decision == MUX_PERMISSION_DECISION_ALLOW) {
+            rewrite = TRUE;
+            continue;
+        }
+        if (decision != MUX_PERMISSION_DECISION_DENY ||
             !valid_origin(origin, NULL) ||
             !valid_category(category, NULL))
             continue;
@@ -471,6 +476,8 @@ load_store(MuxPermissionStore *store, GError **error)
         g_hash_table_replace(store->entries, entry->key, entry);
     }
     enforce_entry_limit(store);
+    if (rewrite && !mux_permission_store_flush(store, error))
+        return FALSE;
     return TRUE;
 }
 
@@ -596,8 +603,10 @@ mux_permission_store_lookup(const MuxPermissionStore *store,
         return MUX_PERMISSION_DECISION_ASK;
     key = permission_key(origin, category);
     entry = g_hash_table_lookup(store->entries, key);
-    return entry && !permission_entry_is_expired(entry, g_get_real_time())
-               ? entry->decision
+    return entry &&
+                   entry->decision == MUX_PERMISSION_DECISION_DENY &&
+                   !permission_entry_is_expired(entry, g_get_real_time())
+               ? MUX_PERMISSION_DECISION_DENY
                : MUX_PERMISSION_DECISION_ASK;
 }
 
@@ -698,6 +707,8 @@ mux_permission_store_flush(MuxPermissionStore *store, GError **error)
         g_autofree gchar *group =
             g_strconcat("permission ", digest, NULL);
 
+        if (entry->decision != MUX_PERMISSION_DECISION_DENY)
+            continue;
         g_key_file_set_string(
             key_file, group, "origin", entry->origin);
         g_key_file_set_string(
@@ -816,6 +827,8 @@ mux_permission_store_set_for_duration(
                             "invalid permission decision");
         return FALSE;
     }
+    if (decision == MUX_PERMISSION_DECISION_ALLOW)
+        decision = MUX_PERMISSION_DECISION_ASK;
     if (decision != MUX_PERMISSION_DECISION_ASK &&
         (duration_us <= 0 ||
          duration_us > MUX_PERMISSION_STORE_MAX_TTL_US)) {
@@ -864,7 +877,10 @@ mux_permission_store_size(const MuxPermissionStore *store)
     now_us = g_get_real_time();
     g_hash_table_iter_init(&iterator, store->entries);
     while (g_hash_table_iter_next(&iterator, NULL, &value)) {
-        if (!permission_entry_is_expired(value, now_us))
+        const PermissionEntry *entry = value;
+
+        if (entry->decision == MUX_PERMISSION_DECISION_DENY &&
+            !permission_entry_is_expired(entry, now_us))
             count++;
     }
     return count;

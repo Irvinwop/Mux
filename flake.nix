@@ -165,7 +165,8 @@
               runHook postCheck
             '';
 
-            # The WPE Meson project does not define install targets yet.
+            # Keep the Nix runtime output explicit even though Meson also
+            # defines install targets for these six executables.
             installPhase = ''
               runHook preInstall
               mkdir -p "$out/bin"
@@ -200,10 +201,9 @@
                 export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}"
               fi
 
-              muxd --ensure
-
               if [[ $# -gt 0 && $1 == ctl ]]; then
                 shift
+                muxd --ensure
                 exec muxctl "$@"
               fi
 
@@ -217,12 +217,30 @@
               uid="$(${pkgs.coreutils}/bin/id -u)"
               if [[ -n "''${XDG_RUNTIME_DIR:-}" ]]; then
                 runtime_parent="$XDG_RUNTIME_DIR"
+                if [[ "$runtime_parent" != /* ]]; then
+                  echo "XDG_RUNTIME_DIR must be an absolute path: $runtime_parent" >&2
+                  exit 1
+                fi
+                if [[ -L "$runtime_parent" ]]; then
+                  echo "XDG_RUNTIME_DIR must not be a symlink: $runtime_parent" >&2
+                  exit 1
+                fi
+                if [[ ! -e "$runtime_parent" ]]; then
+                  echo "XDG_RUNTIME_DIR does not exist: $runtime_parent" >&2
+                  exit 1
+                fi
+                if [[ ! -d "$runtime_parent" ]]; then
+                  echo "XDG_RUNTIME_DIR is not a directory: $runtime_parent" >&2
+                  exit 1
+                fi
+                runtime_owner="$(${pkgs.coreutils}/bin/stat -c %u -- "$runtime_parent")"
+                if [[ "$runtime_owner" != "$uid" ]]; then
+                  echo "XDG_RUNTIME_DIR is not owned by the current user: $runtime_parent" >&2
+                  exit 1
+                fi
                 runtime_mode="$(${pkgs.coreutils}/bin/stat -c %a -- "$runtime_parent")"
-                if [[ "$runtime_parent" != /* || ! -d "$runtime_parent" ||
-                      -L "$runtime_parent" ||
-                      "$(${pkgs.coreutils}/bin/stat -c %u -- "$runtime_parent")" != "$uid" ]] ||
-                   (( (8#$runtime_mode & 077) != 0 )); then
-                  echo "XDG_RUNTIME_DIR must be an owner-controlled absolute directory." >&2
+                if (( (8#$runtime_mode & 077) != 0 )); then
+                  echo "XDG_RUNTIME_DIR must not grant group or other access: $runtime_parent" >&2
                   exit 1
                 fi
                 kitty_runtime="$runtime_parent/mux"
@@ -256,6 +274,8 @@
               }
               trap cleanup_kitty_socket EXIT
 
+              muxd --ensure
+
               kitty \
                 --config ${./kitty}/wpe.conf \
                 --listen-on "$KITTY_LISTEN_ON" \
@@ -277,6 +297,7 @@
           default = {
             type = "app";
             program = "${self.packages.${system}.default}/bin/mux";
+            meta.description = "Launch the Mux Kitty-native WPE browser multiplexer";
           };
         }
       );

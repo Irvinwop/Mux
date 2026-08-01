@@ -19,6 +19,7 @@ typedef struct _MuxPermissionStore MuxPermissionStore;
 
 typedef enum {
     MUX_PERMISSION_DECISION_ASK = 0,
+    /* Legacy input only: stores normalize ALLOW to ASK. */
     MUX_PERMISSION_DECISION_ALLOW = 1,
     MUX_PERMISSION_DECISION_DENY = 2,
 } MuxPermissionDecision;
@@ -66,8 +67,9 @@ MuxPermissionDecision mux_permission_store_lookup(
     const gchar *category);
 
 /*
- * ASK removes a stored decision. Persistent updates are transactional with
- * respect to memory: a failed disk write restores the previous value.
+ * ASK and ALLOW remove a stored decision; only DENY can be remembered.
+ * Persistent updates are transactional with respect to memory: a failed disk
+ * write restores the previous value.
  */
 gboolean mux_permission_store_set(MuxPermissionStore *store,
                                   const gchar *origin,

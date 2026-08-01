@@ -26,7 +26,7 @@ command_fix() {
       printf '%s' 'install a C17 compiler (Arch: base-devel)'
       ;;
     kitty|kitten)
-      printf '%s' 'install Kitty, including its kitten helper (Arch: kitty)'
+      printf '%s' 'install Kitty 0.45 or newer, including its kitten helper (Arch: kitty)'
       ;;
     meson)
       printf '%s' 'install Meson (Arch: meson)'
@@ -37,7 +37,39 @@ command_fix() {
     pkg-config)
       printf '%s' 'install pkg-config (Arch: pkgconf)'
       ;;
+    sha256sum|stat)
+      printf '%s' 'install GNU coreutils (Arch: coreutils)'
+      ;;
   esac
+}
+
+check_kitty_version() {
+  local output major minor patch version
+
+  if ! output="$(LC_ALL=C kitty --version 2>/dev/null)"; then
+    fail 'Kitty version could not be queried' 'install Kitty 0.45 or newer and ensure kitty --version works'
+    return
+  fi
+
+  if [[ ! "$output" =~ ^kitty[[:space:]]+([0-9]+)\.([0-9]+)(\.([0-9]+))?([[:space:]].*)?$ ]]; then
+    fail "Kitty version output is not understood: $output" 'install Kitty 0.45 or newer from an official distribution package'
+    return
+  fi
+
+  major=$((10#${BASH_REMATCH[1]}))
+  minor=$((10#${BASH_REMATCH[2]}))
+  if [[ -n "${BASH_REMATCH[4]:-}" ]]; then
+    patch=$((10#${BASH_REMATCH[4]}))
+  else
+    patch=0
+  fi
+  version="$major.$minor.$patch"
+
+  if (( major > 0 || (major == 0 && minor >= 45) )); then
+    ok "kitty $version (minimum 0.45)"
+  else
+    fail "kitty $version is older than required 0.45" 'upgrade Kitty to 0.45 or newer (Arch: pacman -Syu kitty)'
+  fi
 }
 
 check_command() {
@@ -90,9 +122,13 @@ else
   fail 'operating system is not Linux' 'run Mux on Linux; the current WPEPlatform and IPC implementation is Linux-only'
 fi
 
-for command in cc kitty kitten meson ninja pkg-config; do
+for command in cc kitty kitten meson ninja pkg-config sha256sum stat; do
   check_command "$command"
 done
+
+if command -v kitty >/dev/null 2>&1; then
+  check_kitty_version
+fi
 
 check_package glib-2.0 2.74
 check_package gio-2.0 2.74
@@ -106,10 +142,36 @@ else
 fi
 
 if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
-  if [[ -d "$XDG_RUNTIME_DIR" && -w "$XDG_RUNTIME_DIR" && -O "$XDG_RUNTIME_DIR" ]]; then
+  runtime_problem=''
+  runtime_uid=''
+  runtime_mode=''
+
+  if [[ "$XDG_RUNTIME_DIR" != /* ]]; then
+    runtime_problem='is not an absolute path'
+  elif [[ -L "$XDG_RUNTIME_DIR" ]]; then
+    runtime_problem='must not be a symlink'
+  elif [[ ! -e "$XDG_RUNTIME_DIR" ]]; then
+    runtime_problem='does not exist'
+  elif [[ ! -d "$XDG_RUNTIME_DIR" ]]; then
+    runtime_problem='is not a directory'
+  elif ! runtime_uid="$(stat -c %u -- "$XDG_RUNTIME_DIR" 2>/dev/null)"; then
+    runtime_problem='ownership could not be inspected'
+  elif [[ "$runtime_uid" != "$EUID" ]]; then
+    runtime_problem="is owned by uid $runtime_uid instead of effective uid $EUID"
+  elif ! runtime_mode="$(stat -c %a -- "$XDG_RUNTIME_DIR" 2>/dev/null)"; then
+    runtime_problem='permissions could not be inspected'
+  elif [[ ! "$runtime_mode" =~ ^[0-7]{3,4}$ ]]; then
+    runtime_problem="has an unrecognized mode: $runtime_mode"
+  elif (( (8#$runtime_mode & 077) != 0 )); then
+    runtime_problem="has group or other permission bits set (mode $runtime_mode)"
+  elif [[ ! -w "$XDG_RUNTIME_DIR" || ! -x "$XDG_RUNTIME_DIR" ]]; then
+    runtime_problem='is not writable and searchable by this user'
+  fi
+
+  if [[ -z "$runtime_problem" ]]; then
     ok "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
   else
-    fail "XDG_RUNTIME_DIR is not a writable directory owned by this user: $XDG_RUNTIME_DIR" 'repair its ownership/permissions or unset it so Mux can use its owner-only /tmp fallback'
+    fail "XDG_RUNTIME_DIR $runtime_problem: $XDG_RUNTIME_DIR" 'repair the path so it is an existing owner-only directory, or unset it so Mux can use its owner-only /tmp fallback'
   fi
 else
   ok "XDG_RUNTIME_DIR is unset; Mux will use /tmp/mux-$(id -u)"

@@ -28,6 +28,19 @@ This document defines that boundary for the shared `mux-engine`, the thin
 7. Requests display their security origin. A pane must not show an untrusted
    message where an origin is expected.
 
+## Browser shortcut modifiers
+
+For browser-owned commands, `mux-pane` treats WPE's Meta modifier as an alias
+for Control. This covers the existing URL, close, reload, history, bookmark,
+command-palette, and clipboard commands. Kitty passes the corresponding Super
+combinations through where it has explicit Ctrl mappings. Unconsumed input is
+still sent to web content with its original modifier bits, so Meta is never
+rewritten to Control for a page.
+
+On an Apple keyboard, Linux normally exposes the Command key as Super/Meta.
+This alias does not add native macOS support: Mux remains a Linux-only WPE and
+Kitty application.
+
 ## WPE hooks
 
 WPE WebKit 2.52 exposes the required embedder signals directly on
@@ -145,30 +158,25 @@ The default is deny. Decisions can be:
 
 - Allow once.
 - Deny once.
-- Remember allow for this origin and permission kind.
 - Remember deny for this origin and permission kind.
 
-Remembered policy is stored by `mux-engine` in the selected profile with owner-
-only permissions and atomic replacement. Private profiles never persist it.
-`query-permission-state` consults the same store, so JavaScript observes a state
-consistent with prior decisions.
-
-Camera, microphone, display capture, encrypted media, and XR are initially
-compiled in but policy-disabled until their Linux device and sandbox behavior
-is exercised. The pane explains that distinction instead of silently claiming
-the feature is unavailable.
+Powerful permissions are never granted persistently. The generic WebKit request
+interface does not always expose the exact requesting origin, so every allow is
+limited to that one request. Only denies may be remembered by profile, top-level
+origin, and permission kind. They are stored with owner-only permissions and
+atomic replacement; private profiles never persist them.
 
 ## File chooser
 
 For `run-file-chooser`, the engine sends accepted MIME types, multi-select state,
 and the current origin. The pane temporarily suspends raw browsing input and
-uses `kitten choose-files` when Kitty 0.45 or newer is available. Multiple mode
+uses `kitten choose-files`, which requires Kitty 0.45 or newer. Multiple mode
 maps to `--mode=files`; otherwise it uses `--mode=file`.
 
-On older Kitty versions, the overlay accepts newline-separated absolute paths.
-Before answering WebKit, the pane canonicalizes paths and the engine validates
-that each path is absolute, exists, is a regular readable file, and was returned
-for the current request. No directory is recursively exposed.
+Mux has no manual path-entry fallback. On older Kitty versions the upload is
+cancelled. Selected files are validated and copied into bounded, owner-only
+staging before WebKit receives them; symlinks, special files, and directory
+uploads are rejected.
 
 Kitty chooser reference:
 <https://sw.kovidgoyal.net/kitty/kittens/choose-files/>

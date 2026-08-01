@@ -18,8 +18,9 @@ Prepare a Linux checkout and launch the real WPE implementation in Kitty.
   ./setup --deps-only
 
 Arch Linux and Arch Linux ARM have automatic dependency installation. On
-other distributions, setup checks an existing WPEPlatform 2.52+ toolchain and
-prints actionable diagnostics without guessing distribution package names.
+other distributions, setup checks an existing Kitty 0.45+ and WPEPlatform
+2.52+ toolchain and prints actionable diagnostics without guessing package
+names.
 EOF
 }
 
@@ -63,8 +64,9 @@ run_root() {
 }
 
 if command -v pacman >/dev/null 2>&1; then
-  printf 'Reconciling Arch Linux dependencies (safe to rerun)...\n'
-  run_root pacman -Syu --needed --noconfirm \
+  printf 'Reconciling Arch Linux dependencies with a full system upgrade.\n'
+  printf 'Pacman will ask for confirmation before making changes.\n'
+  run_root pacman -Syu --needed \
     base-devel \
     glib2 \
     kitty \

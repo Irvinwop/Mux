@@ -227,6 +227,7 @@ test_close_handshake_round_trip(void)
     static const guint16 types[] = {
         MUX_ENGINE_MESSAGE_REQUEST_CLOSE,
         MUX_ENGINE_MESSAGE_CLOSE_READY,
+        MUX_ENGINE_MESSAGE_CLOSE_CANCELLED,
     };
 
     for (gsize index = 0; index < G_N_ELEMENTS(types); index++) {

@@ -787,6 +787,18 @@ mux_kitty_clipboard_request(MuxKittyClipboard *clipboard,
     return result;
 }
 
+void
+mux_kitty_clipboard_cancel_read(MuxKittyClipboard *clipboard)
+{
+    MuxKittyClipboard *guard;
+
+    g_return_if_fail(clipboard != NULL);
+    guard = mux_kitty_clipboard_ref(clipboard);
+    g_clear_pointer(&clipboard->read, read_transaction_free);
+    launch_pending_offer(clipboard);
+    mux_kitty_clipboard_unref(guard);
+}
+
 gboolean
 mux_kitty_clipboard_publish(MuxKittyClipboard *clipboard,
                             MuxOsc5522Location location,

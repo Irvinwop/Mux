@@ -72,6 +72,12 @@ typedef struct {
 } TerminalOutputChunk;
 
 typedef struct {
+    guint16 event_type;
+    guint modifiers;
+    guint keyval;
+} DelayedPasteKey;
+
+typedef struct {
     guint image_id;
     guint64 frame_serial;
     gboolean retired;
@@ -113,6 +119,11 @@ typedef struct {
     GError *terminal_output_error;
     gboolean clipboard_write_active;
     gint64 clipboard_tick_due_us;
+    DelayedPasteKey delayed_paste_keys[
+        MUX_PANE_CLIPBOARD_MAX_PENDING_PASTES];
+    guint delayed_paste_count;
+    guint64 next_fresh_paste_request_id;
+    guint64 fresh_paste_request_id;
     GByteArray *input;
     GByteArray *control_input;
     GByteArray *events_input;
@@ -1341,6 +1352,16 @@ kitty_modifiers_to_wpe(guint encoded)
 }
 
 static guint
+browser_shortcut_modifiers(guint modifiers)
+{
+    if ((modifiers & WPE_MODIFIER_CONTROL) == 0 &&
+        (modifiers & WPE_MODIFIER_META) != 0)
+        return (modifiers & ~WPE_MODIFIER_META) |
+            WPE_MODIFIER_CONTROL;
+    return modifiers;
+}
+
+static guint
 unicode_keyval(guint32 codepoint)
 {
     if (codepoint <= 0xff)
@@ -1360,6 +1381,26 @@ key_number_to_keyval(guint32 key)
         return KEY_ESCAPE;
     case 127:
         return KEY_BACKSPACE;
+    case 57348:
+        return KEY_INSERT;
+    case 57349:
+        return KEY_DELETE;
+    case 57350:
+        return KEY_LEFT;
+    case 57351:
+        return KEY_RIGHT;
+    case 57352:
+        return KEY_UP;
+    case 57353:
+        return KEY_DOWN;
+    case 57354:
+        return KEY_PAGE_UP;
+    case 57355:
+        return KEY_PAGE_DOWN;
+    case 57356:
+        return KEY_HOME;
+    case 57357:
+        return KEY_END;
     case 57358:
         return 0xffe5u;
     case 57359:
@@ -2050,6 +2091,22 @@ handle_engine_message(Pane *pane)
             pane->quit = TRUE;
         }
         break;
+    case MUX_ENGINE_MESSAGE_CLOSE_CANCELLED:
+        if (message.flags != MUX_ENGINE_FLAG_NONE ||
+            !message.serial ||
+            g_bytes_get_size(message.payload) != 0) {
+            g_printerr("mux-pane: invalid CLOSE_CANCELLED\n");
+            disconnect_engine(pane);
+        } else if (message.serial <= pane->retired_close_serial) {
+            break;
+        } else if (!pane->close_request_serial ||
+                   message.serial != pane->close_request_serial) {
+            g_printerr("mux-pane: out-of-order CLOSE_CANCELLED\n");
+            disconnect_engine(pane);
+        } else {
+            retire_close_request(pane);
+        }
+        break;
     case MUX_ENGINE_MESSAGE_EXTENSION: {
         gsize packet_length;
         const guint8 *packet =
@@ -2339,6 +2396,94 @@ kitty_committed_text(const gchar *field, guint32 fallback)
     return g_string_free(text, FALSE);
 }
 
+static guint16
+engine_key_event_type(guint kitty_event_type)
+{
+    if (kitty_event_type == 3)
+        return MUX_ENGINE_KEY_RELEASE;
+    if (kitty_event_type == 2)
+        return MUX_ENGINE_KEY_REPEAT;
+    return MUX_ENGINE_KEY_PRESS;
+}
+
+static void
+forward_delayed_paste_keys(Pane *pane)
+{
+    guint index;
+
+    for (index = 0; index < pane->delayed_paste_count; index++) {
+        DelayedPasteKey *key = &pane->delayed_paste_keys[index];
+
+        send_key(pane, key->event_type, key->modifiers, key->keyval);
+    }
+    pane->delayed_paste_count = 0;
+}
+
+static void
+fresh_paste_ready(MuxPaneClipboard *clipboard,
+                  guint64 request_id,
+                  gboolean fresh,
+                  gpointer user_data)
+{
+    Pane *pane = user_data;
+
+    (void)clipboard;
+    (void)fresh;
+    if (request_id != pane->fresh_paste_request_id)
+        return;
+    pane->fresh_paste_request_id = 0;
+    forward_delayed_paste_keys(pane);
+}
+
+static gboolean
+defer_page_paste_key(Pane *pane,
+                     guint kitty_event_type,
+                     guint modifiers,
+                     guint keyval)
+{
+    g_autoptr(GError) error = NULL;
+    gint64 active_due_us;
+
+    if (kitty_event_type == 3 && !pane->fresh_paste_request_id)
+        return FALSE;
+    if (pane->delayed_paste_count >=
+        MUX_PANE_CLIPBOARD_MAX_PENDING_PASTES)
+        forward_delayed_paste_keys(pane);
+
+    pane->delayed_paste_keys[pane->delayed_paste_count++] =
+        (DelayedPasteKey) {
+            .event_type = engine_key_event_type(kitty_event_type),
+            .modifiers = modifiers,
+            .keyval = keyval,
+        };
+    if (pane->fresh_paste_request_id)
+        return TRUE;
+
+    pane->next_fresh_paste_request_id++;
+    if (!pane->next_fresh_paste_request_id)
+        pane->next_fresh_paste_request_id++;
+    pane->fresh_paste_request_id = pane->next_fresh_paste_request_id;
+    if (!mux_pane_clipboard_request_fresh_paste(
+            pane->clipboard,
+            pane->fresh_paste_request_id,
+            fresh_paste_ready,
+            pane,
+            &error)) {
+        g_warning("fresh clipboard paste unavailable: %s",
+                  error != NULL ? error->message : "unknown error");
+        pane->fresh_paste_request_id = 0;
+        forward_delayed_paste_keys(pane);
+        return TRUE;
+    }
+
+    active_due_us = g_get_monotonic_time() +
+        (gint64)ACTIVE_MAINTENANCE_MS * 1000;
+    if (!pane->clipboard_tick_due_us ||
+        pane->clipboard_tick_due_us > active_due_us)
+        pane->clipboard_tick_due_us = active_due_us;
+    return TRUE;
+}
+
 static void
 handle_kitty_key(Pane *pane, const gchar *parameters)
 {
@@ -2351,6 +2496,7 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
     guint encoded_modifiers = 1;
     guint event_type = 1;
     guint modifiers;
+    guint browser_modifiers;
     guint keyval;
 
     if (!fields[0] || !*fields[0]) {
@@ -2372,6 +2518,8 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
         text_codepoint = g_utf8_get_char(committed_text);
 
     modifiers = kitty_modifiers_to_wpe(encoded_modifiers);
+    /* Normalize only for Mux-owned matching; forward modifiers unchanged. */
+    browser_modifiers = browser_shortcut_modifiers(modifiers);
     keyval = key_number_to_keyval(key_number);
     if (handle_ui_key(pane,
                       event_type,
@@ -2379,7 +2527,8 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
                       keyval,
                       text_codepoint)) {
     } else if (pane->clipboard != NULL &&
-        (modifiers & (WPE_MODIFIER_CONTROL | WPE_MODIFIER_SHIFT)) ==
+        (browser_modifiers &
+         (WPE_MODIFIER_CONTROL | WPE_MODIFIER_SHIFT)) ==
             (WPE_MODIFIER_CONTROL | WPE_MODIFIER_SHIFT) &&
         (key_number == 'v' || key_number == 'V')) {
         if (event_type == 1) {
@@ -2414,10 +2563,10 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
             picker_key = MUX_CLIPBOARD_PICKER_KEY_HOME;
         } else if (keyval == KEY_END) {
             picker_key = MUX_CLIPBOARD_PICKER_KEY_END;
-        } else if ((modifiers & WPE_MODIFIER_CONTROL) &&
+        } else if ((browser_modifiers & WPE_MODIFIER_CONTROL) &&
                    (key_number == 'w' || key_number == 'W')) {
             picker_key = MUX_CLIPBOARD_PICKER_KEY_DELETE_WORD;
-        } else if ((modifiers & WPE_MODIFIER_CONTROL) &&
+        } else if ((browser_modifiers & WPE_MODIFIER_CONTROL) &&
                    (key_number == 'u' || key_number == 'U')) {
             picker_key = MUX_CLIPBOARD_PICKER_KEY_CLEAR_QUERY;
         } else if ((modifiers & WPE_MODIFIER_ALT) &&
@@ -2445,17 +2594,28 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
                 picker_key == MUX_CLIPBOARD_PICKER_KEY_TEXT
                     ? text_codepoint
                     : 0);
-    } else
-    if (event_type == 1 &&
-        (modifiers & WPE_MODIFIER_CONTROL) &&
+    } else if (pane->clipboard != NULL &&
+               (key_number == 'v' || key_number == 'V') &&
+               ((browser_modifiers & (WPE_MODIFIER_CONTROL |
+                                      WPE_MODIFIER_SHIFT |
+                                      WPE_MODIFIER_ALT |
+                                      WPE_MODIFIER_META)) ==
+                    WPE_MODIFIER_CONTROL ||
+                (event_type == 3 && pane->fresh_paste_request_id != 0)) &&
+               defer_page_paste_key(pane,
+                                    event_type,
+                                    modifiers,
+                                    keyval)) {
+    } else if (event_type == 1 &&
+        (browser_modifiers & WPE_MODIFIER_CONTROL) &&
         (key_number == 'q' || key_number == 'Q'))
         request_close(pane);
     else if (event_type == 1 &&
-             (modifiers & WPE_MODIFIER_CONTROL) &&
+             (browser_modifiers & WPE_MODIFIER_CONTROL) &&
              (key_number == 'l' || key_number == 'L'))
         control_write(pane, "PROMPT");
     else if (event_type == 1 &&
-             (modifiers & WPE_MODIFIER_CONTROL) &&
+             (browser_modifiers & WPE_MODIFIER_CONTROL) &&
              (key_number == 'r' || key_number == 'R'))
         send_navigation(pane, MUX_ENGINE_NAVIGATE_RELOAD, NULL);
     else {
@@ -3222,7 +3382,9 @@ service_maintenance(Pane *pane, gint64 monotonic_us)
          monotonic_us >= pane->clipboard_tick_due_us)) {
         mux_pane_clipboard_tick(pane->clipboard, monotonic_us);
         pane->clipboard_tick_due_us = monotonic_us +
-            (gint64)(pane->clipboard_write_active
+            (gint64)(pane->clipboard_write_active ||
+                     mux_pane_clipboard_fresh_paste_pending(
+                         pane->clipboard)
                          ? ACTIVE_MAINTENANCE_MS
                          : IDLE_MAINTENANCE_MS) * 1000;
     }

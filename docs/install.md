@@ -1,10 +1,10 @@
 # Installing Mux v0.1
 
-Mux v0.1 is a personal Linux preview. A usable installation needs Kitty and a
-WPE WebKit build that exposes the WPEPlatform 2.52 API. WPE WebKit's version
-number alone is not sufficient.
+Mux v0.1 is a personal Linux preview. A usable installation needs Kitty 0.45 or
+newer and a WPE WebKit build that exposes the WPEPlatform 2.52 API. WPE
+WebKit's version number alone is not sufficient.
 
-## Fast path on Arch Linux
+## Release-qualified path: Arch family
 
 From the repository root:
 
@@ -12,10 +12,12 @@ From the repository root:
 ./setup
 ```
 
-`setup` runs an idempotent `pacman -Syu --needed` reconciliation, checks the
-environment, creates an incremental release build outside the checkout, and
-launches the real WPE implementation in Kitty. It is safe to rerun after an
-interrupted build or package update.
+`setup` runs `pacman -Syu --needed` interactively, checks the environment,
+creates an incremental release build outside the checkout, and launches the
+real WPE implementation in Kitty. Review the package transaction before
+accepting it: `pacman -Syu` is a full system upgrade and may update the kernel
+or packages unrelated to Mux. The build portion is safe to resume after an
+interruption.
 
 Open an initial page or stop after dependency checks with:
 
@@ -34,7 +36,7 @@ using your distribution, a custom prefix, or a containerized development
 environment:
 
 - A C17 compiler
-- Kitty with the `kitten` helper
+- Kitty 0.45 or newer with the `kitten` helper
 - Meson, Ninja, and pkg-config
 - GLib and GIO 2.74 or newer, including development metadata
 - WPE WebKit 2.52 or newer built with WPEPlatform enabled
@@ -49,21 +51,29 @@ pkg-config --atleast-version=2.52 wpe-platform-2.0
 ./doctor
 ```
 
-If `doctor` passes, the one-command build and launch path is still:
+If `doctor` passes, build and launch with:
 
 ```sh
-./setup https://example.com
+./mux https://example.com
 ```
+
+Non-Arch source installations are useful for development, but they are not a
+release-qualified v0.1 path.
 
 ## Nix flake
 
-The flake supports `x86_64-linux` and `aarch64-linux`. Its default app builds
-the WPE Meson project, runs the registered native tests during the Nix build,
-packages the actual runtime processes, and launches them in Kitty:
+The lock file pins the flake inputs, and the flake has passed evaluation checks
+for `x86_64-linux` and `aarch64-linux`. The default app is intended to build the
+custom WPE derivation and Mux runtime, then launch them in Kitty:
 
 ```sh
 nix run . -- https://example.com
 ```
+
+This path is not release-qualified. A complete custom WPE build has not
+finished locally or in CI. Its evaluated closure requires roughly 1.5 GiB of
+downloads and 6.1 GiB unpacked, so successful evaluation is not evidence of a
+successful build.
 
 Build only the runtime package or enter the development shell with:
 
@@ -118,5 +128,5 @@ files.
 The Linux workflow runs the doctor in an Arch container, configures the real
 WPE project as a warning-free release build, compiles all Meson targets, and
 runs every registered native test with GLib warnings made fatal. It does not
-launch Kitty, exercise graphics presentation, or prove compatibility with live
-websites.
+build the flake's custom WPE derivation, launch Kitty, exercise graphics
+presentation, or prove compatibility with live websites.
