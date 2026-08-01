@@ -18,9 +18,9 @@ Prepare a Linux checkout and launch the real WPE implementation in Kitty.
   ./setup --deps-only
 
 Arch Linux and Arch Linux ARM have automatic dependency installation. On
-other distributions, setup checks an existing Kitty 0.45+ and WPEPlatform
-2.52+ toolchain and prints actionable diagnostics without guessing package
-names.
+other distributions, setup checks an existing Kitty 0.45+ toolchain with
+wpe-webkit-2.0 and wpe-platform-2.0 both at version 2.52.5 or newer, then
+prints actionable diagnostics without guessing package names.
 EOF
 }
 

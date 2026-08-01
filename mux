@@ -62,14 +62,15 @@ require_kitty_045() {
 
 require_kitty_045
 
-if ! pkg-config --atleast-version=2.52 wpe-webkit-2.0 ||
-   ! pkg-config --atleast-version=2.52 wpe-platform-2.0; then
+if ! pkg-config --atleast-version=2.52.5 wpe-webkit-2.0 ||
+   ! pkg-config --atleast-version=2.52.5 wpe-platform-2.0; then
     cat >&2 <<'EOF'
-Mux needs WPE WebKit 2.52 or newer built with:
+Mux needs WPE WebKit 2.52.5 or newer built with:
 
     -DENABLE_WPE_PLATFORM=ON
 
-The required pkg-config modules are wpe-webkit-2.0 and wpe-platform-2.0.
+The required pkg-config modules are wpe-webkit-2.0 and wpe-platform-2.0,
+both at version 2.52.5 or newer.
 See docs/running-wpe.md for the exact runtime boundary.
 EOF
     exit 1

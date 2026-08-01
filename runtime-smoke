@@ -1,0 +1,744 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+readonly SCRIPT_PATH
+REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
+readonly REPO_ROOT
+
+die() {
+    printf 'runtime-smoke: %s\n' "$*" >&2
+    exit 1
+}
+
+[[ $(uname -s) == Linux ]] || die "Linux is required."
+
+if (( EUID == 0 )); then
+    if [[ ${CI:-} != true || ${MUX_SMOKE_ALLOW_ROOT_CI:-0} != 1 ]]; then
+        die "do not run as root; CI may opt in with CI=true MUX_SMOKE_ALLOW_ROOT_CI=1"
+    fi
+fi
+
+for command in dbus-run-session sha256sum timeout; do
+    command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
+done
+
+if [[ -n ${MUX_BIN_DIR:-} ]]; then
+    [[ -d $MUX_BIN_DIR ]] || die "MUX_BIN_DIR is not a directory: $MUX_BIN_DIR"
+    MUX_BIN_DIR=$(CDPATH='' cd -- "$MUX_BIN_DIR" && pwd -P)
+else
+    host_cache=${XDG_CACHE_HOME:-${HOME:?HOME is not set}/.cache}
+    repo_key=$(printf '%s' "$REPO_ROOT" | sha256sum)
+    repo_key=${repo_key%% *}
+    MUX_BIN_DIR="$host_cache/mux/checkouts/$repo_key/wpe-kitty"
+fi
+export MUX_BIN_DIR
+
+timeout_seconds=${MUX_SMOKE_TIMEOUT_SECONDS:-120}
+[[ $timeout_seconds =~ ^[0-9]+$ ]] || die "MUX_SMOKE_TIMEOUT_SECONDS must be an integer"
+(( timeout_seconds >= 30 && timeout_seconds <= 900 )) ||
+    die "MUX_SMOKE_TIMEOUT_SECONDS must be between 30 and 900"
+
+if [[ ${1:-} != --runtime-smoke-inner ]]; then
+    (( $# == 0 )) || die "usage: ./runtime-smoke"
+    if [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]]; then
+        exec timeout --foreground --signal=TERM --kill-after=10s \
+            "${timeout_seconds}s" "$SCRIPT_PATH" --runtime-smoke-inner
+    fi
+    exec timeout --foreground --signal=TERM --kill-after=10s \
+        "${timeout_seconds}s" dbus-run-session -- \
+        "$SCRIPT_PATH" --runtime-smoke-inner
+fi
+shift
+(( $# == 0 )) || die "unexpected internal arguments"
+
+required_commands=(
+    awk cat chmod cp dbus-run-session env grep id install kitty kitten kill
+    mkdir mktemp pgrep pkg-config python3 rm sed sha256sum sleep stat tail
+    timeout tr uname weston
+)
+for command in "${required_commands[@]}"; do
+    command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
+done
+
+kitty_version_output=$(LC_ALL=C kitty --version 2>/dev/null) ||
+    die "kitty --version failed; Kitty 0.45 or newer is required"
+if [[ $kitty_version_output =~ ^kitty[[:space:]]+([0-9]+)\.([0-9]+)(\.[0-9]+)?([[:space:]]|$) ]]; then
+    kitty_major=${BASH_REMATCH[1]}
+    kitty_minor=${BASH_REMATCH[2]}
+else
+    die "could not parse Kitty version: $kitty_version_output"
+fi
+if (( kitty_major == 0 && kitty_minor < 45 )); then
+    die "Kitty 0.45 or newer is required; found $kitty_version_output"
+fi
+
+pkg-config --atleast-version=2.52.5 wpe-webkit-2.0 ||
+    die "wpe-webkit-2.0 2.52.5 or newer is required"
+pkg-config --atleast-version=2.52.5 wpe-platform-2.0 ||
+    die "wpe-platform-2.0 2.52.5 or newer is required"
+weston --version >/dev/null 2>&1 || die "weston --version failed"
+python3 --version >/dev/null 2>&1 || die "python3 --version failed"
+dbus-run-session --version >/dev/null 2>&1 || die "dbus-run-session --version failed"
+
+[[ -r /proc/$$/environ ]] || die "/proc process environments must be readable"
+[[ -d /dev/shm && -w /dev/shm ]] || die "/dev/shm must exist and be writable"
+if [[ ${WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS+x} ]]; then
+    die "refusing to run with WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS set"
+fi
+
+readonly BIN_DIR=$MUX_BIN_DIR
+for executable in muxd muxctl mux-engine mux-layer mux-pane mux-bar; do
+    [[ -x "$BIN_DIR/$executable" ]] ||
+        die "missing executable: $BIN_DIR/$executable"
+done
+
+BASE=
+LOG_DIR=
+KITTY_SOCKET=
+KITTY_LISTEN_ON=
+KITTY_PUBLIC_KEY_VALUE=
+SNAPSHOT=
+MUXD_PID=0
+ENGINE_PID=0
+WESTON_PID=0
+HTTP_PID=0
+KITTY_PID=0
+BOOT_PANE_PID=0
+ALT_PANE_PID=0
+declare -a CHILD_PIDS=()
+declare -a CHILD_LABELS=()
+declare -a KITTY_WINDOW_IDS=()
+TEARDOWN_DONE=0
+
+pid_alive() {
+    local pid=$1
+    (( pid > 0 )) && kill -0 "$pid" 2>/dev/null
+}
+
+track_child() {
+    CHILD_PIDS+=("$1")
+    CHILD_LABELS+=("$2")
+}
+
+pid_env_value() {
+    local pid=$1
+    local key=$2
+    local entry
+
+    [[ -r /proc/$pid/environ ]] || return 1
+    while IFS= read -r -d '' entry; do
+        case $entry in
+            "$key="*)
+                printf '%s\n' "${entry#*=}"
+                return 0
+                ;;
+        esac
+    done <"/proc/$pid/environ"
+    return 1
+}
+
+marked_pid() {
+    local process_name=$1
+    local excluded_pid=${2:-}
+    local pid marker
+
+    while IFS= read -r pid; do
+        [[ -n $pid ]] || continue
+        [[ $pid != "$excluded_pid" ]] || continue
+        marker=$(pid_env_value "$pid" MUX_SMOKE_ID 2>/dev/null || true)
+        if [[ $marker == "$MUX_SMOKE_ID" ]]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done < <(pgrep -u "$(id -u)" -x "$process_name" 2>/dev/null || true)
+    return 1
+}
+
+safe_dump_file() {
+    local path=$1
+    python3 - "$path" <<'PY'
+from pathlib import Path
+import sys
+
+data = Path(sys.argv[1]).read_bytes()
+out = []
+for byte in data:
+    if byte in (9, 10, 13) or 32 <= byte <= 126:
+        out.append(chr(byte))
+    else:
+        out.append(f"\\x{byte:02x}")
+sys.stderr.write("".join(out))
+if not data.endswith(b"\n"):
+    sys.stderr.write("\n")
+PY
+}
+
+dump_failure() {
+    local pane_pid key match capture index=0
+
+    printf '\nruntime-smoke: failure diagnostics\n' >&2
+
+    if [[ -z $KITTY_PUBLIC_KEY_VALUE ]]; then
+        pane_pid=$(marked_pid mux-pane 2>/dev/null || true)
+        if [[ -n $pane_pid ]]; then
+            KITTY_PUBLIC_KEY_VALUE=$(pid_env_value "$pane_pid" KITTY_PUBLIC_KEY 2>/dev/null || true)
+        fi
+    fi
+
+    if [[ -n $KITTY_PUBLIC_KEY_VALUE && -S ${KITTY_SOCKET:-/nonexistent} ]]; then
+        if (( ${#KITTY_WINDOW_IDS[@]} > 0 )); then
+            for match in "${KITTY_WINDOW_IDS[@]}"; do
+                capture="$BASE/pane-$index.txt"
+                if timeout 3s env KITTY_PUBLIC_KEY="$KITTY_PUBLIC_KEY_VALUE" \
+                    kitten @ --to "$KITTY_LISTEN_ON" --use-password=always \
+                    get-text --match "id:$match" --extent=all \
+                    >"$capture" 2>&1; then
+                    printf '\n--- pane PTY id:%s ---\n' "$match" >&2
+                    safe_dump_file "$capture" || true
+                fi
+                (( index += 1 ))
+            done
+        else
+            capture="$BASE/pane-all.txt"
+            if timeout 3s env KITTY_PUBLIC_KEY="$KITTY_PUBLIC_KEY_VALUE" \
+                kitten @ --to "$KITTY_LISTEN_ON" --use-password=always \
+                get-text --match 'cmdline:mux-pane' --extent=all \
+                >"$capture" 2>&1; then
+                printf '\n--- pane PTY ---\n' >&2
+                safe_dump_file "$capture" || true
+            fi
+        fi
+    fi
+
+    if [[ -x $BIN_DIR/muxctl ]]; then
+        printf '\n--- muxctl status ---\n' >&2
+        timeout 2s "$BIN_DIR/muxctl" status >&2 2>&1 || true
+        printf '\n--- muxctl list ---\n' >&2
+        timeout 2s "$BIN_DIR/muxctl" list >&2 2>&1 || true
+    fi
+
+    if [[ -d ${LOG_DIR:-/nonexistent} ]]; then
+        for capture in "$LOG_DIR"/*.log; do
+            [[ -f $capture ]] || continue
+            printf '\n--- %s ---\n' "$(basename -- "$capture")" >&2
+            safe_dump_file "$capture" || true
+        done
+    fi
+}
+
+teardown_children() {
+    local pid attempt any_alive
+
+    (( TEARDOWN_DONE == 0 )) || return 0
+    TEARDOWN_DONE=1
+
+    for (( index=${#CHILD_PIDS[@]} - 1; index >= 0; index-- )); do
+        pid=${CHILD_PIDS[index]}
+        if pid_alive "$pid"; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    done
+
+    for (( attempt=0; attempt < 80; attempt++ )); do
+        any_alive=0
+        for pid in "${CHILD_PIDS[@]}"; do
+            if pid_alive "$pid"; then
+                any_alive=1
+                break
+            fi
+        done
+        (( any_alive == 0 )) && break
+        sleep 0.05
+    done
+
+    for pid in "${CHILD_PIDS[@]}"; do
+        if pid_alive "$pid"; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
+    for pid in "${CHILD_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM
+
+    if (( rc != 0 )); then
+        dump_failure || true
+    fi
+    teardown_children || true
+    if [[ -n ${BASE:-} && -d $BASE ]]; then
+        if [[ ${MUX_SMOKE_KEEP_ARTIFACTS:-0} == 1 ]]; then
+            printf 'runtime-smoke: artifacts retained at %s\n' "$BASE" >&2
+        else
+            rm -rf -- "$BASE"
+        fi
+    fi
+    exit "$rc"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+fail() {
+    printf 'runtime-smoke: FAIL: %s\n' "$*" >&2
+    exit 1
+}
+
+wait_socket() {
+    local path=$1
+    local pid=$2
+    local label=$3
+    local attempt
+
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        [[ -S $path ]] && return 0
+        pid_alive "$pid" || fail "$label exited before creating $path"
+        sleep 0.05
+    done
+    fail "$label did not create $path within 10 seconds"
+}
+
+assert_core_alive() {
+    pid_alive "$WESTON_PID" || fail "Weston exited"
+    pid_alive "$HTTP_PID" || fail "HTTP fixture server exited"
+    pid_alive "$MUXD_PID" || fail "muxd exited"
+    pid_alive "$ENGINE_PID" || fail "mux-engine exited"
+    pid_alive "$KITTY_PID" || fail "Kitty exited"
+}
+
+run_muxctl() {
+    timeout 2s "$BIN_DIR/muxctl" "$@"
+}
+
+view_record() {
+    local listing=$1
+    local view_id=$2
+    awk -v wanted="$view_id" '
+        $1 == "*" && $2 == wanted { print; exit }
+        $1 == wanted { print; exit }
+    ' <<<"$listing"
+}
+
+record_field() {
+    local listing=$1
+    local view_id=$2
+    local field=$3
+    local record
+
+    record=$(view_record "$listing" "$view_id")
+    awk -v prefix="$field=" '
+        {
+            for (i = 1; i <= NF; i++) {
+                if (index($i, prefix) == 1) {
+                    print substr($i, length(prefix) + 1)
+                    exit
+                }
+            }
+        }
+    ' <<<"$record"
+}
+
+wait_title() {
+    local view_id=$1
+    local expected_url=$2
+    local expected_title=$3
+    local attempt listing record
+
+    for (( attempt=0; attempt < 400; attempt++ )); do
+        listing=$(run_muxctl list 2>/dev/null || true)
+        record=$(view_record "$listing" "$view_id")
+        if [[ $record == *"$expected_url"* && $record == *"$expected_title"* ]]; then
+            SNAPSHOT=$listing
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "title $expected_title was not observed for $view_id within 20 seconds"
+}
+
+wait_initial_view() {
+    local expected_url=$1
+    local expected_title=$2
+    local attempt listing view_id record
+
+    for (( attempt=0; attempt < 400; attempt++ )); do
+        listing=$(run_muxctl list 2>/dev/null || true)
+        view_id=$(awk '
+            $1 == "*" && $2 ~ /^(view|transient)-/ { print $2; exit }
+            $1 ~ /^(view|transient)-/ { print $1; exit }
+        ' <<<"$listing")
+        if [[ -n $view_id ]]; then
+            record=$(view_record "$listing" "$view_id")
+            if [[ $record == *"$expected_url"* && $record == *"$expected_title"* ]]; then
+                SNAPSHOT=$listing
+                printf '%s\n' "$view_id"
+                return 0
+            fi
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "initial JavaScript title was not observed within 20 seconds"
+}
+
+wait_new_view() {
+    local old_view=$1
+    local attempt listing new_view
+
+    for (( attempt=0; attempt < 400; attempt++ )); do
+        listing=$(run_muxctl list 2>/dev/null || true)
+        new_view=$(awk -v old="$old_view" '
+            {
+                candidate = ""
+                if ($1 == "*" && $2 ~ /^(view|transient)-/) candidate = $2
+                else if ($1 ~ /^(view|transient)-/) candidate = $1
+                if (candidate != "" && candidate != old) {
+                    print candidate
+                    exit
+                }
+            }
+        ' <<<"$listing")
+        if [[ -n $new_view ]]; then
+            SNAPSHOT=$listing
+            printf '%s\n' "$new_view"
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "second Kitty layer did not register a view within 20 seconds"
+}
+
+wait_active_view() {
+    local expected_view=$1
+    local attempt listing
+
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        listing=$(run_muxctl list 2>/dev/null || true)
+        if awk -v wanted="$expected_view" '
+            $1 == "*" && $2 == wanted { found = 1 }
+            END { exit found ? 0 : 1 }
+        ' <<<"$listing"; then
+            SNAPSHOT=$listing
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "$expected_view did not become the physically focused Kitty view"
+}
+
+wait_layer() {
+    local expected_layer=$1
+    local expected_view=$2
+    local attempt status
+
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        status=$(run_muxctl status 2>/dev/null || true)
+        if [[ $status =~ (^|[[:space:]])layer=$expected_layer($|[[:space:]]) ]] &&
+            wait_active_view "$expected_view"; then
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "physical layer $expected_layer did not focus $expected_view"
+}
+
+wait_view_closed() {
+    local view_id=$1
+    local pane_pid=$2
+    local attempt listing
+
+    for (( attempt=0; attempt < 240; attempt++ )); do
+        listing=$(run_muxctl list 2>/dev/null || true)
+        if [[ -z $(view_record "$listing" "$view_id") ]] && ! pid_alive "$pane_pid"; then
+            SNAPSHOT=$listing
+            return 0
+        fi
+        pid_alive "$ENGINE_PID" || fail "central engine exited while closing $view_id"
+        pid_alive "$MUXD_PID" || fail "muxd exited while closing $view_id"
+        sleep 0.05
+    done
+    fail "graceful Ctrl+Q did not close $view_id within 12 seconds"
+}
+
+kitty_rc() {
+    timeout 5s env KITTY_PUBLIC_KEY="$KITTY_PUBLIC_KEY_VALUE" \
+        kitten @ --to "$KITTY_LISTEN_ON" --use-password=always "$@"
+}
+
+umask 077
+BASE=$(mktemp -d "${TMPDIR:-/tmp}/mux-runtime-smoke.XXXXXX")
+chmod 700 "$BASE"
+LOG_DIR="$BASE/log"
+
+export MUX_SMOKE_ID="mux-runtime-smoke-$$"
+export XDG_RUNTIME_DIR="$BASE/run"
+export XDG_STATE_HOME="$BASE/state"
+export XDG_DATA_HOME="$BASE/data"
+export XDG_CACHE_HOME="$BASE/cache"
+export XDG_CONFIG_HOME="$BASE/config"
+export MUX_PROFILE=runtime-smoke
+export MUX_EPHEMERAL=1
+export MUX_LAYER=main
+export MUX_GLOBAL_BAR=1
+export MUX_PROFILE_DATA_DIR="$BASE/profile-data"
+export MUX_PROFILE_CACHE_DIR="$BASE/profile-cache"
+export MUX_ENGINE_SOCKET="$XDG_RUNTIME_DIR/mux/engine.sock"
+export WAYLAND_DISPLAY=mux-runtime-smoke-wayland
+export WPE_DISPLAY=wpe-display-headless
+export LIBGL_ALWAYS_SOFTWARE=1
+export PATH="$BIN_DIR:$PATH"
+unset DISPLAY KITTY_DISABLE_WAYLAND
+
+install -d -m 700 \
+    "$LOG_DIR" \
+    "$XDG_RUNTIME_DIR" \
+    "$XDG_RUNTIME_DIR/mux" \
+    "$XDG_STATE_HOME" \
+    "$XDG_DATA_HOME" \
+    "$XDG_CACHE_HOME" \
+    "$XDG_CONFIG_HOME" \
+    "$MUX_PROFILE_DATA_DIR" \
+    "$MUX_PROFILE_CACHE_DIR" \
+    "$BASE/site" \
+    "$BASE/kitty"
+
+cat >"$BASE/site/index.html" <<'HTML'
+<!doctype html>
+<meta charset="utf-8">
+<title>MUX_SMOKE_BOOT_LOADING</title>
+<script>
+addEventListener("load", () => {
+    document.title = "MUX_SMOKE_BOOT_LOADED";
+});
+</script>
+<body>Mux boot fixture</body>
+HTML
+
+cat >"$BASE/site/second.html" <<'HTML'
+<!doctype html>
+<meta charset="utf-8">
+<title>MUX_SMOKE_SECOND_LOADING</title>
+<script>
+addEventListener("load", () => {
+    document.title = "MUX_SMOKE_SECOND_LOADED";
+});
+</script>
+<body>Mux targeted navigation fixture</body>
+HTML
+
+cp "$REPO_ROOT/kitty/kitty.conf" "$BASE/kitty/kitty.conf"
+cp "$REPO_ROOT/kitty/wpe.conf" "$BASE/kitty/wpe.conf"
+python3 - "$BASE/kitty/wpe.conf" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+old = 'remote_control_password "" detach-window focus-window launch\n'
+new = 'remote_control_password "" detach-window focus-window launch send-key get-text\n'
+text = path.read_text(encoding="ascii")
+if text.count(old) != 1:
+    raise SystemExit("temporary Kitty ACL source did not match production config")
+path.write_text(text.replace(old, new), encoding="ascii")
+PY
+
+weston \
+    --backend=headless \
+    --renderer=pixman \
+    --shell=kiosk-shell.so \
+    --width=1280 \
+    --height=800 \
+    --idle-time=0 \
+    -S "$WAYLAND_DISPLAY" \
+    --log="$LOG_DIR/weston.log" \
+    >"$LOG_DIR/weston-stdio.log" 2>&1 &
+WESTON_PID=$!
+track_child "$WESTON_PID" weston
+wait_socket "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" "$WESTON_PID" weston
+
+PORT_FILE="$BASE/http.port"
+python3 - "$BASE/site" "$PORT_FILE" >"$LOG_DIR/http.log" 2>&1 <<'PY' &
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import sys
+
+handler = partial(SimpleHTTPRequestHandler, directory=sys.argv[1])
+server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+Path(sys.argv[2]).write_text(str(server.server_port), encoding="ascii")
+server.serve_forever()
+PY
+HTTP_PID=$!
+track_child "$HTTP_PID" http
+
+for (( attempt=0; attempt < 200; attempt++ )); do
+    [[ -s $PORT_FILE ]] && break
+    pid_alive "$HTTP_PID" || fail "HTTP fixture server exited before publishing its port"
+    sleep 0.05
+done
+[[ -s $PORT_FILE ]] || fail "HTTP fixture server did not publish its port"
+HTTP_PORT=$(<"$PORT_FILE")
+[[ $HTTP_PORT =~ ^[0-9]+$ ]] || fail "invalid fixture port: $HTTP_PORT"
+BOOT_URL="http://127.0.0.1:$HTTP_PORT/index.html"
+SECOND_URL="http://127.0.0.1:$HTTP_PORT/second.html"
+
+python3 - "$BOOT_URL" "$SECOND_URL" <<'PY'
+import sys
+import urllib.request
+
+for url in sys.argv[1:]:
+    with urllib.request.urlopen(url, timeout=2) as response:
+        if response.status != 200:
+            raise SystemExit(f"fixture returned HTTP {response.status}: {url}")
+PY
+
+"$BIN_DIR/muxd" --foreground >"$LOG_DIR/muxd.log" 2>&1 &
+MUXD_PID=$!
+track_child "$MUXD_PID" muxd
+wait_socket "$XDG_RUNTIME_DIR/mux/muxd.sock" "$MUXD_PID" muxd
+
+initial_status=$(run_muxctl status) || fail "muxctl could not reach muxd"
+[[ $initial_status =~ (^|[[:space:]])views=0($|[[:space:]]) ]] ||
+    fail "muxd did not begin with zero views: $initial_status"
+
+"$BIN_DIR/mux-engine" \
+    --profile "$MUX_PROFILE" \
+    --socket "$MUX_ENGINE_SOCKET" \
+    >"$LOG_DIR/engine.log" 2>&1 &
+ENGINE_PID=$!
+track_child "$ENGINE_PID" mux-engine
+wait_socket "$MUX_ENGINE_SOCKET" "$ENGINE_PID" mux-engine
+
+KITTY_SOCKET="$XDG_RUNTIME_DIR/mux/kitty.sock"
+KITTY_LISTEN_ON="unix:$KITTY_SOCKET"
+export KITTY_LISTEN_ON
+
+kitty \
+    --config "$BASE/kitty/wpe.conf" \
+    --listen-on "$KITTY_LISTEN_ON" \
+    --title Mux \
+    env \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        XDG_STATE_HOME="$XDG_STATE_HOME" \
+        XDG_DATA_HOME="$XDG_DATA_HOME" \
+        XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+        XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+        MUX_PROFILE="$MUX_PROFILE" \
+        MUX_EPHEMERAL="$MUX_EPHEMERAL" \
+        MUX_LAYER="$MUX_LAYER" \
+        MUX_GLOBAL_BAR="$MUX_GLOBAL_BAR" \
+        MUX_ENGINE_SOCKET="$MUX_ENGINE_SOCKET" \
+        MUX_PROFILE_DATA_DIR="$MUX_PROFILE_DATA_DIR" \
+        MUX_PROFILE_CACHE_DIR="$MUX_PROFILE_CACHE_DIR" \
+        MUX_SMOKE_ID="$MUX_SMOKE_ID" \
+        WPE_DISPLAY="$WPE_DISPLAY" \
+        LIBGL_ALWAYS_SOFTWARE="$LIBGL_ALWAYS_SOFTWARE" \
+        PATH="$PATH" \
+        "$BIN_DIR/mux-layer" "$BOOT_URL" \
+    >"$LOG_DIR/kitty.log" 2>&1 &
+KITTY_PID=$!
+track_child "$KITTY_PID" kitty
+wait_socket "$KITTY_SOCKET" "$KITTY_PID" kitty
+
+BOOT_VIEW_ID=$(wait_initial_view "$BOOT_URL" MUX_SMOKE_BOOT_LOADED)
+SNAPSHOT=$(run_muxctl list)
+BOOT_PANE_PID=$(marked_pid mux-pane) || fail "mux-pane process was not observed"
+BAR_PID=$(marked_pid mux-bar) || fail "mux-bar process was not observed"
+pid_alive "$BAR_PID" || fail "mux-bar exited"
+
+reported_boot_pid=$(record_field "$SNAPSHOT" "$BOOT_VIEW_ID" pid)
+BOOT_KITTY_ID=$(record_field "$SNAPSHOT" "$BOOT_VIEW_ID" kitty)
+[[ $reported_boot_pid == "$BOOT_PANE_PID" ]] ||
+    fail "muxctl pane PID $reported_boot_pid does not match process $BOOT_PANE_PID"
+[[ -n $BOOT_KITTY_ID ]] || fail "muxctl did not report the initial Kitty window ID"
+KITTY_WINDOW_IDS+=("$BOOT_KITTY_ID")
+
+KITTY_PUBLIC_KEY_VALUE=$(pid_env_value "$BOOT_PANE_PID" KITTY_PUBLIC_KEY || true)
+[[ -n $KITTY_PUBLIC_KEY_VALUE ]] ||
+    fail "KITTY_PUBLIC_KEY was not present in the mux-pane environment"
+
+run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl focus failed for $BOOT_VIEW_ID"
+wait_active_view "$BOOT_VIEW_ID"
+
+kitty_rc launch \
+    --source-window "id:$BOOT_KITTY_ID" \
+    --type=tab \
+    --copy-env \
+    "$BIN_DIR/mux-layer" --new \
+    >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "Kitty could not launch the alternate Mux layer"
+
+ALT_VIEW_ID=$(wait_new_view "$BOOT_VIEW_ID")
+SNAPSHOT=$(run_muxctl list)
+ALT_LAYER=$(record_field "$SNAPSHOT" "$ALT_VIEW_ID" layer)
+ALT_KITTY_ID=$(record_field "$SNAPSHOT" "$ALT_VIEW_ID" kitty)
+reported_alt_pid=$(record_field "$SNAPSHOT" "$ALT_VIEW_ID" pid)
+[[ -n $ALT_LAYER && $ALT_LAYER != main ]] ||
+    fail "alternate pane did not register a distinct layer"
+[[ -n $ALT_KITTY_ID ]] || fail "alternate pane did not report a Kitty window ID"
+KITTY_WINDOW_IDS+=("$ALT_KITTY_ID")
+
+for (( attempt=0; attempt < 200; attempt++ )); do
+    ALT_PANE_PID=$(marked_pid mux-pane "$BOOT_PANE_PID" 2>/dev/null || true)
+    if [[ -n $ALT_PANE_PID ]]; then
+        break
+    fi
+    ALT_PANE_PID=0
+    assert_core_alive
+    sleep 0.05
+done
+(( ALT_PANE_PID > 0 )) || fail "alternate mux-pane process was not observed"
+[[ $reported_alt_pid == "$ALT_PANE_PID" ]] ||
+    fail "alternate muxctl PID $reported_alt_pid does not match process $ALT_PANE_PID"
+
+run_muxctl layer "$ALT_LAYER" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl layer failed for $ALT_LAYER"
+wait_layer "$ALT_LAYER" "$ALT_VIEW_ID"
+
+run_muxctl layer main >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl layer failed for main"
+wait_layer main "$BOOT_VIEW_ID"
+
+run_muxctl open "$BOOT_VIEW_ID" "$SECOND_URL" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "targeted navigation failed for $BOOT_VIEW_ID"
+wait_title "$BOOT_VIEW_ID" "$SECOND_URL" MUX_SMOKE_SECOND_LOADED
+
+run_muxctl focus "$ALT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl focus failed for $ALT_VIEW_ID"
+wait_active_view "$ALT_VIEW_ID"
+kitty_rc send-key --match "id:$ALT_KITTY_ID" ctrl+q \
+    >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "encrypted Ctrl+Q injection failed for $ALT_VIEW_ID"
+wait_view_closed "$ALT_VIEW_ID" "$ALT_PANE_PID"
+
+run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl focus failed for $BOOT_VIEW_ID"
+wait_active_view "$BOOT_VIEW_ID"
+kitty_rc send-key --match "id:$BOOT_KITTY_ID" ctrl+q \
+    >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "encrypted Ctrl+Q injection failed for $BOOT_VIEW_ID"
+wait_view_closed "$BOOT_VIEW_ID" "$BOOT_PANE_PID"
+
+final_status=$(run_muxctl status) || fail "muxctl status failed after pane closure"
+[[ $final_status =~ (^|[[:space:]])views=0($|[[:space:]]) ]] ||
+    fail "muxd retained views after graceful close: $final_status"
+pid_alive "$ENGINE_PID" || fail "central engine exited after its last view closed"
+pid_alive "$MUXD_PID" || fail "muxd exited after its last view closed"
+
+printf 'runtime-smoke: JavaScript title, processes, focus, layers, navigation, and graceful close passed\n'
+printf 'runtime-smoke: Kitty pixel FRAME_ACK delivery is not observable and is not proved\n'
+
+teardown_children
+[[ ! -S $MUX_ENGINE_SOCKET ]] || fail "engine socket remained after shutdown"
+[[ ! -S $XDG_RUNTIME_DIR/mux/muxd.sock ]] || fail "muxd socket remained after shutdown"
+
+printf 'runtime-smoke: PASS\n'

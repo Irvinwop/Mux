@@ -15,10 +15,16 @@ update one Kitty graphics image in place.
 - Linux
 - Kitty in a Wayland or X11 session
 - GLib and GIO 2.74 or newer
-- WPE WebKit 2.52 or newer
+- WPE WebKit 2.52.5 or newer
 - WPEPlatform enabled in the WPE build
-- pkg-config modules `wpe-webkit-2.0` and `wpe-platform-2.0`
+- pkg-config modules `wpe-webkit-2.0` and `wpe-platform-2.0`, both version
+  2.52.5 or newer
 - Writable `/dev/shm`
+
+Version 2.52.5 is the current stable security floor: the
+[WPE release index](https://wpewebkit.org/release/) lists it as stable, and
+[WSA-2026-0004](https://www.webkitgtk.org/security/WSA-2026-0004.html) affects
+WPE WebKit versions before 2.52.5.
 
 Run `./doctor` before investigating runtime failures. It distinguishes missing
 build requirements from the expected no-display warning in headless shells.

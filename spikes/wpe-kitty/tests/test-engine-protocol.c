@@ -1,10 +1,23 @@
 #include "../src/mux-engine-protocol.h"
+#include "../mux-uri.h"
 
 #include <glib.h>
 
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+gboolean mux_engine_test_prepare_initial_uri(gboolean popup_claim,
+                                             const gchar *uri,
+                                             const gchar *search_url,
+                                             gchar **normalized_uri,
+                                             GError **error);
+gboolean mux_pane_test_schedule_retry_at(gint64 now_us,
+                                         gint64 *retry_us,
+                                         guint *backoff_ms);
+gboolean mux_pane_test_decode_engine_error(GBytes *payload,
+                                           guint32 *code,
+                                           gchar **safe_detail);
 
 static void
 put_u16(guint8 *target, guint16 value)
@@ -428,6 +441,123 @@ test_malformed_packet(gconstpointer user_data)
     assert_protocol_rejected(packet, packet_size);
 }
 
+static void
+test_create_view_initial_uri_preparation(void)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree gchar *normalized = NULL;
+
+    g_assert_false(mux_engine_test_prepare_initial_uri(
+        FALSE,
+        "data:text/html,not-allowed",
+        NULL,
+        &normalized,
+        &error));
+    g_assert_error(error,
+                   MUX_URI_ERROR,
+                   MUX_URI_ERROR_DISALLOWED_SCHEME);
+    g_assert_null(normalized);
+    g_clear_error(&error);
+
+    g_assert_true(mux_engine_test_prepare_initial_uri(FALSE,
+                                                      "example.com",
+                                                      NULL,
+                                                      &normalized,
+                                                      &error));
+    g_assert_no_error(error);
+    g_assert_cmpstr(normalized, ==, "https://example.com");
+    g_clear_pointer(&normalized, g_free);
+
+    g_assert_true(mux_engine_test_prepare_initial_uri(
+        TRUE,
+        "data:text/html,popup-uri-is-not-reloaded",
+        NULL,
+        &normalized,
+        &error));
+    g_assert_no_error(error);
+    g_assert_null(normalized);
+}
+
+static void
+test_pane_retry_backoff(void)
+{
+    static const guint expected_delays[] = {
+        100, 200, 400, 800, 1600, 3200, 5000, 5000,
+    };
+    gint64 now_us = G_GINT64_CONSTANT(1000000);
+    gint64 retry_us = 0;
+    guint backoff_ms = 0;
+
+    for (gsize index = 0;
+         index < G_N_ELEMENTS(expected_delays);
+         index++) {
+        g_assert_true(mux_pane_test_schedule_retry_at(now_us,
+                                                      &retry_us,
+                                                      &backoff_ms));
+        g_assert_cmpint(retry_us,
+                        ==,
+                        now_us +
+                            (gint64)expected_delays[index] * 1000);
+        g_assert_cmpuint(backoff_ms,
+                         ==,
+                         index + 1 < G_N_ELEMENTS(expected_delays)
+                             ? expected_delays[index + 1]
+                             : 5000);
+        g_assert_false(mux_pane_test_schedule_retry_at(now_us + 1,
+                                                       &retry_us,
+                                                       &backoff_ms));
+        retry_us = 0;
+        now_us += G_GINT64_CONSTANT(10000000);
+    }
+}
+
+static void
+test_engine_error_payload_validation(void)
+{
+    MuxEngineBuilder builder = { 0 };
+    g_autoptr(GBytes) payload = NULL;
+    g_autofree gchar *safe_detail = NULL;
+    guint32 code = 0;
+    guint8 invalid_utf8[9] = { 0 };
+    g_autoptr(GBytes) invalid_payload = NULL;
+    g_autofree gchar *oversized = g_strnfill(4097, 'x');
+    g_autoptr(GBytes) oversized_payload = NULL;
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder,
+                               MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE);
+    mux_engine_builder_put_string(
+        &builder,
+        "bad\033[31m\nvalue\xE2\x80\xAE");
+    payload = mux_engine_builder_finish(&builder);
+    g_assert_true(mux_pane_test_decode_engine_error(payload,
+                                                    &code,
+                                                    &safe_detail));
+    g_assert_cmpuint(code, ==, MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE);
+    g_assert_cmpstr(safe_detail, ==, "bad?[31m?value?");
+    g_assert_null(strchr(safe_detail, '\033'));
+    g_assert_null(strchr(safe_detail, '\n'));
+
+    put_u32(invalid_utf8, MUX_ENGINE_REMOTE_ERROR_INTERNAL);
+    put_u32(invalid_utf8 + 4, 1);
+    invalid_utf8[8] = 0xff;
+    invalid_payload = g_bytes_new(invalid_utf8, sizeof(invalid_utf8));
+    g_clear_pointer(&safe_detail, g_free);
+    g_assert_false(mux_pane_test_decode_engine_error(invalid_payload,
+                                                     &code,
+                                                     &safe_detail));
+    g_assert_null(safe_detail);
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, MUX_ENGINE_REMOTE_ERROR_INTERNAL);
+    mux_engine_builder_put_string(&builder, oversized);
+    oversized_payload = mux_engine_builder_finish(&builder);
+    g_assert_false(mux_pane_test_decode_engine_error(oversized_payload,
+                                                     &code,
+                                                     &safe_detail));
+    g_assert_null(safe_detail);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -462,6 +592,12 @@ main(int argc, char **argv)
                     test_cancel_close_round_trip);
     g_test_add_func("/engine-protocol/packet/reject-v1",
                     test_legacy_protocol_version_rejected);
+    g_test_add_func("/engine-runtime/create-view/prepare-initial-uri",
+                    test_create_view_initial_uri_preparation);
+    g_test_add_func("/engine-runtime/reconnect/exponential-backoff",
+                    test_pane_retry_backoff);
+    g_test_add_func("/engine-runtime/error/bounded-sanitized-payload",
+                    test_engine_error_payload_validation);
 
     for (index = 0; index < G_N_ELEMENTS(malformed_cases); index++) {
         g_test_add_data_func(malformed_cases[index].path,

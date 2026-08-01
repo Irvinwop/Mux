@@ -19,8 +19,8 @@ gio_dep = dependency('gio-2.0', version: '>=2.74')
 
 view_deps = [
   glib_dep,
-  dependency('wpe-webkit-2.0', version: '>=2.52'),
-  dependency('wpe-platform-2.0', version: '>=2.52'),
+  dependency('wpe-webkit-2.0', version: '>=2.52.5'),
+  dependency('wpe-platform-2.0', version: '>=2.52.5'),
 ]
 
 rt = cc.find_library('rt', required: false)
@@ -94,8 +94,8 @@ executable(
 engine_dependencies = [
   dependency('glib-2.0'),
   dependency('gio-2.0'),
-  dependency('wpe-webkit-2.0', version: '>=2.52'),
-  dependency('wpe-platform-2.0', version: '>=2.52'),
+  dependency('wpe-webkit-2.0', version: '>=2.52.5'),
+  dependency('wpe-platform-2.0', version: '>=2.52.5'),
 ]
 
 executable(
@@ -196,12 +196,19 @@ test('clipboard-broker', clipboard_broker_test)
 
 engine_protocol_test = executable(
   'test-engine-protocol',
-  [
-    'tests/test-engine-protocol.c',
-    'src/mux-engine-protocol.c',
-  ],
-  dependencies: [glib_dep],
-)
+    [
+      'tests/test-engine-protocol.c',
+      'src/mux-engine-protocol.c',
+      'src/mux-engine.c',
+      'src/mux-pane.c',
+      'mux-uri.c',
+    ],
+    c_args: [
+      '-DMUX_ENGINE_LOGIC_TEST',
+      '-DMUX_PANE_LOGIC_TEST',
+    ],
+    dependencies: engine_dependencies,
+  )
 
 test('engine-protocol', engine_protocol_test)
 

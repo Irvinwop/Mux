@@ -14,9 +14,11 @@ memory and updates an existing Kitty graphics image.
 
 The real WPE implementation builds as a collection of native processes and has
 unit tests for its clipboard, protocol, local transport, extension routing,
-and URI-input components. The interactive browser paths have not all been
-validated end to end on a Linux desktop. Treat v0.1 as personal experimental
-software, not as a secure daily-driver browser.
+and URI-input components. A bounded headless gate also runs real Weston,
+Kitty, WPE, muxd, the shared engine, a pane, and the global bar end to end. The
+interactive browser paths have not all been validated on a Linux desktop.
+Treat v0.1 as personal experimental software, not as a secure daily-driver
+browser.
 
 ## Requirements
 
@@ -25,11 +27,14 @@ software, not as a secure daily-driver browser.
 - Kitty 0.45 or newer, including `kitten`
 - A C17 compiler, Meson, Ninja, and pkg-config
 - GLib and GIO 2.74 or newer
-- WPE WebKit 2.52 or newer, built with WPEPlatform enabled
+- WPE WebKit and WPEPlatform 2.52.5 or newer
 - Writable POSIX shared memory at `/dev/shm`
 
 The decisive dependency check is that pkg-config can find both
-`wpe-webkit-2.0 >= 2.52` and `wpe-platform-2.0 >= 2.52`.
+`wpe-webkit-2.0 >= 2.52.5` and `wpe-platform-2.0 >= 2.52.5`. Versions before
+2.52.5 are affected by
+[WSA-2026-0004](https://www.webkitgtk.org/security/WSA-2026-0004.html); see the
+official [WPE WebKit 2.52.5 release](https://wpewebkit.org/release/wpewebkit-2.52.5.html).
 
 ## Release-qualified start path
 
@@ -74,6 +79,38 @@ launcher:
 
 Run `./doctor` for a read-only, actionable dependency report. See
 [Installation](docs/install.md) for package and Nix details.
+
+## Headless full-stack runtime gate
+
+After the normal source build has produced the six executables, run the gate
+as an ordinary user on Linux:
+
+```sh
+./runtime-smoke
+```
+
+It derives the same checkout-specific cache build directory as `./mux`. To use
+another build explicitly:
+
+```sh
+MUX_BIN_DIR="$PWD/build/runtime-smoke" ./runtime-smoke
+```
+
+The gate creates private XDG and profile directories, starts a D-Bus session
+when needed, and uses Weston headless with its Pixman renderer. It serves only
+loopback HTTP fixtures because Mux intentionally rejects `data:` navigation.
+Through a real Kitty process it proves JavaScript title execution, the
+Kitty-to-pane process topology, muxd and engine connectivity, muxctl focus,
+physical layer switching, targeted navigation, and encrypted blank-password
+`Ctrl+Q` closure. The temporary Kitty copy adds only `send-key` and `get-text`;
+the production ACL is unchanged.
+
+The gate does not expose Kitty's graphics `FRAME_ACK`, so it does not prove
+that a pixel reached Kitty. It also does not qualify real GPU rendering, live
+websites, media, desktop input conflicts, or long-running resource behavior.
+Weston, Python 3, D-Bus, and `pgrep` from procps are additional smoke-only
+dependencies. Root execution is rejected except for the explicit privileged
+container path used by CI.
 
 ## Current implementation
 
@@ -151,11 +188,11 @@ Browser content does not execute inside `muxd`.
 
 ## Runtime storage
 
-The source launcher keeps its release build under
-`$XDG_CACHE_HOME/mux/wpe-kitty` and recompiles only changed sources. Profile
-data follows XDG data and cache directories. Authenticated local sockets use
-`$XDG_RUNTIME_DIR`; when it is absent, Mux uses an owner-only fallback below
-`/tmp`.
+The source launcher keeps each checkout's release build under
+`$XDG_CACHE_HOME/mux/checkouts/<checkout-sha256>/wpe-kitty` and recompiles only
+changed sources. Profile data follows XDG data and cache directories.
+Authenticated local sockets use `$XDG_RUNTIME_DIR`; when it is absent, Mux
+uses an owner-only fallback below `/tmp`.
 
 See [Running the WPE implementation](docs/running-wpe.md) for the runtime
 boundary and [Architecture](docs/architecture.md) for design rationale.

@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <wpe/webkit.h>
 #include <wpe/wpe-platform.h>
@@ -54,6 +55,43 @@
 #define MUX_ENGINE_PALETTE_BOOKMARKS 32U
 #define MUX_ENGINE_PALETTE_CLOSED 32U
 #define MUX_ENGINE_PALETTE_HISTORY 96U
+#define MUX_ENGINE_ENSURE_TIMEOUT_MS 5000U
+#define MUX_ENGINE_ENSURE_POLL_MS 20U
+#define MUX_ENGINE_ERROR_DETAIL_CHARACTERS 1024U
+
+static gboolean
+prepare_initial_uri(gboolean popup_claim,
+                    const gchar *uri,
+                    const gchar *search_url,
+                    gchar **normalized_uri,
+                    GError **error)
+{
+    g_return_val_if_fail(normalized_uri != NULL, FALSE);
+
+    *normalized_uri = NULL;
+    if (popup_claim)
+        return TRUE;
+    *normalized_uri = mux_uri_resolve_user_input(uri, search_url, error);
+    return *normalized_uri != NULL;
+}
+
+#ifdef MUX_ENGINE_LOGIC_TEST
+
+gboolean
+mux_engine_test_prepare_initial_uri(gboolean popup_claim,
+                                    const gchar *uri,
+                                    const gchar *search_url,
+                                    gchar **normalized_uri,
+                                    GError **error)
+{
+    return prepare_initial_uri(popup_claim,
+                               uri,
+                               search_url,
+                               normalized_uri,
+                               error);
+}
+
+#else
 
 typedef struct _Engine Engine;
 typedef struct _Client Client;
@@ -508,10 +546,11 @@ write_lock_pid(Engine *engine, GError **error)
 }
 
 static gint
-daemonize_engine(GError **error)
+daemonize_engine(pid_t *child_pid, GError **error)
 {
     pid_t child = fork();
 
+    *child_pid = -1;
     if (child < 0) {
         g_set_error(error,
                     G_FILE_ERROR,
@@ -520,8 +559,12 @@ daemonize_engine(GError **error)
                     g_strerror(errno));
         return -1;
     }
-    if (child > 0)
+    if (child > 0) {
+        *child_pid = child;
         return 1;
+    }
+
+    *child_pid = 0;
 
     if (setsid() < 0) {
         g_set_error(error,
@@ -555,6 +598,140 @@ daemonize_engine(GError **error)
     if (null_fd > STDERR_FILENO)
         close(null_fd);
     return 0;
+}
+
+static gboolean
+engine_listener_reachable(const gchar *socket_path)
+{
+    struct stat status;
+    struct sockaddr_un address = { 0 };
+    int fd;
+    gboolean reachable;
+
+    if (lstat(socket_path, &status) < 0 ||
+        !S_ISSOCK(status.st_mode) ||
+        status.st_uid != getuid() ||
+        (status.st_mode & 0077) != 0)
+        return FALSE;
+
+    fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return FALSE;
+    address.sun_family = AF_UNIX;
+    g_strlcpy(address.sun_path, socket_path, sizeof(address.sun_path));
+    reachable = connect(fd,
+                        (const struct sockaddr *)&address,
+                        offsetof(struct sockaddr_un, sun_path) +
+                            strlen(address.sun_path) + 1) == 0;
+    close(fd);
+    return reachable;
+}
+
+static void
+remove_owned_engine_socket(const gchar *socket_path)
+{
+    struct stat status;
+
+    if (lstat(socket_path, &status) == 0 &&
+        S_ISSOCK(status.st_mode) &&
+        status.st_uid == getuid())
+        (void)unlink(socket_path);
+}
+
+static void
+stop_daemon_child(pid_t child_pid)
+{
+    int status;
+
+    if (child_pid <= 0)
+        return;
+    if (kill(child_pid, SIGTERM) < 0 && errno == ESRCH)
+        return;
+    for (guint attempt = 0; attempt < 50; attempt++) {
+        pid_t waited;
+
+        do {
+            waited = waitpid(child_pid, &status, WNOHANG);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == child_pid || (waited < 0 && errno == ECHILD))
+            return;
+        g_usleep(10000);
+    }
+
+    (void)kill(child_pid, SIGKILL);
+    while (waitpid(child_pid, &status, 0) < 0 && errno == EINTR)
+        continue;
+}
+
+static gboolean
+wait_for_engine_listener(const gchar *socket_path,
+                         pid_t child_pid,
+                         GError **error)
+{
+    gint64 deadline = g_get_monotonic_time() +
+        (gint64)MUX_ENGINE_ENSURE_TIMEOUT_MS * 1000;
+
+    for (;;) {
+        int status = 0;
+
+        if (engine_listener_reachable(socket_path))
+            return TRUE;
+        if (child_pid > 0) {
+            pid_t waited;
+
+            do {
+                waited = waitpid(child_pid, &status, WNOHANG);
+            } while (waited < 0 && errno == EINTR);
+            if (waited == child_pid) {
+                remove_owned_engine_socket(socket_path);
+                if (WIFEXITED(status)) {
+                    g_set_error(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_FAILED,
+                                "engine daemon exited with status %d before its listener was ready",
+                                WEXITSTATUS(status));
+                } else if (WIFSIGNALED(status)) {
+                    g_set_error(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_FAILED,
+                                "engine daemon was terminated by signal %d before its listener was ready",
+                                WTERMSIG(status));
+                } else {
+                    g_set_error_literal(
+                        error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_FAILED,
+                        "engine daemon exited before its listener was ready");
+                }
+                return FALSE;
+            }
+            if (waited < 0) {
+                g_set_error(error,
+                            G_IO_ERROR,
+                            g_io_error_from_errno(errno),
+                            "wait for engine daemon: %s",
+                            g_strerror(errno));
+                stop_daemon_child(child_pid);
+                remove_owned_engine_socket(socket_path);
+                return FALSE;
+            }
+        }
+        if (g_get_monotonic_time() >= deadline)
+            break;
+        g_usleep((gulong)MUX_ENGINE_ENSURE_POLL_MS * 1000);
+    }
+
+    if (child_pid > 0) {
+        stop_daemon_child(child_pid);
+        remove_owned_engine_socket(socket_path);
+    }
+    g_set_error(error,
+                G_IO_ERROR,
+                G_IO_ERROR_TIMED_OUT,
+                "engine listener %s was not reachable within %u ms",
+                socket_path,
+                MUX_ENGINE_ENSURE_TIMEOUT_MS);
+    return FALSE;
 }
 
 static gboolean
@@ -1046,10 +1223,21 @@ client_send_error(Client *client,
     MuxEngineBuilder builder;
     GBytes *payload;
     gboolean result;
+    const gchar *message = detail ? detail : "engine error";
+    g_autofree gchar *bounded_detail = NULL;
+    glong character_count;
+
+    if (!g_utf8_validate(message, -1, NULL))
+        message = "engine error";
+    character_count = g_utf8_strlen(message, -1);
+    bounded_detail = g_utf8_substring(
+        message,
+        0,
+        MIN(character_count, (glong)MUX_ENGINE_ERROR_DETAIL_CHARACTERS));
 
     mux_engine_builder_init(&builder);
     mux_engine_builder_put_u32(&builder, code);
-    mux_engine_builder_put_string(&builder, detail ? detail : "engine error");
+    mux_engine_builder_put_string(&builder, bounded_detail);
     payload = mux_engine_builder_finish(&builder);
     result = client_send(client,
                          MUX_ENGINE_MESSAGE_ERROR,
@@ -1927,7 +2115,7 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
     gchar *layer = NULL;
     gchar *uri = NULL;
     g_autofree gchar *popup_token = NULL;
-    gchar *normalized_uri;
+    g_autofree gchar *normalized_uri = NULL;
     GError *uri_error = NULL;
     guint64 *key;
     MuxEngineBuilder builder;
@@ -1975,6 +2163,20 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
     popup_claim = popup_token && *popup_token;
     requested_ephemeral =
         (request->flags & MUX_ENGINE_FLAG_EPHEMERAL) != 0;
+    if (!prepare_initial_uri(popup_claim,
+                             uri,
+                             g_getenv(MUX_URI_SEARCH_ENV),
+                             &normalized_uri,
+                             &uri_error)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          uri_error->message);
+        g_clear_error(&uri_error);
+        g_free(layer);
+        g_free(uri);
+        return TRUE;
+    }
     if (popup_claim)
         view = claim_popup(engine, popup_token);
     if (popup_claim && !view) {
@@ -2226,24 +2428,8 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
     }
     g_bytes_unref(payload);
 
-    if (!popup_claim) {
-        normalized_uri = mux_uri_resolve_user_input(
-            uri,
-            g_getenv(MUX_URI_SEARCH_ENV),
-            &uri_error);
-        if (!normalized_uri) {
-            client_send_error(client,
-                              request,
-                              MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
-                              uri_error->message);
-            g_clear_error(&uri_error);
-            g_hash_table_remove(engine->views, &view->id);
-            g_free(uri);
-            return TRUE;
-        }
+    if (!popup_claim)
         webkit_web_view_load_uri(view->web_view, normalized_uri);
-        g_free(normalized_uri);
-    }
     g_free(uri);
     view_send_metadata(view);
     engine_view_send_frame(view);
@@ -3810,6 +3996,7 @@ main(int argc, char **argv)
     GError *error = NULL;
     gboolean already_running = FALSE;
     gint daemon_result;
+    pid_t daemon_pid = 0;
     int result = 1;
     Engine engine = {
         .listen_fd = -1,
@@ -3857,15 +4044,24 @@ main(int argc, char **argv)
         return 1;
     }
     if (already_running) {
-        if (!ensure)
+        if (!ensure) {
             g_printerr("mux-engine: profile %s is already running\n",
                        engine.profile);
+            engine_clear(&engine);
+            return 1;
+        }
+        if (!wait_for_engine_listener(engine.socket_path, 0, &error)) {
+            g_printerr("mux-engine: %s\n", error->message);
+            g_clear_error(&error);
+            engine_clear(&engine);
+            return 1;
+        }
         engine_clear(&engine);
-        return ensure ? 0 : 1;
+        return 0;
     }
 
     if (ensure) {
-        daemon_result = daemonize_engine(&error);
+        daemon_result = daemonize_engine(&daemon_pid, &error);
         if (daemon_result < 0) {
             g_printerr("mux-engine: %s\n", error->message);
             g_clear_error(&error);
@@ -3873,8 +4069,16 @@ main(int argc, char **argv)
             return 1;
         }
         if (daemon_result > 0) {
+            gboolean ready = wait_for_engine_listener(engine.socket_path,
+                                                       daemon_pid,
+                                                       &error);
+
+            if (!ready) {
+                g_printerr("mux-engine: %s\n", error->message);
+                g_clear_error(&error);
+            }
             engine_clear(&engine);
-            return 0;
+            return ready ? 0 : 1;
         }
     }
 
@@ -3915,3 +4119,5 @@ main(int argc, char **argv)
     engine_clear(&engine);
     return result;
 }
+
+#endif

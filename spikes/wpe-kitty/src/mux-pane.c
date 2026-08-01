@@ -59,6 +59,96 @@
 #define TERMINAL_OUTPUT_CAP_BYTES (4u * 1024u * 1024u)
 #define TERMINAL_OUTPUT_FRAME_RESERVE_BYTES (128u * 1024u)
 #define TERMINAL_OUTPUT_DRAIN_TIMEOUT_MS 250
+#define ENGINE_ERROR_DETAIL_MAX_BYTES 4096u
+#define ENGINE_ERROR_WIRE_MAX_BYTES (8u + ENGINE_ERROR_DETAIL_MAX_BYTES)
+
+static gboolean
+schedule_retry_at(gint64 now_us, gint64 *retry_us, guint *backoff_ms)
+{
+    guint delay_ms;
+
+    if (*retry_us)
+        return FALSE;
+    delay_ms = *backoff_ms ? *backoff_ms : RECONNECT_INITIAL_MS;
+    *retry_us = now_us + (gint64)delay_ms * 1000;
+    *backoff_ms = MIN(delay_ms * 2, RECONNECT_MAX_MS);
+    return TRUE;
+}
+
+static gchar *
+sanitize_engine_diagnostic(const gchar *detail)
+{
+    GString *safe = g_string_sized_new(strlen(detail));
+    const gchar *cursor = detail;
+
+    while (*cursor) {
+        gunichar character = g_utf8_get_char(cursor);
+        GUnicodeType type = g_unichar_type(character);
+
+        if (g_unichar_iscntrl(character) || type == G_UNICODE_FORMAT)
+            g_string_append_c(safe, '?');
+        else
+            g_string_append_unichar(safe, character);
+        cursor = g_utf8_next_char(cursor);
+    }
+    if (!safe->len)
+        g_string_append(safe, "engine error");
+    return g_string_free(safe, FALSE);
+}
+
+static gboolean
+decode_engine_error_payload(GBytes *payload,
+                            guint32 *code,
+                            gchar **safe_detail)
+{
+    MuxEngineCursor cursor;
+    g_autofree gchar *detail = NULL;
+    guint32 decoded_code = 0;
+    gsize payload_size;
+
+    g_return_val_if_fail(code != NULL, FALSE);
+    g_return_val_if_fail(safe_detail != NULL, FALSE);
+    *code = 0;
+    *safe_detail = NULL;
+    if (!payload)
+        return FALSE;
+    payload_size = g_bytes_get_size(payload);
+    if (payload_size < 8 || payload_size > ENGINE_ERROR_WIRE_MAX_BYTES)
+        return FALSE;
+
+    mux_engine_cursor_init(&cursor, payload);
+    if (!mux_engine_cursor_get_u32(&cursor, &decoded_code) ||
+        !decoded_code ||
+        !mux_engine_cursor_get_string(&cursor, &detail) ||
+        !mux_engine_cursor_done(&cursor) ||
+        strlen(detail) > ENGINE_ERROR_DETAIL_MAX_BYTES ||
+        !g_utf8_validate(detail, -1, NULL))
+        return FALSE;
+
+    *code = decoded_code;
+    *safe_detail = sanitize_engine_diagnostic(detail);
+    return TRUE;
+}
+
+#ifdef MUX_PANE_LOGIC_TEST
+
+gboolean
+mux_pane_test_schedule_retry_at(gint64 now_us,
+                                gint64 *retry_us,
+                                guint *backoff_ms)
+{
+    return schedule_retry_at(now_us, retry_us, backoff_ms);
+}
+
+gboolean
+mux_pane_test_decode_engine_error(GBytes *payload,
+                                  guint32 *code,
+                                  gchar **safe_detail)
+{
+    return decode_engine_error_payload(payload, code, safe_detail);
+}
+
+#else
 
 /*
  * The PTY queue is capped at 4 MiB. Clipboard and UI output stop at the
@@ -161,6 +251,10 @@ static void delete_image(Pane *pane);
 static void send_resize(Pane *pane);
 static void acknowledge_graphics_response(Pane *pane, guint image_id);
 static void redraw_clipboard_picker(Pane *pane);
+static void disconnect_engine(Pane *pane);
+static void retire_close_request(Pane *pane);
+static void handle_runtime_engine_error(Pane *pane,
+                                        const MuxEngineMessage *message);
 
 static void
 signal_resize(int signal_number)
@@ -418,6 +512,38 @@ terminal_write_critical(Pane *pane, const gchar *text)
 }
 
 static gboolean
+decode_engine_error_message(const MuxEngineMessage *message,
+                            guint32 *code,
+                            gchar **safe_detail)
+{
+    return message->flags == MUX_ENGINE_FLAG_NONE &&
+        decode_engine_error_payload(message->payload, code, safe_detail);
+}
+
+static void
+show_engine_diagnostic(Pane *pane,
+                       guint32 code,
+                       const gchar *safe_detail,
+                       gboolean reconnecting)
+{
+    g_autofree gchar *overlay = NULL;
+    const gchar *next_step = reconnecting
+        ? "The pane is reconnecting with bounded backoff."
+        : "Use the URL bar, reload, or close the pane.";
+
+    g_printerr("mux-pane: engine error %u: %s\n", code, safe_detail);
+    if (!pane->terminal_active)
+        return;
+    delete_image(pane);
+    overlay = g_strdup_printf(
+        "\033[2J\033[H\033[1;1HMux engine error (%u)\r\n\r\n%s\r\n\r\n%s\033[?25l",
+        code,
+        safe_detail,
+        next_step);
+    (void)terminal_write_critical(pane, overlay);
+}
+
+static gboolean
 clipboard_terminal_output(MuxPaneClipboard *clipboard,
                           GBytes *packet,
                           gpointer user_data,
@@ -500,13 +626,9 @@ muxd_socket_path(void)
 static void
 queue_retry(gint64 *retry_us, guint *backoff_ms)
 {
-    guint delay_ms;
-
-    if (*retry_us)
-        return;
-    delay_ms = *backoff_ms ? *backoff_ms : RECONNECT_INITIAL_MS;
-    *retry_us = g_get_monotonic_time() + (gint64)delay_ms * 1000;
-    *backoff_ms = MIN(delay_ms * 2, RECONNECT_MAX_MS);
+    (void)schedule_retry_at(g_get_monotonic_time(),
+                            retry_us,
+                            backoff_ms);
 }
 
 static void
@@ -538,6 +660,32 @@ retire_close_request(Pane *pane)
         pane->retired_close_serial = pane->close_request_serial;
     pane->close_request_serial = 0;
     pane->close_deadline_us = 0;
+}
+
+static void
+handle_runtime_engine_error(Pane *pane,
+                            const MuxEngineMessage *message)
+{
+    g_autofree gchar *safe_detail = NULL;
+    guint32 code = 0;
+    gboolean state_lost;
+
+    if (!decode_engine_error_message(message, &code, &safe_detail)) {
+        code = MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE;
+        safe_detail = g_strdup("malformed engine error response");
+        state_lost = TRUE;
+    } else {
+        state_lost = message->view_id == 0 ||
+            message->view_id != pane->view_id ||
+            code == MUX_ENGINE_REMOTE_ERROR_NOT_FOUND ||
+            code == MUX_ENGINE_REMOTE_ERROR_NOT_OWNER;
+    }
+    if (message->serial &&
+        message->serial == pane->close_request_serial)
+        retire_close_request(pane);
+    show_engine_diagnostic(pane, code, safe_detail, state_lost);
+    if (state_lost)
+        disconnect_engine(pane);
 }
 
 static void
@@ -655,6 +803,8 @@ ensure_engine(Pane *pane)
         (gchar *)"--ensure",
         (gchar *)"--profile",
         pane->profile,
+        (gchar *)"--socket",
+        pane->socket_path,
         NULL,
     };
     GError *error = NULL;
@@ -683,13 +833,7 @@ ensure_engine(Pane *pane)
     g_free(binary);
     g_free(directory);
     g_free(self);
-
-    for (guint attempt = 0; attempt < 100; attempt++) {
-        if (connect_engine(pane))
-            return TRUE;
-        g_usleep(20000);
-    }
-    return FALSE;
+    return connect_engine(pane);
 }
 
 static gboolean
@@ -1125,17 +1269,38 @@ receive_message(Pane *pane, MuxEngineMessage *message)
 
 static gboolean
 wait_for_message(Pane *pane,
-                 guint16 expected,
-                 MuxEngineMessage *message)
+                  guint16 expected,
+                  guint64 expected_serial,
+                  MuxEngineMessage *message)
 {
     for (;;) {
         if (!receive_message(pane, message))
             return FALSE;
-        if (message->type == expected)
-            return TRUE;
-        if (message->type == MUX_ENGINE_MESSAGE_ERROR) {
-            g_printerr("mux-pane: engine rejected startup\n");
+        if (message->type == expected) {
+            if (message->serial == expected_serial)
+                return TRUE;
+            g_printerr("mux-pane: out-of-order engine startup response\n");
             mux_engine_message_clear(message);
+            disconnect_engine(pane);
+            return FALSE;
+        }
+        if (message->type == MUX_ENGINE_MESSAGE_ERROR) {
+            g_autofree gchar *safe_detail = NULL;
+            guint32 code = 0;
+
+            if (message->serial == expected_serial &&
+                message->view_id == 0 &&
+                decode_engine_error_message(message,
+                                            &code,
+                                            &safe_detail)) {
+                g_printerr("mux-pane: engine rejected startup (%u): %s\n",
+                           code,
+                           safe_detail);
+            } else {
+                g_printerr("mux-pane: invalid engine startup error\n");
+            }
+            mux_engine_message_clear(message);
+            disconnect_engine(pane);
             return FALSE;
         }
         mux_engine_message_clear(message);
@@ -1147,10 +1312,14 @@ start_view(Pane *pane, const gchar *initial_uri)
 {
     MuxEngineMessage response = { 0 };
     GBytes *payload;
+    guint64 request_serial;
 
-    if (!send_hello(pane, initial_uri) ||
-        !wait_for_message(pane,
+    if (!send_hello(pane, initial_uri))
+        return FALSE;
+    request_serial = pane->next_serial;
+    if (!wait_for_message(pane,
                           MUX_ENGINE_MESSAGE_WELCOME,
+                          request_serial,
                           &response))
         return FALSE;
     pane->engine_handshake_complete = TRUE;
@@ -1170,12 +1339,13 @@ start_view(Pane *pane, const gchar *initial_uri)
     } else {
         payload = g_bytes_new(NULL, 0);
     }
+    request_serial = ++pane->next_serial;
     if (!send_message(pane,
                       MUX_ENGINE_MESSAGE_CREATE_VIEW,
                       pane->ephemeral ? MUX_ENGINE_FLAG_EPHEMERAL
                                       : MUX_ENGINE_FLAG_NONE,
                       0,
-                      ++pane->next_serial,
+                      request_serial,
                       payload)) {
         g_bytes_unref(payload);
         return FALSE;
@@ -1183,8 +1353,15 @@ start_view(Pane *pane, const gchar *initial_uri)
     g_bytes_unref(payload);
     if (!wait_for_message(pane,
                           MUX_ENGINE_MESSAGE_VIEW_CREATED,
+                          request_serial,
                           &response))
         return FALSE;
+    if (!response.view_id) {
+        g_printerr("mux-pane: engine returned an invalid view id\n");
+        mux_engine_message_clear(&response);
+        disconnect_engine(pane);
+        return FALSE;
+    }
     pane->view_id = response.view_id;
     pane->next_image_id++;
     if (!pane->next_image_id)
@@ -2060,7 +2237,8 @@ handle_engine_message(Pane *pane)
 
     if (!receive_message(pane, &message))
         return;
-    if (message.view_id && message.view_id != pane->view_id) {
+    if (message.type != MUX_ENGINE_MESSAGE_ERROR &&
+        message.view_id && message.view_id != pane->view_id) {
         mux_engine_message_clear(&message);
         return;
     }
@@ -2161,6 +2339,7 @@ handle_engine_message(Pane *pane)
         break;
     }
     case MUX_ENGINE_MESSAGE_ERROR:
+        handle_runtime_engine_error(pane, &message);
         break;
     default:
         break;
@@ -3708,3 +3887,5 @@ main(int argc, char **argv)
     pane_clear(&pane);
     return 0;
 }
+
+#endif

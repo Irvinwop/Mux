@@ -87,7 +87,7 @@ package_fix() {
       printf '%s' "install GLib development files providing $1 (Arch: glib2)"
       ;;
     wpe-webkit-2.0|wpe-platform-2.0)
-      printf '%s' "install WPE WebKit built with WPEPlatform enabled, providing $1 >= 2.52 (Arch: wpewebkit)"
+      printf '%s' "install WPE WebKit built with WPEPlatform enabled, providing $1 >= 2.52.5 (Arch: wpewebkit)"
       ;;
   esac
 }
@@ -132,8 +132,8 @@ fi
 
 check_package glib-2.0 2.74
 check_package gio-2.0 2.74
-check_package wpe-webkit-2.0 2.52
-check_package wpe-platform-2.0 2.52
+check_package wpe-webkit-2.0 2.52.5
+check_package wpe-platform-2.0 2.52.5
 
 if [[ -d /dev/shm && -w /dev/shm ]]; then
   ok '/dev/shm is writable for raw frame transport'

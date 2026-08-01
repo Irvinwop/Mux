@@ -1,8 +1,11 @@
 # Installing Mux v0.1
 
 Mux v0.1 is a personal Linux preview. A usable installation needs Kitty 0.45 or
-newer and a WPE WebKit build that exposes the WPEPlatform 2.52 API. WPE
-WebKit's version number alone is not sufficient.
+newer and WPE WebKit built with WPEPlatform, with both pkg-config modules at
+2.52.5 or newer. Versions before 2.52.5 are affected by the official
+[WSA-2026-0004 advisory](https://www.webkitgtk.org/security/WSA-2026-0004.html).
+WPE WebKit 2.52.5 is the corresponding
+[stable release](https://wpewebkit.org/release/wpewebkit-2.52.5.html).
 
 ## Release-qualified path: Arch family
 
@@ -39,15 +42,15 @@ environment:
 - Kitty 0.45 or newer with the `kitten` helper
 - Meson, Ninja, and pkg-config
 - GLib and GIO 2.74 or newer, including development metadata
-- WPE WebKit 2.52 or newer built with WPEPlatform enabled
+- WPE WebKit and WPEPlatform 2.52.5 or newer
 - GStreamer plugins needed by the sites you use
 - General-purpose fonts
 
 Confirm the dependency boundary directly:
 
 ```sh
-pkg-config --atleast-version=2.52 wpe-webkit-2.0
-pkg-config --atleast-version=2.52 wpe-platform-2.0
+pkg-config --atleast-version=2.52.5 wpe-webkit-2.0
+pkg-config --atleast-version=2.52.5 wpe-platform-2.0
 ./doctor
 ```
 
@@ -101,6 +104,56 @@ only changed files, ensures the control daemon is running, and opens a dedicated
 Kitty instance. It does not install files globally or write build products into
 the checkout.
 
+## Full-stack runtime smoke
+
+The release gate needs Weston, Mesa's software stack, Python 3, D-Bus, and
+procps in addition to the normal Mux dependencies. On Arch Linux:
+
+```sh
+sudo pacman -Syu --needed weston mesa dbus python procps-ng
+```
+
+Build through the normal launcher, then run the smoke as your ordinary desktop
+user:
+
+```sh
+./mux ctl status
+./runtime-smoke
+```
+
+`runtime-smoke` computes the exact
+`$XDG_CACHE_HOME/mux/checkouts/<checkout-sha256>/wpe-kitty` directory used by
+`./mux`. A separately built tree can be selected explicitly:
+
+```sh
+MUX_BIN_DIR="$PWD/build/runtime-smoke" ./runtime-smoke
+```
+
+The command owns a 120-second default timeout and bounded cleanup. It creates
+0700 XDG, profile, cache, and runtime directories; uses an ephemeral profile;
+starts a D-Bus session when the caller has none; and runs Weston headless with
+Pixman. Loopback HTTP pages are used instead of `data:` URIs because Mux rejects
+that scheme.
+
+The gate starts foreground muxd and mux-engine processes followed by a real
+Kitty -> mux-layer -> mux-pane and mux-bar stack. It proves JavaScript page load
+through title metadata in `muxctl list`, process presence, physical focus and
+layer changes, targeted navigation to a second fixture, and graceful `Ctrl+Q`
+for both panes. Kitty commands use encrypted blank-password remote control with
+the `KITTY_PUBLIC_KEY` read from the pane environment. Only the temporary Kitty
+config copy gains `send-key` and `get-text`, which are used for the close path
+and failure diagnostics.
+
+This is not a pixel oracle. Mux does not expose Kitty's graphics `FRAME_ACK`, so
+the gate cannot prove that Kitty displayed a frame. It also does not cover a
+real GPU, live sites, media, desktop keyboard conflicts, endurance, or resource
+budgets.
+
+Do not use `sudo ./runtime-smoke`. Normal Linux use must be non-root. The GitHub
+job is the sole root path: its disposable Arch container is privileged and uses
+the host user namespace so WebKit's nested bubblewrap sandbox remains enabled,
+and it opts in with both `CI=true` and `MUX_SMOKE_ALLOW_ROOT_CI=1`.
+
 ## Diagnostics
 
 Run:
@@ -125,8 +178,13 @@ files.
 
 ## CI boundary
 
-The Linux workflow runs the doctor in an Arch container, configures the real
-WPE project as a warning-free release build, compiles all Meson targets, and
-runs every registered native test with GLib warnings made fatal. It does not
-build the flake's custom WPE derivation, launch Kitty, exercise graphics
-presentation, or prove compatibility with live websites.
+The Linux workflow retains its Arch warning-free build and fatal-GLib native
+test job. A separate `Runtime smoke` job builds again in a privileged Arch
+container with host user namespaces and 2 GiB of shared memory, then runs
+`./runtime-smoke`. The outer privilege is required for nested WebKit bubblewrap;
+the gate refuses the environment variable that disables WebKit sandboxing.
+
+CI now launches real Weston, Kitty, WPE, and every Mux runtime process against
+loopback fixtures. It still does not build the flake's custom WPE derivation,
+observe a Kitty pixel acknowledgement, use a physical display/GPU, or prove
+compatibility with live websites.
