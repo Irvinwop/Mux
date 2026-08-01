@@ -11,6 +11,7 @@ typedef struct {
 
 struct _MuxPaneClipboard {
     gchar *profile;
+    gchar *broker_profile;
     gboolean ephemeral;
     guint64 view_id;
     GMainContext *context;
@@ -38,6 +39,21 @@ struct _MuxPaneClipboard {
 };
 
 static gboolean connect_broker(MuxPaneClipboard *clipboard, GError **error);
+
+static gchar *
+broker_profile_name(const gchar *profile, gboolean ephemeral)
+{
+    const gchar *prefix = ephemeral ? "private:" : "profile:";
+    gsize prefix_length = strlen(prefix);
+
+    if (strlen(profile) <=
+        MUX_CLIPBOARD_HISTORY_MAX_PROFILE - prefix_length)
+        return g_strconcat(prefix, profile, NULL);
+
+    g_autofree gchar *digest = g_compute_checksum_for_string(
+        G_CHECKSUM_SHA256, profile, -1);
+    return g_strconcat(prefix, digest, NULL);
+}
 
 static void
 summary_metadata_free(gpointer data)
@@ -418,7 +434,7 @@ connect_broker(MuxPaneClipboard *clipboard, GError **error)
     clipboard->client = NULL;
     clipboard->broker_ready = FALSE;
     clipboard->transport = mux_clipboard_broker_client_transport_connect(
-        clipboard->profile,
+        clipboard->broker_profile,
         clipboard->ephemeral
             ? MUX_CLIPBOARD_HISTORY_EPHEMERAL
             : MUX_CLIPBOARD_HISTORY_MEMORY,
@@ -508,6 +524,7 @@ mux_pane_clipboard_new(
 
     clipboard = g_new0(MuxPaneClipboard, 1);
     clipboard->profile = g_strdup(profile);
+    clipboard->broker_profile = broker_profile_name(profile, ephemeral);
     clipboard->ephemeral = ephemeral;
     clipboard->view_id = view_id;
     clipboard->context = g_main_context_ref(context);
@@ -576,6 +593,7 @@ mux_pane_clipboard_free(MuxPaneClipboard *clipboard)
                     mux_clipboard_snapshot_unref);
     g_free(clipboard->pending_origin);
     g_free(clipboard->selected_origin);
+    g_free(clipboard->broker_profile);
     g_free(clipboard->profile);
     g_main_context_unref(clipboard->context);
     if (clipboard->user_data_destroy != NULL)

@@ -1,110 +1,146 @@
 # Mux
 
-Mux is a personal, Kitty-native browser multiplexer. Kitty supplies tabs,
-splits, layouts, keyboard routing, and trusted overlays. WPE WebKit remains the
-real browser engine, while Mux owns the browser control plane and presents each
-page inside a Kitty pane.
+Mux v0.1 is a personal preview of a Kitty-native browser multiplexer for
+Linux. Kitty supplies tabs, splits, windows, layouts, and graphics
+presentation. WPE WebKit supplies the browser engine. Mux connects them with a
+small control daemon, one shared engine per profile, and a thin process in each
+browser pane.
 
-Mux does not encode screenshots or stream PNG files. WebKit damage is copied as
-raw RGBA through short-lived POSIX shared-memory objects and applied to one
-Kitty graphics image in place.
+This is not a replacement browser engine and it does not stream screenshots.
+The WPE path copies damaged raw RGBA regions through short-lived POSIX shared
+memory and updates an existing Kitty graphics image.
 
-## Quick start
+## Status
 
-Mux currently targets a local Linux desktop with Kitty, GLib 2.74, and WPE
-WebKit 2.52 or newer.
+The real WPE implementation builds as a collection of native processes and has
+unit tests for its clipboard, protocol, local transport, extension routing,
+and URI-input components. The interactive browser paths have not all been
+validated end to end on a Linux desktop. Treat v0.1 as personal experimental
+software, not as a secure daily-driver browser.
+
+## Requirements
+
+- Linux on x86-64 or ARM64
+- A Wayland or X11 desktop session
+- Kitty, including `kitten`
+- A C17 compiler, Meson, Ninja, and pkg-config
+- GLib and GIO 2.74 or newer
+- WPE WebKit 2.52 or newer, built with WPEPlatform enabled
+- Writable POSIX shared memory at `/dev/shm`
+
+The decisive dependency check is that pkg-config can find both
+`wpe-webkit-2.0 >= 2.52` and `wpe-platform-2.0 >= 2.52`.
+
+## Start in one command
+
+On Arch Linux or Arch Linux ARM, `setup` reconciles the required packages,
+runs the environment doctor, builds the WPE implementation incrementally, and
+opens its dedicated Kitty window:
 
 ```sh
 ./setup
-```
-
-`setup` installs packages using `pacman`, `apt-get`, or `dnf`, runs the
-environment doctor, builds the project, and launches its dedicated Kitty
-instance. Pass an initial page directly:
-
-```sh
 ./setup https://example.com
 ```
 
-After dependencies are installed, normal starts are incremental:
+On other distributions, install the requirements yourself and use the same
+command. The script will not guess package names for an unmaintained distro
+recipe.
+
+With Nix flakes, the default app builds and runs the same WPE implementation,
+not the old synthetic Kitty transport:
+
+```sh
+nix run . -- https://example.com
+```
+
+After source dependencies are installed, normal starts use the incremental
+launcher:
 
 ```sh
 ./mux
 ./mux https://example.com
+./mux ctl status
 ```
 
-Run `./doctor` for a read-only dependency report. Detailed package information
-is in [docs/install.md](docs/install.md).
+Run `./doctor` for a read-only, actionable dependency report. See
+[Installation](docs/install.md) for package and Nix details.
 
-## Process model
+## Current implementation
 
-| Process | Responsibility |
-| --- | --- |
-| `muxd` | Control socket, logical layers, pane routing, and profile clipboard histories. |
-| `mux-engine` | Profile-specific WPE display, WebKit session, network state, and page ownership. |
-| `mux-pane` | One Kitty pane's input, raw-frame presentation, clipboard link, and trusted UI overlay. |
-| `mux-bar` | Global URL and status bar that follows the focused pane. |
-| `mux-layer` | Creates and restores a logical collection of browser panes. |
-| `muxctl` | Scriptable control client for navigation and layout operations. |
-| Kitty | Tabs, splits, OS windows, layouts, and graphics presentation. |
+The v0.1 code currently wires these paths:
 
-WebKit still uses its sandboxed web, network, and GPU processes. Centralizing
-browser state does not collapse web content into `muxd` or `mux-engine`.
+- A central `muxd` control process with logical layers and pane routing.
+- A profile-specific WPE engine that can own multiple page views.
+- Kitty pane processes for frame presentation and input forwarding.
+- A focus-following global URL/status bar.
+- URL navigation and search-query resolution.
+- Keyboard, pointer, focus, resize, and high-DPI input transport.
+- Clipboard synchronization and bounded, profile-scoped clipboard history.
+- Trusted UI requests for dialogs, permissions, authentication, file choices,
+  downloads, menus, popups, notifications, and renderer crashes.
 
-## Browser behavior
+These are implemented code paths, not a claim that every site or interaction
+has passed interactive testing. Clipboard snapshots can retain related text,
+image, and binary MIME variants, but Mux can only record clipboard traffic it
+actually observes.
 
-The current implementation includes:
-
-- Persistent and ephemeral WebKit profiles.
-- Multiple page views sharing one profile engine.
-- Logical layers across Kitty tabs and windows.
-- A focus-aware global URL bar.
-- Keyboard, pointer, focus, resize, and high-DPI input forwarding.
-- Script dialogs, permission decisions, HTTP authentication, and file choosers.
-- Permission-gated desktop notifications with click and close reporting.
-- Downloads, popup/new-window attachment, native option menus, and context menus.
-- Web-process crash prompts with reload and close actions.
-- Full-MIME clipboard synchronization and profile-isolated clipboard history.
-- Pin, delete, clear, select, and fuzzy-pick clipboard-history operations.
-
-Clipboard snapshots retain every observed MIME representation atomically,
-including images and arbitrary binary data. History is memory-only and bounded;
-pages can access only the current clipboard through WebKit's normal permission
-rules and cannot enumerate history.
-
-## Default controls
+## Intended controls
 
 | Key | Action |
 | --- | --- |
 | `Ctrl+L` | Edit the global URL bar. |
 | `Ctrl+R` | Reload the focused page. |
 | `Alt+Left` / `Alt+Right` | Navigate page history. |
-| `Ctrl+Shift+V` | Open clipboard history. |
-| `Ctrl+Shift+I` | Toggle Web Inspector. |
-| `Ctrl+Shift+Enter` | Open another split. |
+| `Ctrl+Shift+V` | Open profile clipboard history. |
+| `Ctrl+Shift+P` | Open commands, bookmarks, history, and recently closed pages. |
+| `Ctrl+D` | Add or remove a bookmark for the current page. |
+| `Ctrl+Shift+Enter` | Open another browser split. |
 | `Ctrl+Shift+T` | Open another browser layer/tab. |
 | `Ctrl+Shift+N` | Open another Kitty OS window. |
 | `Ctrl+Q` | Close the focused pane. |
 
-## Runtime and storage
+These bindings still need a full conflict and behavior pass against stock and
+user-customized Kitty configurations.
 
-The root `mux` launcher configures a release build under
-`$XDG_CACHE_HOME/mux/wpe-kitty`, compiles only changed sources, ensures `muxd`
-is running, and starts Kitty with [kitty/wpe.conf](kitty/wpe.conf). The checkout
-does not accumulate build artifacts.
+## Process model
 
-Profile data follows XDG data and cache directories. Authenticated Unix sockets
-use `$XDG_RUNTIME_DIR`; when it is unavailable, Mux creates an owner-only
-fallback below `/tmp`.
+| Process | Responsibility |
+| --- | --- |
+| `muxd` | Control socket, logical layers, pane routing, and clipboard broker. |
+| `mux-engine` | WPE display, WebKit session, network state, and page ownership for one profile. |
+| `mux-pane` | Input forwarding, raw-frame presentation, clipboard link, and trusted overlays for one Kitty pane. |
+| `mux-bar` | URL and status bar that follows the focused pane. |
+| `mux-layer` | Starts a logical collection of browser panes. |
+| `muxctl` | Scriptable local control client. |
+| Kitty | Tabs, splits, OS windows, layouts, and graphics presentation. |
 
-## Project status
+WebKit continues to use its own sandboxed web, network, and GPU processes.
+Browser content does not execute inside `muxd`.
 
-The browser/control source is implemented. The remaining release gate is an
-interactive Linux exercise against WPE WebKit 2.52 and Kitty, including frame
-presentation, splits, clipboard traffic, menus, downloads, and process restart.
-The CI workflow compiles every Meson target in an Arch Linux container but does
-not claim an interactive Kitty graphics test.
+## Known v0.1 limitations
 
-The design rationale is in [docs/architecture.md](docs/architecture.md), and
-the current WPE runtime path is documented in
-[docs/running-wpe.md](docs/running-wpe.md).
+- Linux and Kitty are mandatory; macOS and other terminal emulators are not
+  supported.
+- Automatic dependency installation is maintained only for Arch-family
+  systems.
+- Workspace metadata is persisted, but restored offline panes are not yet
+  relaunched automatically after a full desktop logout.
+- In-flight trusted UI requests are cancelled when an engine crashes.
+- Layers are primarily logical: moving a view does not yet guarantee a
+  physical Kitty move.
+- Closing a pane can bypass a page's before-unload flow.
+- Browser shortcuts and trusted overlays still require interactive coverage.
+- Site compatibility, media codecs, downloads, uploads, permissions, popups,
+  notifications, clipboard bridging, and renderer recovery are not yet
+  release-qualified end to end.
+
+## Runtime storage
+
+The source launcher keeps its release build under
+`$XDG_CACHE_HOME/mux/wpe-kitty` and recompiles only changed sources. Profile
+data follows XDG data and cache directories. Authenticated local sockets use
+`$XDG_RUNTIME_DIR`; when it is absent, Mux uses an owner-only fallback below
+`/tmp`.
+
+See [Running the WPE implementation](docs/running-wpe.md) for the runtime
+boundary and [Architecture](docs/architecture.md) for design rationale.

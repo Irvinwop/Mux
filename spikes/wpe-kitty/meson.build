@@ -1,7 +1,7 @@
 project(
   'mux-wpe-kitty',
   'c',
-  version: '0.2.0',
+  version: '0.1.0',
   default_options: [
     'c_std=c17',
     'warning_level=3',
@@ -43,6 +43,7 @@ executable(
   'muxd',
   [
     'src/muxd.c',
+    'src/mux-session-state.c',
     'src/mux-protocol.c',
     'muxd-clipboard.c',
     'mux-clipboard.c',
@@ -60,7 +61,7 @@ executable(
     'mux-local-endpoint.c',
   ],
   dependencies: [glib_dep, gio_dep],
-  install: false,
+  install: true,
 )
 
 executable(
@@ -70,7 +71,7 @@ executable(
     'src/mux-protocol.c',
   ],
   dependencies: [glib_dep],
-  install: false,
+  install: true,
 )
 
 executable(
@@ -80,14 +81,14 @@ executable(
     'src/mux-protocol.c',
   ],
   dependencies: [glib_dep],
-  install: false,
+  install: true,
 )
 
 executable(
   'mux-layer',
   'src/mux-layer.c',
   dependencies: [glib_dep],
-  install: false,
+  install: true,
 )
 
 engine_dependencies = [
@@ -113,12 +114,14 @@ executable(
     'mux-file-chooser-engine.c',
     'mux-popup-engine.c',
     'mux-browser-affordance-engine.c',
+    'mux-browser-store.c',
     'mux-input-method.c',
     'mux-notification-engine.c',
     'mux-navigation-policy.c',
     'mux-uri.c',
   ],
   dependencies: engine_dependencies,
+  install: true,
 )
 
 pane_dependencies = [
@@ -159,6 +162,7 @@ executable(
     'mux-kitty-chooser.c',
   ],
   dependencies: pane_dependencies,
+  install: true,
 )
 clipboard_history_test = executable(
   'test-clipboard-history',
@@ -257,3 +261,37 @@ uri_test = executable(
 )
 
 test('uri', uri_test)
+
+permission_store_test = executable(
+  'test-permission-store',
+  [
+    'tests/test-permission-store.c',
+    'mux-permission-store.c',
+  ],
+  dependencies: [glib_dep, gio_dep],
+)
+
+test('permission-store', permission_store_test)
+
+session_state_test = executable(
+  'test-session-state',
+  [
+    'tests/test-session-state.c',
+    'src/mux-session-state.c',
+  ],
+  include_directories: include_directories('src'),
+  dependencies: [glib_dep, gio_dep],
+)
+
+test('session-state', session_state_test)
+
+browser_store_test = executable(
+  'test-browser-store',
+  [
+    'tests/test-browser-store.c',
+    'mux-browser-store.c',
+  ],
+  dependencies: [glib_dep, gio_dep],
+)
+
+test('browser-store', browser_store_test)

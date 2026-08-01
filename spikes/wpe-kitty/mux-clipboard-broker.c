@@ -89,6 +89,7 @@ mux_clipboard_broker_set_profile_mode(MuxClipboardBroker *broker,
 {
     ProfileClipboard *state;
     MuxClipboardHistory *history;
+    MuxClipboardHistoryScope scope;
 
     g_return_val_if_fail(broker != NULL, FALSE);
     if (!valid_profile_name(profile) ||
@@ -112,7 +113,15 @@ mux_clipboard_broker_set_profile_mode(MuxClipboardBroker *broker,
         return FALSE;
     }
 
-    history = mux_clipboard_history_new(profile, mode);
+    scope = mode == MUX_CLIPBOARD_HISTORY_MEMORY
+                ? MUX_CLIPBOARD_HISTORY_SCOPE_PERSISTENT
+                : mode == MUX_CLIPBOARD_HISTORY_EPHEMERAL
+                      ? MUX_CLIPBOARD_HISTORY_SCOPE_PRIVATE
+                      : MUX_CLIPBOARD_HISTORY_SCOPE_EPHEMERAL;
+    history = mux_clipboard_history_new_for_namespace(profile,
+                                                      profile,
+                                                      scope,
+                                                      mode);
     if (history == NULL) {
         g_set_error_literal(error,
                             G_IO_ERROR,

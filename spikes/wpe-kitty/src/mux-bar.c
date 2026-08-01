@@ -79,13 +79,23 @@ static gchar *display_text(const gchar *text)
     for (const gchar *cursor = valid; *cursor;
          cursor = g_utf8_next_char(cursor)) {
         gunichar codepoint = g_utf8_get_char(cursor);
+        GUnicodeType type = g_unichar_type(codepoint);
 
-        if (g_unichar_iscntrl(codepoint) ||
-            g_unichar_type(codepoint) == G_UNICODE_FORMAT)
+        if (!g_unichar_isprint(codepoint) ||
+            type == G_UNICODE_FORMAT ||
+            type == G_UNICODE_LINE_SEPARATOR ||
+            type == G_UNICODE_PARAGRAPH_SEPARATOR)
             continue;
         g_string_append_unichar(clean, codepoint);
     }
     return g_string_free(clean, FALSE);
+}
+
+static guint codepoint_columns(gunichar codepoint)
+{
+    if (g_unichar_combining_class(codepoint) != 0)
+        return 0;
+    return g_unichar_iswide(codepoint) ? 2 : 1;
 }
 
 static BarView *active_view(Bar *bar)
@@ -95,7 +105,7 @@ static BarView *active_view(Bar *bar)
         : NULL;
 }
 
-static void append_padded(
+static guint append_padded(
     GString *output,
     const gchar *prefix,
     const gchar *value,
@@ -105,11 +115,20 @@ static void append_padded(
     guint used = 0;
     for (const gchar *cursor = prefix; *cursor && used < columns; cursor++, used++)
         g_string_append_c(output, *cursor);
-    for (const gchar *cursor = clean; *cursor && used < columns; cursor++, used++)
-        g_string_append_c(output, *cursor);
+    for (const gchar *cursor = clean; *cursor;) {
+        gunichar codepoint = g_utf8_get_char(cursor);
+        guint width = codepoint_columns(codepoint);
+        if (width > columns - used)
+            break;
+        g_string_append_unichar(output, codepoint);
+        used += width;
+        cursor = g_utf8_next_char(cursor);
+    }
+    guint content_columns = used;
     while (used++ < columns)
         g_string_append_c(output, ' ');
     g_free(clean);
+    return content_columns;
 }
 
 static void redraw(Bar *bar)
@@ -121,11 +140,16 @@ static void redraw(Bar *bar)
 
     BarView *view = active_view(bar);
     const gchar *uri = view && view->uri ? view->uri : "no active view";
+    const gchar *title = view && view->title && *view->title
+        ? view->title
+        : "No active page";
     gchar *header = g_strdup_printf(
-        " MUX / %s  [%u view%s]",
+        " MUX/%s [%u]  C-l:url  C-S-p:cmd  C-S-v:clip | %s",
         bar->layer ? bar->layer : "main",
         g_hash_table_size(bar->views),
-        g_hash_table_size(bar->views) == 1 ? "" : "s");
+        title);
+    guint edit_columns = 0;
+    guint rendered_rows = 1;
 
     GString *output = g_string_new(
         "\033[H\033[48;2;8;22;19m\033[38;2;133;220;170m");
@@ -134,17 +158,39 @@ static void redraw(Bar *bar)
         g_string_append(
             output,
             "\r\n\033[48;2;17;34;29m\033[38;2;222;246;232m");
-        append_padded(
+        edit_columns = append_padded(
             output,
-            bar->editing ? " > " : "   ",
+            bar->editing ? " URL> " : " URL  ",
             bar->editing ? bar->edit->str : uri,
             bar->columns);
+        rendered_rows = 2;
     }
-    for (guint row = 2; row < bar->rows; row++) {
+    if (bar->rows > 2) {
+        g_string_append(
+            output,
+            "\r\n\033[48;2;8;22;19m\033[38;2;154;179;168m");
+        append_padded(
+            output,
+            " ",
+            "C-d bookmark  C-S-enter split  C-S-t new layer  A-hjkl pane  A-[ / ] layer",
+            bar->columns);
+        rendered_rows = 3;
+    }
+    for (guint row = rendered_rows; row < bar->rows; row++) {
         g_string_append(output, "\r\n");
         append_padded(output, "", "", bar->columns);
     }
-    g_string_append(output, bar->editing ? "\033[?25h" : "\033[?25l");
+    if (bar->editing && bar->rows > 1) {
+        guint cursor_column = edit_columns < bar->columns
+            ? edit_columns + 1
+            : bar->columns;
+        g_string_append_printf(
+            output,
+            "\033[2;%uH\033[?25h",
+            cursor_column);
+    } else {
+        g_string_append(output, "\033[?25l");
+    }
     output_text(output->str);
 
     g_string_free(output, TRUE);

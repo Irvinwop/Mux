@@ -7,6 +7,7 @@
 #include "mux-file-chooser-engine.h"
 #include "mux-popup-engine.h"
 #include "mux-browser-affordance-engine.h"
+#include "mux-browser-store.h"
 #include "mux-input-method.h"
 #include "mux-notification-engine.h"
 #include "mux-navigation-policy.h"
@@ -41,11 +42,39 @@
 #define MUX_ENGINE_MAX_KITTY_ID_BYTES 128u
 #define MUX_ENGINE_MAX_URI_BYTES (16u * 1024u)
 #define MUX_ENGINE_TEXT_SHORTCUT_MODIFIERS \
-    ((1u << 0) | (1u << 2) | (1u << 3))
+    (WPE_MODIFIER_KEYBOARD_CONTROL | \
+     WPE_MODIFIER_KEYBOARD_ALT | \
+     WPE_MODIFIER_KEYBOARD_META)
+#define MUX_ENGINE_KEY_LEFT 0xff51u
+#define MUX_ENGINE_KEY_RIGHT 0xff53u
+#define MUX_ENGINE_PALETTE_BOOKMARKS 32U
+#define MUX_ENGINE_PALETTE_CLOSED 32U
+#define MUX_ENGINE_PALETTE_HISTORY 96U
 
 typedef struct _Engine Engine;
 typedef struct _Client Client;
 typedef struct _EngineView EngineView;
+
+typedef enum {
+    BROWSER_ACTION_NONE,
+    BROWSER_ACTION_BACK,
+    BROWSER_ACTION_FORWARD,
+    BROWSER_ACTION_RELOAD,
+    BROWSER_ACTION_STOP,
+    BROWSER_ACTION_TOGGLE_BOOKMARK,
+    BROWSER_ACTION_REOPEN_LAST,
+    BROWSER_ACTION_LOAD_URI,
+} BrowserActionKind;
+
+typedef struct {
+    BrowserActionKind kind;
+    gchar *uri;
+} BrowserPaletteAction;
+
+typedef struct {
+    EngineView *view;
+    GPtrArray *actions;
+} BrowserPalette;
 
 typedef struct {
     guint x;
@@ -117,6 +146,7 @@ struct _Engine {
     MuxPermissionStore *ephemeral_permission_store;
     MuxDownloadManager *download_manager;
     MuxDownloadManager *ephemeral_download_manager;
+    MuxBrowserStore *browser_store;
     WebKitWebContext *web_context;
     WebKitNetworkSession *persistent_session;
     WebKitNetworkSession *ephemeral_session;
@@ -1495,12 +1525,31 @@ view_send_metadata(EngineView *view)
 }
 
 static void
+view_record_navigation(EngineView *view)
+{
+    const gchar *uri;
+    const gchar *title;
+
+    if (!view->engine->browser_store || !view->web_view || !view->id)
+        return;
+    uri = webkit_web_view_get_uri(view->web_view);
+    title = webkit_web_view_get_title(view->web_view);
+    mux_browser_store_record_navigation(view->engine->browser_store,
+                                        view->id,
+                                        view->ephemeral,
+                                        uri,
+                                        title);
+}
+
+static void
 view_property_changed(GObject *object, GParamSpec *spec, gpointer data)
 {
     EngineView *view = data;
 
     (void)object;
-    (void)spec;
+    if (g_str_equal(g_param_spec_get_name(spec), "uri") ||
+        g_str_equal(g_param_spec_get_name(spec), "title"))
+        view_record_navigation(view);
     view_send_metadata(view);
 }
 
@@ -1514,6 +1563,9 @@ view_load_changed(WebKitWebView *web_view,
     (void)web_view;
     if (load_event == WEBKIT_LOAD_STARTED)
         view->fullscreen = FALSE;
+    if (load_event == WEBKIT_LOAD_COMMITTED ||
+        load_event == WEBKIT_LOAD_FINISHED)
+        view_record_navigation(view);
     view_send_metadata(view);
 }
 
@@ -1548,6 +1600,9 @@ engine_view_free(gpointer data)
         return;
     if (view->owner && view->owner->view_count)
         view->owner->view_count--;
+    if (view->engine && view->engine->browser_store && view->id)
+        mux_browser_store_close_view(view->engine->browser_store,
+                                     view->id);
     engine_view_reset_surface(view);
     g_clear_pointer(&view->popup_manager, mux_popup_manager_free);
     g_clear_pointer(&view->file_chooser_bridge,
@@ -2029,6 +2084,7 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
                      "load-changed",
                      G_CALLBACK(view_load_changed),
                      view);
+    view_record_navigation(view);
 
     mux_engine_builder_init(&builder);
     mux_engine_builder_put_u32(&builder, width);
@@ -2208,6 +2264,395 @@ handle_navigate(Client *client, const MuxEngineMessage *request)
     return !client->failed;
 }
 
+static void
+browser_palette_action_free(BrowserPaletteAction *action)
+{
+    if (!action)
+        return;
+    g_free(action->uri);
+    g_free(action);
+}
+
+static void
+browser_palette_free(BrowserPalette *palette)
+{
+    if (!palette)
+        return;
+    g_ptr_array_unref(palette->actions);
+    g_free(palette);
+}
+
+static gchar *
+browser_label_part(const gchar *value, gsize maximum)
+{
+    g_autofree gchar *valid = g_utf8_make_valid(value ? value : "", -1);
+    gsize length = strlen(valid);
+
+    if (length <= maximum)
+        return g_steal_pointer(&valid);
+    length = maximum;
+    while (length && !g_utf8_validate(valid, length, NULL))
+        length--;
+    return g_strndup(valid, length);
+}
+
+static gchar *
+browser_entry_label(const gchar *category, const MuxBrowserEntry *entry)
+{
+    g_autofree gchar *title = browser_label_part(entry->title, 160);
+    g_autofree gchar *uri = browser_label_part(entry->uri, 300);
+
+    if (!*title || g_str_equal(title, uri))
+        return g_strdup_printf("%s  %s", category, uri);
+    return g_strdup_printf("%s  %s | %s", category, title, uri);
+}
+
+static gboolean
+browser_palette_add(BrowserPalette *palette,
+                    GPtrArray *choices,
+                    BrowserActionKind kind,
+                    const gchar *uri,
+                    guint32 flags,
+                    const gchar *label)
+{
+    BrowserPaletteAction *action = g_new0(BrowserPaletteAction, 1);
+    guint32 id;
+
+    if (choices->len >= MUX_UI_MAX_CHOICES) {
+        g_free(action);
+        return FALSE;
+    }
+    id = palette->actions->len;
+
+    action->kind = kind;
+    action->uri = g_strdup(uri);
+    g_ptr_array_add(palette->actions, action);
+    g_ptr_array_add(choices, mux_ui_choice_new(id, flags, label));
+    return TRUE;
+}
+
+static guint
+browser_palette_section_budget(const GPtrArray *choices,
+                               const GPtrArray *entries)
+{
+    guint remaining;
+
+    if (!entries->len || choices->len >= MUX_UI_MAX_CHOICES - 1)
+        return 0;
+    remaining = MUX_UI_MAX_CHOICES - choices->len - 1;
+    return MIN(entries->len, remaining);
+}
+
+static gboolean
+browser_load_user_input(EngineView *view,
+                        const gchar *input,
+                        GError **error)
+{
+    g_autofree gchar *normalized = mux_uri_resolve_user_input(
+        input,
+        g_getenv(MUX_URI_SEARCH_ENV),
+        error);
+
+    if (!normalized)
+        return FALSE;
+    webkit_web_view_load_uri(view->web_view, normalized);
+    return TRUE;
+}
+
+static gboolean
+browser_palette_selected(guint32 choice_id,
+                         gpointer user_data,
+                         GError **error)
+{
+    BrowserPalette *palette = user_data;
+    EngineView *view = palette->view;
+    BrowserPaletteAction *action;
+
+    if (choice_id >= palette->actions->len) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "browser command choice is out of range");
+        return FALSE;
+    }
+    action = g_ptr_array_index(palette->actions, choice_id);
+    switch (action->kind) {
+    case BROWSER_ACTION_BACK:
+        if (webkit_web_view_can_go_back(view->web_view))
+            webkit_web_view_go_back(view->web_view);
+        return TRUE;
+    case BROWSER_ACTION_FORWARD:
+        if (webkit_web_view_can_go_forward(view->web_view))
+            webkit_web_view_go_forward(view->web_view);
+        return TRUE;
+    case BROWSER_ACTION_RELOAD:
+        webkit_web_view_reload(view->web_view);
+        return TRUE;
+    case BROWSER_ACTION_STOP:
+        webkit_web_view_stop_loading(view->web_view);
+        return TRUE;
+    case BROWSER_ACTION_TOGGLE_BOOKMARK: {
+        const gchar *uri = webkit_web_view_get_uri(view->web_view);
+        const gchar *title = webkit_web_view_get_title(view->web_view);
+        gboolean bookmarked = mux_browser_store_is_bookmarked(
+            view->engine->browser_store,
+            view->ephemeral,
+            uri);
+
+        return mux_browser_store_set_bookmarked(
+            view->engine->browser_store,
+            view->ephemeral,
+            uri,
+            title,
+            !bookmarked,
+            error);
+    }
+    case BROWSER_ACTION_REOPEN_LAST: {
+        g_autoptr(MuxBrowserEntry) entry =
+            mux_browser_store_take_recently_closed(
+                view->engine->browser_store,
+                view->ephemeral);
+
+        if (!entry) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_NOT_FOUND,
+                                "there is no recently closed page");
+            return FALSE;
+        }
+        return browser_load_user_input(view, entry->uri, error);
+    }
+    case BROWSER_ACTION_LOAD_URI:
+        return browser_load_user_input(view, action->uri, error);
+    case BROWSER_ACTION_NONE:
+    default:
+        break;
+    }
+    g_set_error_literal(error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_INVALID_ARGUMENT,
+                        "browser command is unavailable");
+    return FALSE;
+}
+
+static gboolean
+browser_show_command_surface(EngineView *view, GError **error)
+{
+    BrowserPalette *palette = g_new0(BrowserPalette, 1);
+    g_autoptr(GPtrArray) choices = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)mux_ui_choice_free);
+    g_autoptr(GPtrArray) bookmarks = NULL;
+    g_autoptr(GPtrArray) closed = NULL;
+    g_autoptr(GPtrArray) history = NULL;
+    const gchar *uri = webkit_web_view_get_uri(view->web_view);
+    gboolean bookmarkable = !view->ephemeral &&
+        mux_browser_store_uri_is_bookmarkable(uri);
+    gboolean bookmarked = bookmarkable &&
+        mux_browser_store_is_bookmarked(view->engine->browser_store,
+                                        FALSE,
+                                        uri);
+    guint section_budget;
+    guint i;
+
+    palette->view = view;
+    palette->actions = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)browser_palette_action_free);
+    (void)browser_palette_add(
+        palette,
+        choices,
+        BROWSER_ACTION_BACK,
+        NULL,
+        webkit_web_view_can_go_back(view->web_view)
+            ? 0
+            : MUX_UI_CHOICE_FLAG_DISABLED,
+        "Command  Back");
+    (void)browser_palette_add(
+        palette,
+        choices,
+        BROWSER_ACTION_FORWARD,
+        NULL,
+        webkit_web_view_can_go_forward(view->web_view)
+            ? 0
+            : MUX_UI_CHOICE_FLAG_DISABLED,
+        "Command  Forward");
+    (void)browser_palette_add(
+        palette,
+        choices,
+        webkit_web_view_is_loading(view->web_view)
+            ? BROWSER_ACTION_STOP
+            : BROWSER_ACTION_RELOAD,
+        NULL,
+        0,
+        webkit_web_view_is_loading(view->web_view)
+            ? "Command  Stop loading"
+            : "Command  Reload");
+    (void)browser_palette_add(
+        palette,
+        choices,
+        BROWSER_ACTION_TOGGLE_BOOKMARK,
+        NULL,
+        bookmarkable ? 0 : MUX_UI_CHOICE_FLAG_DISABLED,
+        view->ephemeral
+            ? "Command  Bookmarks unavailable in private panes"
+            : bookmarked ? "Command  Remove bookmark"
+                         : "Command  Add bookmark");
+    (void)browser_palette_add(
+        palette,
+        choices,
+        BROWSER_ACTION_REOPEN_LAST,
+        NULL,
+        mux_browser_store_recently_closed_count(
+            view->engine->browser_store,
+            view->ephemeral)
+            ? 0
+            : MUX_UI_CHOICE_FLAG_DISABLED,
+        "Command  Reopen most recently closed page");
+
+    bookmarks = mux_browser_store_copy_bookmarks(
+        view->engine->browser_store,
+        view->ephemeral,
+        MUX_ENGINE_PALETTE_BOOKMARKS);
+    closed = mux_browser_store_copy_recently_closed(
+        view->engine->browser_store,
+        view->ephemeral,
+        MUX_ENGINE_PALETTE_CLOSED);
+    history = mux_browser_store_copy_history(
+        view->engine->browser_store,
+        view->ephemeral,
+        MUX_ENGINE_PALETTE_HISTORY);
+
+    section_budget = browser_palette_section_budget(choices, bookmarks);
+    if (section_budget) {
+        (void)browser_palette_add(palette,
+                                  choices,
+                                  BROWSER_ACTION_NONE,
+                                  NULL,
+                                  MUX_UI_CHOICE_FLAG_DISABLED |
+                                      MUX_UI_CHOICE_FLAG_SEPARATOR,
+                                  "Bookmarks");
+        for (i = 0; i < section_budget; i++) {
+            const MuxBrowserEntry *entry = g_ptr_array_index(bookmarks, i);
+            g_autofree gchar *label = browser_entry_label("Bookmark", entry);
+
+            (void)browser_palette_add(palette,
+                                      choices,
+                                      BROWSER_ACTION_LOAD_URI,
+                                      entry->uri,
+                                      0,
+                                      label);
+        }
+    }
+    section_budget = browser_palette_section_budget(choices, closed);
+    if (section_budget) {
+        (void)browser_palette_add(palette,
+                                  choices,
+                                  BROWSER_ACTION_NONE,
+                                  NULL,
+                                  MUX_UI_CHOICE_FLAG_DISABLED |
+                                      MUX_UI_CHOICE_FLAG_SEPARATOR,
+                                  "Recently closed");
+        for (i = 0; i < section_budget; i++) {
+            const MuxBrowserEntry *entry = g_ptr_array_index(closed, i);
+            g_autofree gchar *label = browser_entry_label("Closed", entry);
+
+            (void)browser_palette_add(palette,
+                                      choices,
+                                      BROWSER_ACTION_LOAD_URI,
+                                      entry->uri,
+                                      0,
+                                      label);
+        }
+    }
+    section_budget = browser_palette_section_budget(choices, history);
+    if (section_budget) {
+        (void)browser_palette_add(palette,
+                                  choices,
+                                  BROWSER_ACTION_NONE,
+                                  NULL,
+                                  MUX_UI_CHOICE_FLAG_DISABLED |
+                                      MUX_UI_CHOICE_FLAG_SEPARATOR,
+                                  "Recent navigation");
+        for (i = 0; i < section_budget; i++) {
+            const MuxBrowserEntry *entry = g_ptr_array_index(history, i);
+            g_autofree gchar *label = browser_entry_label("History", entry);
+
+            (void)browser_palette_add(palette,
+                                      choices,
+                                      BROWSER_ACTION_LOAD_URI,
+                                      entry->uri,
+                                      0,
+                                      label);
+        }
+    }
+
+    return mux_browser_affordance_bridge_show_command_surface(
+        view->affordance_bridge,
+        "Mux commands and history",
+        "Type to filter, then press Enter to run or open.",
+        choices,
+        browser_palette_selected,
+        palette,
+        (GDestroyNotify)browser_palette_free,
+        error);
+}
+
+static gboolean
+browser_handle_shortcut(EngineView *view,
+                        guint16 event_type,
+                        guint32 modifiers,
+                        guint32 keyval)
+{
+    WPEModifiers shortcut_modifiers = (WPEModifiers)modifiers &
+        (WPE_MODIFIER_KEYBOARD_CONTROL |
+         WPE_MODIFIER_KEYBOARD_SHIFT |
+         WPE_MODIFIER_KEYBOARD_ALT |
+         WPE_MODIFIER_KEYBOARD_META);
+    gboolean palette =
+        shortcut_modifiers ==
+            (WPE_MODIFIER_KEYBOARD_CONTROL |
+             WPE_MODIFIER_KEYBOARD_SHIFT) &&
+        (keyval == 'p' || keyval == 'P');
+    gboolean bookmark =
+        shortcut_modifiers == WPE_MODIFIER_KEYBOARD_CONTROL &&
+        (keyval == 'd' || keyval == 'D');
+    gboolean back = shortcut_modifiers == WPE_MODIFIER_KEYBOARD_ALT &&
+        keyval == MUX_ENGINE_KEY_LEFT;
+    gboolean forward = shortcut_modifiers == WPE_MODIFIER_KEYBOARD_ALT &&
+        keyval == MUX_ENGINE_KEY_RIGHT;
+    g_autoptr(GError) error = NULL;
+
+    if (!palette && !bookmark && !back && !forward)
+        return FALSE;
+    if (event_type != MUX_ENGINE_KEY_PRESS)
+        return TRUE;
+
+    if (palette) {
+        if (!browser_show_command_surface(view, &error))
+            g_warning("browser command surface failed: %s", error->message);
+    } else if (bookmark) {
+        const gchar *uri = webkit_web_view_get_uri(view->web_view);
+        const gchar *title = webkit_web_view_get_title(view->web_view);
+        gboolean current = mux_browser_store_is_bookmarked(
+            view->engine->browser_store,
+            view->ephemeral,
+            uri);
+
+        if (!mux_browser_store_set_bookmarked(view->engine->browser_store,
+                                              view->ephemeral,
+                                              uri,
+                                              title,
+                                              !current,
+                                              &error))
+            g_warning("bookmark shortcut failed: %s", error->message);
+    } else if (back) {
+        if (webkit_web_view_can_go_back(view->web_view))
+            webkit_web_view_go_back(view->web_view);
+    } else if (webkit_web_view_can_go_forward(view->web_view)) {
+        webkit_web_view_go_forward(view->web_view);
+    }
+    return TRUE;
+}
+
 static gboolean
 handle_input_key(Client *client, const MuxEngineMessage *request)
 {
@@ -2237,6 +2682,12 @@ handle_input_key(Client *client, const MuxEngineMessage *request)
                           "invalid INPUT_KEY payload");
         return TRUE;
     }
+
+    if (browser_handle_shortcut(view,
+                                event_type,
+                                modifiers,
+                                keyval))
+        return TRUE;
 
     if (view->input_method && view->suppressed_text_keys) {
         if (!mux_input_method_context_is_focused(view->input_method)) {
@@ -2901,15 +3352,22 @@ initialize_browser(Engine *engine, GError **error)
         !ensure_private_directory(engine->cache_directory, error))
         return FALSE;
 
-    engine->permission_store = mux_permission_store_new(
+    engine->browser_store = mux_browser_store_new(engine->data_directory,
+                                                  error);
+    if (!engine->browser_store)
+        return FALSE;
+    engine->permission_store = mux_permission_store_new_for_namespace(
         engine->data_directory,
-        TRUE,
+        engine->profile,
+        MUX_PERMISSION_STORE_SCOPE_PERSISTENT,
         error);
     if (!engine->permission_store)
         return FALSE;
-    engine->ephemeral_permission_store = mux_permission_store_new(
+    engine->ephemeral_permission_store =
+        mux_permission_store_new_for_namespace(
         NULL,
-        FALSE,
+        engine->profile,
+        MUX_PERMISSION_STORE_SCOPE_PRIVATE,
         error);
     if (!engine->ephemeral_permission_store)
         return FALSE;
@@ -3026,6 +3484,7 @@ engine_clear(Engine *engine)
     }
     if (engine->clients)
         g_ptr_array_free(engine->clients, TRUE);
+    g_clear_pointer(&engine->browser_store, mux_browser_store_free);
     if (engine->listen_fd >= 0)
         close(engine->listen_fd);
     if (engine->socket_bound)

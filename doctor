@@ -2,22 +2,62 @@
 set -u
 
 failures=0
+warnings=0
 
 ok() {
   printf 'ok    %s\n' "$1"
 }
 
+warn() {
+  printf 'WARN  %s\n' "$1" >&2
+  printf '      %s\n' "$2" >&2
+  warnings=$((warnings + 1))
+}
+
 fail() {
   printf 'FAIL  %s\n' "$1" >&2
+  printf '      Fix: %s\n' "$2" >&2
   failures=$((failures + 1))
 }
 
+command_fix() {
+  case "$1" in
+    cc)
+      printf '%s' 'install a C17 compiler (Arch: base-devel)'
+      ;;
+    kitty|kitten)
+      printf '%s' 'install Kitty, including its kitten helper (Arch: kitty)'
+      ;;
+    meson)
+      printf '%s' 'install Meson (Arch: meson)'
+      ;;
+    ninja)
+      printf '%s' 'install Ninja (Arch: ninja)'
+      ;;
+    pkg-config)
+      printf '%s' 'install pkg-config (Arch: pkgconf)'
+      ;;
+  esac
+}
+
 check_command() {
-  if command -v "$1" >/dev/null 2>&1; then
-    ok "$1: $(command -v "$1")"
+  local command="$1"
+  if command -v "$command" >/dev/null 2>&1; then
+    ok "$command: $(command -v "$command")"
   else
-    fail "$1 is missing"
+    fail "$command is missing" "$(command_fix "$command")"
   fi
+}
+
+package_fix() {
+  case "$1" in
+    glib-2.0|gio-2.0)
+      printf '%s' "install GLib development files providing $1 (Arch: glib2)"
+      ;;
+    wpe-webkit-2.0|wpe-platform-2.0)
+      printf '%s' "install WPE WebKit built with WPEPlatform enabled, providing $1 >= 2.52 (Arch: wpewebkit)"
+      ;;
+  esac
 }
 
 check_package() {
@@ -29,24 +69,25 @@ check_package() {
     return
   fi
   if ! pkg-config --exists "$package"; then
-    fail "pkg-config package $package is missing"
+    fail "pkg-config package $package is missing" "$(package_fix "$package")"
     return
   fi
+
   version="$(pkg-config --modversion "$package" 2>/dev/null || printf unknown)"
   if pkg-config --atleast-version="$minimum" "$package"; then
     ok "$package $version"
   else
-    fail "$package $version is older than required $minimum"
+    fail "$package $version is older than required $minimum" "$(package_fix "$package")"
   fi
 }
 
-printf 'Mux environment doctor\n'
-printf '======================\n'
+printf 'Mux v0.1 environment doctor\n'
+printf '===========================\n'
 
 if [[ "$(uname -s)" == Linux ]]; then
-  ok "operating system: Linux"
+  ok 'operating system: Linux'
 else
-  fail "operating system must be Linux"
+  fail 'operating system is not Linux' 'run Mux on Linux; the current WPEPlatform and IPC implementation is Linux-only'
 fi
 
 for command in cc kitty kitten meson ninja pkg-config; do
@@ -59,20 +100,35 @@ check_package wpe-webkit-2.0 2.52
 check_package wpe-platform-2.0 2.52
 
 if [[ -d /dev/shm && -w /dev/shm ]]; then
-  ok "/dev/shm is writable for Kitty shared-memory frames"
+  ok '/dev/shm is writable for raw frame transport'
 else
-  fail "/dev/shm is unavailable or not writable"
+  fail '/dev/shm is unavailable or not writable' 'mount a writable tmpfs at /dev/shm; containers may need --shm-size'
 fi
 
-if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" && -w "${XDG_RUNTIME_DIR}" ]]; then
-  ok "XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR}"
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+  if [[ -d "$XDG_RUNTIME_DIR" && -w "$XDG_RUNTIME_DIR" && -O "$XDG_RUNTIME_DIR" ]]; then
+    ok "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
+  else
+    fail "XDG_RUNTIME_DIR is not a writable directory owned by this user: $XDG_RUNTIME_DIR" 'repair its ownership/permissions or unset it so Mux can use its owner-only /tmp fallback'
+  fi
 else
-  ok "XDG_RUNTIME_DIR absent; Mux will use /tmp/mux-$(id -u)"
+  ok "XDG_RUNTIME_DIR is unset; Mux will use /tmp/mux-$(id -u)"
+fi
+
+if [[ -z "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
+  warn 'no Wayland or X11 display is visible in this shell' 'Builds and tests can run headlessly, but launching Kitty requires a graphical session.'
+else
+  ok 'graphical session is visible'
 fi
 
 if (( failures )); then
-  printf '\n%d requirement(s) failed. Run ./setup after updating to a distribution with WPE WebKit 2.52+.\n' "$failures" >&2
+  printf '\n%d hard requirement(s) failed; Mux was not declared ready.\n' "$failures" >&2
+  printf 'See docs/install.md for supported installation paths.\n' >&2
   exit 1
 fi
 
-printf '\nEnvironment is ready. ./mux will build incrementally and launch Kitty.\n'
+printf '\nAll build requirements passed'
+if (( warnings )); then
+  printf ' with %d warning(s)' "$warnings"
+fi
+printf '. The ./mux launcher can build the WPE implementation incrementally.\n'

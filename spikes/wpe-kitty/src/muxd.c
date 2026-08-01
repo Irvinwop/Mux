@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "mux-protocol.h"
+#include "mux-session-state.h"
 #include "muxd-clipboard.h"
 
 #include <errno.h>
@@ -28,6 +29,8 @@ typedef struct {
     int fd;
     ClientKind kind;
     gboolean closing;
+    gboolean graceful_bye;
+    gboolean persistable;
     GString *input;
 
     gchar *id;
@@ -37,6 +40,8 @@ typedef struct {
     gchar *uri;
     gchar *title;
     long pid;
+    pid_t peer_pid;
+    guint64 session_view_id;
     gboolean focused;
 } Client;
 
@@ -48,10 +53,22 @@ typedef struct {
     gchar *active_id;
     gchar *current_layer;
     guint64 revision;
+    guint64 next_view_id;
+    guint64 reserved_view_id_limit;
+    guint64 next_transient_id;
     gboolean running;
+    gboolean session_dirty;
+    gint64 session_write_due_us;
     GMainContext *main_context;
     MuxdClipboard *clipboard;
+    MuxSessionState *session;
+    gchar *session_path;
 } Server;
+
+#define SESSION_WRITE_DEBOUNCE_US (250 * 1000)
+#define SESSION_WRITE_RETRY_US (1000 * 1000)
+#define VIEW_ID_RESERVATION_SIZE 64u
+#define MAX_PEER_ENVIRONMENT_BYTES (4u * 1024u * 1024u)
 
 static volatile sig_atomic_t stop_requested;
 
@@ -102,6 +119,201 @@ static gboolean encoded_layer_is_valid(const gchar *encoded)
     g_autofree gchar *layer = decode_layer(encoded);
 
     return layer != NULL;
+}
+
+static gboolean peer_ephemeral_status(pid_t pid, gboolean *ephemeral)
+{
+    g_autofree gchar *path = NULL;
+    g_autofree gchar *contents = NULL;
+    gsize length = 0;
+    gsize offset = 0;
+
+    g_return_val_if_fail(ephemeral != NULL, FALSE);
+    *ephemeral = TRUE;
+    if (pid <= 0)
+        return FALSE;
+
+    path = g_strdup_printf("/proc/%ld/environ", (long)pid);
+    if (!g_file_get_contents(path, &contents, &length, NULL) ||
+        length > MAX_PEER_ENVIRONMENT_BYTES)
+        return FALSE;
+
+    *ephemeral = FALSE;
+    while (offset < length) {
+        const gchar *entry = contents + offset;
+        gsize remaining = length - offset;
+        const gchar *terminator = memchr(entry, '\0', remaining);
+        gsize entry_length = terminator
+            ? (gsize)(terminator - entry)
+            : remaining;
+        const gchar prefix[] = "MUX_EPHEMERAL=";
+
+        if (entry_length >= sizeof(prefix) - 1 &&
+            memcmp(entry, prefix, sizeof(prefix) - 1) == 0) {
+            const gchar *value = entry + sizeof(prefix) - 1;
+            gsize value_length = entry_length - (sizeof(prefix) - 1);
+
+            *ephemeral = !(value_length == 1 && value[0] == '0');
+            return TRUE;
+        }
+        offset += entry_length + (terminator != NULL ? 1 : 0);
+    }
+    return TRUE;
+}
+
+static void schedule_session_write(Server *server)
+{
+    server->session_dirty = TRUE;
+    server->session_write_due_us =
+        g_get_monotonic_time() + SESSION_WRITE_DEBOUNCE_US;
+}
+
+static gboolean persist_session_now(Server *server)
+{
+    g_autoptr(GError) error = NULL;
+
+    if (mux_session_state_save_atomic(server->session,
+                                      server->session_path,
+                                      &error)) {
+        server->session_dirty = FALSE;
+        server->session_write_due_us = 0;
+        return TRUE;
+    }
+    g_printerr("muxd: cannot persist workspace: %s\n", error->message);
+    server->session_dirty = TRUE;
+    server->session_write_due_us =
+        g_get_monotonic_time() + SESSION_WRITE_RETRY_US;
+    return FALSE;
+}
+
+static void flush_session_if_due(Server *server)
+{
+    if (server->session_dirty && server->session_write_due_us > 0 &&
+        g_get_monotonic_time() >= server->session_write_due_us)
+        persist_session_now(server);
+}
+
+static gboolean allocate_persistent_view_id(Server *server,
+                                            guint64 *view_id)
+{
+    if (server->next_view_id >= server->reserved_view_id_limit) {
+        guint64 previous_limit =
+            mux_session_state_get_next_view_id(server->session);
+        guint64 new_limit;
+
+        if (server->next_view_id >
+            G_MAXUINT64 - VIEW_ID_RESERVATION_SIZE) {
+            g_printerr("muxd: persistent view ID space is exhausted\n");
+            return FALSE;
+        }
+        new_limit = server->next_view_id + VIEW_ID_RESERVATION_SIZE;
+        if (!mux_session_state_set_next_view_id(server->session, new_limit) ||
+            !persist_session_now(server)) {
+            mux_session_state_set_next_view_id(server->session,
+                                               previous_limit);
+            return FALSE;
+        }
+        server->reserved_view_id_limit = new_limit;
+    }
+
+    *view_id = server->next_view_id++;
+    return TRUE;
+}
+
+static void assign_transient_view_id(Server *server, Client *client)
+{
+    client->id = g_strdup_printf("transient-%ld-%" G_GUINT64_FORMAT,
+                                 (long)client->peer_pid,
+                                 server->next_transient_id++);
+}
+
+static void update_persisted_view(Server *server, Client *client)
+{
+    if (!client->persistable || client->session_view_id == 0)
+        return;
+    if (mux_session_state_upsert_view(server->session,
+                                      client->session_view_id,
+                                      client->layer,
+                                      client->uri ? client->uri : "",
+                                      client->title ? client->title : ""))
+        schedule_session_write(server);
+}
+
+static gboolean session_contains_view_id(Server *server, guint64 view_id)
+{
+    guint count = mux_session_state_get_view_count(server->session);
+
+    for (guint i = 0; i < count; i++) {
+        const MuxSessionView *view =
+            mux_session_state_get_view(server->session, i);
+
+        if (view != NULL && view->id == view_id)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean session_view_id_is_live(Server *server, guint64 view_id)
+{
+    for (guint i = 0; i < server->clients->len; i++) {
+        Client *client = g_ptr_array_index(server->clients, i);
+
+        if (client->kind == CLIENT_VIEW &&
+            client->session_view_id == view_id)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean parse_persistent_view_id(const gchar *id,
+                                         guint64 *view_id)
+{
+    const gchar *number;
+    gchar *end = NULL;
+    guint64 parsed;
+
+    if (id == NULL || !g_str_has_prefix(id, "view-"))
+        return FALSE;
+    number = id + strlen("view-");
+    if (!g_ascii_isdigit(*number) || *number == '0')
+        return FALSE;
+    for (const gchar *cursor = number; *cursor != '\0'; cursor++) {
+        if (!g_ascii_isdigit(*cursor))
+            return FALSE;
+    }
+
+    errno = 0;
+    parsed = g_ascii_strtoull(number, &end, 10);
+    if (errno != 0 || end == number || *end != '\0' || parsed == 0)
+        return FALSE;
+    *view_id = parsed;
+    return TRUE;
+}
+
+static gboolean layer_has_persistable_view(Server *server,
+                                           const gchar *layer)
+{
+    guint count = mux_session_state_get_view_count(server->session);
+
+    for (guint i = 0; i < count; i++) {
+        const MuxSessionView *view =
+            mux_session_state_get_view(server->session, i);
+
+        if (view != NULL && g_strcmp0(view->layer, layer) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void persist_active_layer_if_eligible(Server *server,
+                                             const gchar *layer,
+                                             const Client *source_view)
+{
+    if ((source_view != NULL && !source_view->persistable) ||
+        !layer_has_persistable_view(server, layer))
+        return;
+    if (mux_session_state_set_active_layer(server->session, layer))
+        schedule_session_write(server);
 }
 
 static void client_free(gpointer data)
@@ -268,6 +480,9 @@ static void set_active(Server *server, Client *view)
 
     if (g_strcmp0(server->current_layer, view->layer) != 0) {
         replace_string(&server->current_layer, g_strdup(view->layer));
+        persist_active_layer_if_eligible(server,
+                                         server->current_layer,
+                                         view);
         broadcast_layer(server);
     }
 
@@ -393,6 +608,9 @@ static void handle_control(
             return;
         }
         replace_string(&server->current_layer, layer);
+        persist_active_layer_if_eligible(server,
+                                         server->current_layer,
+                                         NULL);
         broadcast_layer(server);
         Client *view = find_layer_view(server, server->current_layer);
         if (view) {
@@ -429,6 +647,7 @@ static void handle_control(
             return;
         }
         replace_string(&view->layer, layer);
+        update_persisted_view(server, view);
         broadcast_view(server, view, "UPSERT");
         mux_send_line(client->fd, "OK");
         client->closing = TRUE;
@@ -472,6 +691,7 @@ static void handle_view(
     if (g_strcmp0(fields[0], "STATE") == 0 && field_count >= 3) {
         replace_string(&client->uri, mux_decode(fields[1]));
         replace_string(&client->title, mux_decode(fields[2]));
+        update_persisted_view(server, client);
         broadcast_view(server, client, "UPSERT");
         return;
     }
@@ -493,6 +713,7 @@ static void handle_view(
             return;
         }
         replace_string(&client->layer, layer);
+        update_persisted_view(server, client);
         broadcast_view(server, client, "UPSERT");
         return;
     }
@@ -505,6 +726,7 @@ static void handle_view(
         return;
     }
     if (g_strcmp0(fields[0], "BYE") == 0) {
+        client->graceful_bye = TRUE;
         client->closing = TRUE;
         return;
     }
@@ -557,15 +779,46 @@ static void handle_line(Server *server, Client *client, const gchar *line)
     if (client->kind == CLIENT_UNKNOWN &&
         g_strcmp0(fields[0], "VIEW") == 0 &&
         field_count >= 7 && encoded_layer_is_valid(fields[5])) {
+        g_autofree gchar *proposed_id = mux_decode(fields[1]);
+        guint64 proposed_session_view_id = 0;
+        gboolean ephemeral;
+
         client->kind = CLIENT_VIEW;
-        client->id = mux_decode(fields[1]);
-        client->pid = strtol(fields[2], NULL, 10);
+        client->pid = (long)client->peer_pid;
         client->kitty_window = mux_decode(fields[3]);
         client->kitty_socket = mux_decode(fields[4]);
         client->layer = mux_decode(fields[5]);
         client->uri = mux_decode(fields[6]);
         client->title = g_strdup("");
-        mux_send_line(client->fd, "OK\t%d", MUX_PROTOCOL_VERSION);
+        client->persistable =
+            peer_ephemeral_status(client->peer_pid, &ephemeral) &&
+            !ephemeral;
+        if (client->persistable &&
+            parse_persistent_view_id(proposed_id,
+                                     &proposed_session_view_id) &&
+            session_contains_view_id(server,
+                                     proposed_session_view_id) &&
+            !session_view_id_is_live(server,
+                                     proposed_session_view_id)) {
+            client->session_view_id = proposed_session_view_id;
+            client->id = g_strdup_printf("view-%" G_GUINT64_FORMAT,
+                                         client->session_view_id);
+        } else if (client->persistable &&
+            allocate_persistent_view_id(server,
+                                        &client->session_view_id)) {
+            client->id = g_strdup_printf("view-%" G_GUINT64_FORMAT,
+                                         client->session_view_id);
+        } else {
+            client->persistable = FALSE;
+            client->session_view_id = 0;
+            assign_transient_view_id(server, client);
+        }
+        g_autofree gchar *encoded_assigned_id = mux_encode(client->id);
+        mux_send_line(client->fd,
+                      "OK\t%d\t%s",
+                      MUX_PROTOCOL_VERSION,
+                      encoded_assigned_id);
+        update_persisted_view(server, client);
         broadcast_view(server, client, "UPSERT");
         if (!server->active_id)
             set_active(server, client);
@@ -636,6 +889,11 @@ static void remove_closed_clients(Server *server)
             continue;
 
         if (client->kind == CLIENT_VIEW) {
+            if (client->graceful_bye && client->persistable &&
+                client->session_view_id != 0 &&
+                mux_session_state_remove_view(server->session,
+                                              client->session_view_id))
+                schedule_session_write(server);
             broadcast_view(server, client, "REMOVE");
             if (g_strcmp0(server->active_id, client->id) == 0) {
                 g_clear_pointer(&server->active_id, g_free);
@@ -677,6 +935,7 @@ static gboolean accept_client(Server *server)
 
     Client *client = g_new0(Client, 1);
     client->fd = fd;
+    client->peer_pid = credentials.pid;
     client->input = g_string_new(NULL);
     g_ptr_array_add(server->clients, client);
     return TRUE;
@@ -808,6 +1067,7 @@ static int run_server(void)
         .lock_fd = -1,
         .clients = g_ptr_array_new_with_free_func(client_free),
         .current_layer = g_strdup("main"),
+        .next_transient_id = 1,
         .running = TRUE,
         .main_context = g_main_context_new(),
     };
@@ -822,6 +1082,26 @@ static int run_server(void)
         return EXIT_FAILURE;
     }
 
+    server.session_path = mux_session_state_default_path();
+    g_autoptr(GError) session_error = NULL;
+    server.session = mux_session_state_load(server.session_path,
+                                            &session_error);
+    if (server.session == NULL) {
+        guint64 recovery_floor = (guint64)MAX(g_get_real_time(), 1);
+
+        g_printerr("muxd: ignoring unusable workspace state: %s\n",
+                   session_error->message);
+        server.session = mux_session_state_new();
+        mux_session_state_set_next_view_id(server.session,
+                                           recovery_floor);
+    }
+    replace_string(
+        &server.current_layer,
+        g_strdup(mux_session_state_get_active_layer(server.session)));
+    server.next_view_id =
+        mux_session_state_get_next_view_id(server.session);
+    server.reserved_view_id_limit = server.next_view_id;
+
     g_autoptr(GError) clipboard_error = NULL;
     server.clipboard = muxd_clipboard_new(server.main_context,
                                           &clipboard_error);
@@ -834,6 +1114,8 @@ static int run_server(void)
         g_ptr_array_unref(server.clients);
         g_free(server.socket_path);
         g_free(server.current_layer);
+        g_free(server.session_path);
+        mux_session_state_free(server.session);
         g_main_context_unref(server.main_context);
         return EXIT_FAILURE;
     }
@@ -876,8 +1158,11 @@ static int run_server(void)
         while (g_main_context_iteration(server.main_context, FALSE))
             ;
         remove_closed_clients(&server);
+        flush_session_if_due(&server);
     }
 
+    if (server.session_dirty)
+        persist_session_now(&server);
     muxd_clipboard_free(server.clipboard);
     g_main_context_unref(server.main_context);
     close(server.listener);
@@ -887,6 +1172,8 @@ static int run_server(void)
     g_free(server.socket_path);
     g_free(server.active_id);
     g_free(server.current_layer);
+    g_free(server.session_path);
+    mux_session_state_free(server.session);
     return EXIT_SUCCESS;
 }
 

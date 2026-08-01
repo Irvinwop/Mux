@@ -16,6 +16,10 @@ typedef struct {
     WebKitAuthenticationRequest *authentication;
     WebKitOptionMenu *option_menu;
     GPtrArray *context_actions;
+    GHashTable *command_choice_ids;
+    MuxBrowserAffordanceChoiceFunc command_choice_func;
+    gpointer command_data;
+    GDestroyNotify command_data_destroy;
     gulong underlying_handler;
 } PendingAffordance;
 
@@ -37,6 +41,8 @@ struct _MuxBrowserAffordanceBridge {
 static void send_cancel(MuxBrowserAffordanceBridge *bridge,
                         guint64 request_id,
                         MuxUiCancelReason reason);
+static void supersede_kind(MuxBrowserAffordanceBridge *bridge,
+                           MuxUiRequestKind kind);
 
 static guint64 *
 request_key_new(guint64 request_id)
@@ -98,6 +104,9 @@ pending_affordance_free(PendingAffordance *pending)
     g_clear_object(&pending->authentication);
     g_clear_object(&pending->option_menu);
     g_clear_pointer(&pending->context_actions, g_ptr_array_unref);
+    g_clear_pointer(&pending->command_choice_ids, g_hash_table_unref);
+    if (pending->command_data_destroy)
+        pending->command_data_destroy(pending->command_data);
     g_free(pending);
 }
 
@@ -187,6 +196,106 @@ publish_request(MuxBrowserAffordanceBridge *bridge,
         return FALSE;
     }
     return TRUE;
+}
+
+gboolean
+mux_browser_affordance_bridge_show_command_surface(
+    MuxBrowserAffordanceBridge *bridge,
+    const gchar *heading,
+    const gchar *message,
+    const GPtrArray *choices,
+    MuxBrowserAffordanceChoiceFunc choice_func,
+    gpointer user_data,
+    GDestroyNotify user_data_destroy,
+    GError **error)
+{
+    g_autoptr(MuxUiRequest) request =
+        mux_ui_request_new(MUX_UI_REQUEST_CONTEXT_MENU);
+    PendingAffordance *pending = g_new0(PendingAffordance, 1);
+    GHashTable *seen_ids = g_hash_table_new_full(g_int_hash,
+                                                 g_int_equal,
+                                                 g_free,
+                                                 NULL);
+    guint selectable = 0;
+    guint i;
+
+    pending->command_data = user_data;
+    pending->command_data_destroy = user_data_destroy;
+    if (!bridge || !choices || !choice_func ||
+        choices->len == 0 || choices->len > MUX_UI_MAX_CHOICES) {
+        g_set_error_literal(error,
+                            MUX_UI_ERROR,
+                            MUX_UI_ERROR_INVALID,
+                            "command surface choices are invalid");
+        g_hash_table_unref(seen_ids);
+        pending_affordance_free(pending);
+        return FALSE;
+    }
+
+    pending->request_id = next_request_id(bridge);
+    pending->kind = MUX_UI_REQUEST_CONTEXT_MENU;
+    pending->command_choice_func = choice_func;
+    pending->command_choice_ids = g_hash_table_new_full(g_int_hash,
+                                                        g_int_equal,
+                                                        g_free,
+                                                        NULL);
+    request->request_id = pending->request_id;
+    request->flags = bridge->private_profile
+                         ? MUX_UI_REQUEST_FLAG_PRIVATE_PROFILE
+                         : 0;
+    request->deadline_ms = 300000;
+    request->origin = view_origin(bridge->web_view);
+    request->heading = bounded_utf8(heading, 1024);
+    request->message = bounded_utf8(message, MUX_UI_MAX_MESSAGE);
+
+    for (i = 0; i < choices->len; i++) {
+        const MuxUiChoice *choice = g_ptr_array_index((GPtrArray *)choices, i);
+        guint32 *seen_key;
+
+        if (!choice || !choice->label) {
+            g_set_error_literal(error,
+                                MUX_UI_ERROR,
+                                MUX_UI_ERROR_INVALID,
+                                "command surface contains an invalid choice");
+            g_hash_table_unref(seen_ids);
+            pending_affordance_free(pending);
+            return FALSE;
+        }
+        seen_key = g_new(guint32, 1);
+        *seen_key = choice->id;
+        if (g_hash_table_contains(seen_ids, seen_key)) {
+            g_free(seen_key);
+            g_set_error_literal(error,
+                                MUX_UI_ERROR,
+                                MUX_UI_ERROR_INVALID,
+                                "command surface choice ids must be unique");
+            g_hash_table_unref(seen_ids);
+            pending_affordance_free(pending);
+            return FALSE;
+        }
+        g_hash_table_add(seen_ids, seen_key);
+        g_ptr_array_add(request->choices, mux_ui_choice_copy(choice));
+        if (!(choice->flags & (MUX_UI_CHOICE_FLAG_DISABLED |
+                              MUX_UI_CHOICE_FLAG_SEPARATOR))) {
+            guint32 *selectable_key = g_new(guint32, 1);
+
+            *selectable_key = choice->id;
+            g_hash_table_add(pending->command_choice_ids, selectable_key);
+            selectable++;
+        }
+    }
+    g_hash_table_unref(seen_ids);
+    if (!selectable) {
+        g_set_error_literal(error,
+                            MUX_UI_ERROR,
+                            MUX_UI_ERROR_INVALID,
+                            "command surface has no selectable choices");
+        pending_affordance_free(pending);
+        return FALSE;
+    }
+
+    supersede_kind(bridge, MUX_UI_REQUEST_CONTEXT_MENU);
+    return publish_request(bridge, pending, request, error);
 }
 
 static guint64
@@ -817,8 +926,18 @@ resolve_pending(MuxBrowserAffordanceBridge *bridge,
             return TRUE;
         if (action == MUX_UI_ACTION_SELECT &&
             parse_choice_id(value, &choice_id, error)) {
+            if (pending->command_choice_func) {
+                if (!g_hash_table_contains(pending->command_choice_ids,
+                                           &choice_id))
+                    break;
+                return pending->command_choice_func(choice_id,
+                                                    pending->command_data,
+                                                    error);
+            }
             ContextAction *item;
 
+            if (!pending->context_actions)
+                break;
             if (choice_id >= pending->context_actions->len)
                 break;
             item = g_ptr_array_index(pending->context_actions,

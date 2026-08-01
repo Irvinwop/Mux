@@ -19,13 +19,17 @@ typedef struct {
     gchar *origin;
     gchar *category;
     MuxPermissionDecision decision;
+    gint64 updated_us;
+    gint64 expires_us;
 } PermissionEntry;
 
 struct _MuxPermissionStore {
     grefcount reference_count;
     gchar *profile_directory;
     gchar *path;
+    gchar *profile_namespace;
     GHashTable *entries;
+    MuxPermissionStoreScope scope;
     gboolean persistent;
 };
 
@@ -49,7 +53,9 @@ permission_key(const gchar *origin, const gchar *category)
 static PermissionEntry *
 permission_entry_new(const gchar *origin,
                      const gchar *category,
-                     MuxPermissionDecision decision)
+                     MuxPermissionDecision decision,
+                     gint64 updated_us,
+                     gint64 expires_us)
 {
     PermissionEntry *entry = g_new0(PermissionEntry, 1);
 
@@ -57,6 +63,8 @@ permission_entry_new(const gchar *origin,
     entry->origin = g_strdup(origin);
     entry->category = g_strdup(category);
     entry->decision = decision;
+    entry->updated_us = updated_us;
+    entry->expires_us = expires_us;
     return entry;
 }
 
@@ -65,8 +73,64 @@ permission_entry_copy(const PermissionEntry *entry)
 {
     return entry ? permission_entry_new(entry->origin,
                                         entry->category,
-                                        entry->decision)
+                                        entry->decision,
+                                        entry->updated_us,
+                                        entry->expires_us)
                  : NULL;
+}
+
+static GHashTable *
+permission_entries_copy(GHashTable *entries)
+{
+    GHashTable *copy = g_hash_table_new_full(
+        g_str_hash,
+        g_str_equal,
+        NULL,
+        (GDestroyNotify)permission_entry_free);
+    GHashTableIter iterator;
+    gpointer value;
+
+    g_hash_table_iter_init(&iterator, entries);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        PermissionEntry *entry = permission_entry_copy(value);
+
+        g_hash_table_insert(copy, entry->key, entry);
+    }
+    return copy;
+}
+
+static gboolean
+valid_namespace(const gchar *profile_namespace, GError **error)
+{
+    const guchar *cursor;
+    gsize length;
+
+    if (!profile_namespace || !*profile_namespace) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "permission namespace is empty");
+        return FALSE;
+    }
+    length = strlen(profile_namespace);
+    if (length > MUX_PERMISSION_NAMESPACE_MAX) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "permission namespace is too long");
+        return FALSE;
+    }
+    for (cursor = (const guchar *)profile_namespace; *cursor; cursor++) {
+        if (!(g_ascii_isalnum(*cursor) || *cursor == '-' ||
+              *cursor == '_' || *cursor == '.')) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_ARGUMENT,
+                                "permission namespace is invalid");
+            return FALSE;
+        }
+    }
+    return TRUE;
 }
 
 static gboolean
@@ -199,7 +263,70 @@ load_file_is_safe(const gchar *path, gboolean *exists, GError **error)
             "permission store must be an owner-only regular file");
         return FALSE;
     }
+    if ((guint64)status.st_size > MUX_PERMISSION_STORE_MAX_FILE_BYTES) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "permission store exceeds its size limit");
+        return FALSE;
+    }
     return TRUE;
+}
+
+static gboolean
+permission_entry_is_expired(const PermissionEntry *entry, gint64 now_us)
+{
+    return entry->expires_us <= now_us;
+}
+
+static guint
+prune_expired(MuxPermissionStore *store, gint64 now_us)
+{
+    GHashTableIter iterator;
+    gpointer value;
+    guint removed = 0;
+
+    g_hash_table_iter_init(&iterator, store->entries);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        if (!permission_entry_is_expired(value, now_us))
+            continue;
+        g_hash_table_iter_remove(&iterator);
+        removed++;
+    }
+    return removed;
+}
+
+static PermissionEntry *
+oldest_entry(MuxPermissionStore *store)
+{
+    GHashTableIter iterator;
+    PermissionEntry *oldest = NULL;
+    gpointer value;
+
+    g_hash_table_iter_init(&iterator, store->entries);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        PermissionEntry *entry = value;
+
+        if (!oldest || entry->updated_us < oldest->updated_us ||
+            (entry->updated_us == oldest->updated_us &&
+             g_strcmp0(entry->key, oldest->key) < 0)) {
+            oldest = entry;
+        }
+    }
+    return oldest;
+}
+
+static void
+enforce_entry_limit(MuxPermissionStore *store)
+{
+    while (g_hash_table_size(store->entries) >
+           MUX_PERMISSION_STORE_MAX_ENTRIES) {
+        PermissionEntry *oldest = oldest_entry(store);
+
+        if (!oldest)
+            return;
+        g_hash_table_remove(store->entries, oldest->key);
+    }
 }
 
 static const gchar *
@@ -231,7 +358,11 @@ load_store(MuxPermissionStore *store, GError **error)
 {
     g_autoptr(GKeyFile) key_file = g_key_file_new();
     g_auto(GStrv) groups = NULL;
+    g_autofree gchar *file_namespace = NULL;
+    g_autoptr(GError) metadata_error = NULL;
     gboolean exists;
+    gint version;
+    gint64 now_us = g_get_real_time();
     gsize count;
     gsize i;
 
@@ -243,6 +374,43 @@ load_store(MuxPermissionStore *store, GError **error)
             key_file, store->path, G_KEY_FILE_NONE, error))
         return FALSE;
 
+    version = g_key_file_get_integer(
+        key_file, "mux", "version", &metadata_error);
+    if (metadata_error) {
+        g_propagate_error(error, g_steal_pointer(&metadata_error));
+        return FALSE;
+    }
+    if (version == 1) {
+        if (g_strcmp0(store->profile_namespace, "default") != 0) {
+            g_set_error_literal(
+                error,
+                G_IO_ERROR,
+                G_IO_ERROR_INVALID_DATA,
+                "legacy permission store belongs to the default namespace");
+            return FALSE;
+        }
+    } else if (version == 2) {
+        file_namespace = g_key_file_get_string(
+            key_file, "mux", "namespace", &metadata_error);
+        if (!file_namespace) {
+            g_propagate_error(error, g_steal_pointer(&metadata_error));
+            return FALSE;
+        }
+        if (g_strcmp0(file_namespace, store->profile_namespace) != 0) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_DATA,
+                                "permission store namespace does not match");
+            return FALSE;
+        }
+    } else {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_SUPPORTED,
+                            "unsupported permission store version");
+        return FALSE;
+    }
+
     groups = g_key_file_get_groups(key_file, &count);
     for (i = 0; i < count; i++) {
         g_autofree gchar *origin = NULL;
@@ -251,6 +419,8 @@ load_store(MuxPermissionStore *store, GError **error)
         g_autoptr(GError) entry_error = NULL;
         MuxPermissionDecision decision;
         PermissionEntry *entry;
+        gint64 updated_us;
+        gint64 expires_us;
 
         if (!g_str_has_prefix(groups[i], "permission "))
             continue;
@@ -271,9 +441,36 @@ load_store(MuxPermissionStore *store, GError **error)
             !valid_origin(origin, NULL) ||
             !valid_category(category, NULL))
             continue;
-        entry = permission_entry_new(origin, category, decision);
+        if (version == 1) {
+            updated_us = now_us;
+            expires_us = now_us +
+                         MUX_PERMISSION_STORE_DEFAULT_TTL_US;
+        } else {
+            updated_us = g_key_file_get_int64(
+                key_file, groups[i], "updated-us", &entry_error);
+            if (entry_error)
+                continue;
+            expires_us = g_key_file_get_int64(
+                key_file, groups[i], "expires-us", &entry_error);
+            if (entry_error)
+                continue;
+            if (updated_us <= 0 || expires_us <= now_us ||
+                expires_us <= updated_us ||
+                expires_us - updated_us >
+                    MUX_PERMISSION_STORE_MAX_TTL_US ||
+                expires_us - now_us >
+                    MUX_PERMISSION_STORE_MAX_TTL_US) {
+                continue;
+            }
+        }
+        entry = permission_entry_new(origin,
+                                     category,
+                                     decision,
+                                     updated_us,
+                                     expires_us);
         g_hash_table_replace(store->entries, entry->key, entry);
     }
+    enforce_entry_limit(store);
     return TRUE;
 }
 
@@ -282,9 +479,35 @@ mux_permission_store_new(const gchar *profile_directory,
                          gboolean persistent,
                          GError **error)
 {
+    return mux_permission_store_new_for_namespace(
+        profile_directory,
+        "default",
+        persistent ? MUX_PERMISSION_STORE_SCOPE_PERSISTENT
+                   : MUX_PERMISSION_STORE_SCOPE_EPHEMERAL,
+        error);
+}
+
+MuxPermissionStore *
+mux_permission_store_new_for_namespace(
+    const gchar *profile_directory,
+    const gchar *profile_namespace,
+    MuxPermissionStoreScope scope,
+    GError **error)
+{
     MuxPermissionStore *store;
 
-    if (persistent && (!profile_directory || !*profile_directory)) {
+    if (scope < MUX_PERMISSION_STORE_SCOPE_PERSISTENT ||
+        scope > MUX_PERMISSION_STORE_SCOPE_EPHEMERAL) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "invalid permission store scope");
+        return NULL;
+    }
+    if (!valid_namespace(profile_namespace, error))
+        return NULL;
+    if (scope == MUX_PERMISSION_STORE_SCOPE_PERSISTENT &&
+        (!profile_directory || !*profile_directory)) {
         g_set_error_literal(error,
                             G_IO_ERROR,
                             G_IO_ERROR_INVALID_ARGUMENT,
@@ -293,13 +516,16 @@ mux_permission_store_new(const gchar *profile_directory,
     }
     store = g_new0(MuxPermissionStore, 1);
     g_ref_count_init(&store->reference_count);
-    store->persistent = persistent;
+    store->scope = scope;
+    store->persistent =
+        scope == MUX_PERMISSION_STORE_SCOPE_PERSISTENT;
+    store->profile_namespace = g_strdup(profile_namespace);
     store->entries = g_hash_table_new_full(
         g_str_hash,
         g_str_equal,
         NULL,
         (GDestroyNotify)permission_entry_free);
-    if (!persistent)
+    if (!store->persistent)
         return store;
 
     store->profile_directory = g_strdup(profile_directory);
@@ -331,6 +557,7 @@ mux_permission_store_free(MuxPermissionStore *store)
     g_clear_pointer(&store->entries, g_hash_table_unref);
     g_free(store->path);
     g_free(store->profile_directory);
+    g_free(store->profile_namespace);
     g_free(store);
 }
 
@@ -339,6 +566,21 @@ mux_permission_store_is_persistent(const MuxPermissionStore *store)
 {
     g_return_val_if_fail(store, FALSE);
     return store->persistent;
+}
+
+MuxPermissionStoreScope
+mux_permission_store_get_scope(const MuxPermissionStore *store)
+{
+    g_return_val_if_fail(store,
+                         MUX_PERMISSION_STORE_SCOPE_EPHEMERAL);
+    return store->scope;
+}
+
+const gchar *
+mux_permission_store_get_namespace(const MuxPermissionStore *store)
+{
+    g_return_val_if_fail(store, NULL);
+    return store->profile_namespace;
 }
 
 MuxPermissionDecision
@@ -354,7 +596,9 @@ mux_permission_store_lookup(const MuxPermissionStore *store,
         return MUX_PERMISSION_DECISION_ASK;
     key = permission_key(origin, category);
     entry = g_hash_table_lookup(store->entries, key);
-    return entry ? entry->decision : MUX_PERMISSION_DECISION_ASK;
+    return entry && !permission_entry_is_expired(entry, g_get_real_time())
+               ? entry->decision
+               : MUX_PERMISSION_DECISION_ASK;
 }
 
 static gint
@@ -429,11 +673,16 @@ mux_permission_store_flush(MuxPermissionStore *store, GError **error)
     g_return_val_if_fail(store, FALSE);
     if (!store->persistent)
         return TRUE;
+    prune_expired(store, g_get_real_time());
     if (!ensure_profile_directory(store->profile_directory, error))
         return FALSE;
 
     key_file = g_key_file_new();
-    g_key_file_set_integer(key_file, "mux", "version", 1);
+    g_key_file_set_integer(key_file, "mux", "version", 2);
+    g_key_file_set_string(key_file,
+                          "mux",
+                          "namespace",
+                          store->profile_namespace);
     ordered = g_ptr_array_new();
     g_hash_table_iter_init(&iterator, store->entries);
     while (g_hash_table_iter_next(&iterator, NULL, &value))
@@ -458,10 +707,25 @@ mux_permission_store_flush(MuxPermissionStore *store, GError **error)
             group,
             "decision",
             decision_name(entry->decision));
+        g_key_file_set_int64(key_file,
+                             group,
+                             "updated-us",
+                             entry->updated_us);
+        g_key_file_set_int64(key_file,
+                             group,
+                             "expires-us",
+                             entry->expires_us);
     }
     contents = g_key_file_to_data(key_file, &length, error);
     if (!contents)
         return FALSE;
+    if (length > MUX_PERMISSION_STORE_MAX_FILE_BYTES) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "permission store exceeds its size limit");
+        return FALSE;
+    }
 
     temporary = g_strconcat(store->path, ".tmp.XXXXXX", NULL);
     descriptor = g_mkstemp_full(
@@ -517,9 +781,28 @@ mux_permission_store_set(MuxPermissionStore *store,
                          MuxPermissionDecision decision,
                          GError **error)
 {
+    return mux_permission_store_set_for_duration(
+        store,
+        origin,
+        category,
+        decision,
+        MUX_PERMISSION_STORE_DEFAULT_TTL_US,
+        error);
+}
+
+gboolean
+mux_permission_store_set_for_duration(
+    MuxPermissionStore *store,
+    const gchar *origin,
+    const gchar *category,
+    MuxPermissionDecision decision,
+    gint64 duration_us,
+    GError **error)
+{
     g_autofree gchar *key = NULL;
-    PermissionEntry *previous;
+    GHashTable *previous_entries;
     PermissionEntry *replacement = NULL;
+    gint64 now_us;
 
     g_return_val_if_fail(store, FALSE);
     if (!valid_origin(origin, error) ||
@@ -533,33 +816,56 @@ mux_permission_store_set(MuxPermissionStore *store,
                             "invalid permission decision");
         return FALSE;
     }
+    if (decision != MUX_PERMISSION_DECISION_ASK &&
+        (duration_us <= 0 ||
+         duration_us > MUX_PERMISSION_STORE_MAX_TTL_US)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "permission duration is outside its safety limit");
+        return FALSE;
+    }
 
+    previous_entries = permission_entries_copy(store->entries);
+    now_us = g_get_real_time();
+    prune_expired(store, now_us);
     key = permission_key(origin, category);
-    previous = permission_entry_copy(
-        g_hash_table_lookup(store->entries, key));
     if (decision == MUX_PERMISSION_DECISION_ASK) {
         g_hash_table_remove(store->entries, key);
     } else {
-        replacement =
-            permission_entry_new(origin, category, decision);
+        replacement = permission_entry_new(origin,
+                                           category,
+                                           decision,
+                                           now_us,
+                                           now_us + duration_us);
         g_hash_table_replace(
             store->entries, replacement->key, replacement);
     }
+    enforce_entry_limit(store);
 
     if (!mux_permission_store_flush(store, error)) {
-        g_hash_table_remove(store->entries, key);
-        if (previous)
-            g_hash_table_replace(
-                store->entries, previous->key, previous);
+        g_hash_table_unref(store->entries);
+        store->entries = previous_entries;
         return FALSE;
     }
-    permission_entry_free(previous);
+    g_hash_table_unref(previous_entries);
     return TRUE;
 }
 
 guint
 mux_permission_store_size(const MuxPermissionStore *store)
 {
+    GHashTableIter iterator;
+    gpointer value;
+    gint64 now_us;
+    guint count = 0;
+
     g_return_val_if_fail(store, 0);
-    return g_hash_table_size(store->entries);
+    now_us = g_get_real_time();
+    g_hash_table_iter_init(&iterator, store->entries);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        if (!permission_entry_is_expired(value, now_us))
+            count++;
+    }
+    return count;
 }

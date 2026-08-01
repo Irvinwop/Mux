@@ -1,82 +1,133 @@
 # Running Mux with WPE WebKit
 
-The browser frame path is:
+Mux's real browser path is:
 
-    WPE WebKit -> WPEBuffer -> damage copy -> POSIX shared memory -> Kitty image edit
+```text
+WPE WebKit -> WPEBuffer damage -> POSIX shared memory -> Kitty image update
+```
 
-There are no PNG encodes and no polling screenshot loop. WebKit submits frames
-when page content changes. Mux applies a configurable presentation ceiling and
-otherwise sleeps without a redraw timer.
+The implementation does not encode a PNG for each frame and does not poll the
+page for screenshots. It is designed to copy damaged raw RGBA regions and
+update one Kitty graphics image in place.
 
-## Requirements
+## Runtime requirements
 
 - Linux
-- Kitty
-- Meson and Ninja
-- GLib 2.74 or newer
+- Kitty in a Wayland or X11 session
+- GLib and GIO 2.74 or newer
 - WPE WebKit 2.52 or newer
-- WPEPlatform enabled in WPE WebKit with `-DENABLE_WPE_PLATFORM=ON`
-- pkg-config modules wpe-webkit-2.0 and wpe-platform-2.0
+- WPEPlatform enabled in the WPE build
+- pkg-config modules `wpe-webkit-2.0` and `wpe-platform-2.0`
+- Writable `/dev/shm`
 
-WPEPlatform is optional in the 2.52 release line. A distro package can contain
-WPE WebKit while still omitting wpe-platform-2.0; the launcher checks for that
-case before configuring the build.
+Run `./doctor` before investigating runtime failures. It distinguishes missing
+build requirements from the expected no-display warning in headless shells.
 
-## Start
+## Start the browser
 
-From the repository root:
+The source-checkout path builds incrementally and launches Kitty:
 
-    ./mux https://example.com
+```sh
+./setup https://example.com
+```
 
-The first invocation configures an incremental release build under
-`XDG_CACHE_HOME`, ensures the central `muxd` service and profile `mux-engine`
-are available, then launches a dedicated Kitty window. Later invocations only
-compile changed files.
+After setup:
 
-Use `./setup` instead when dependencies have not yet been installed.
+```sh
+./mux https://example.com
+```
 
-## Controls
+The Nix path builds and packages the same WPE processes:
 
-- Ctrl+L edits the URL bar. Plain words with spaces become a DuckDuckGo query.
-- Ctrl+R reloads.
-- Alt+Left and Alt+Right navigate history.
-- Ctrl+Shift+I toggles Web Inspector.
-- Ctrl+Shift+V opens profile clipboard history.
-- Ctrl+Q exits the pane.
-- Ctrl+Shift+Enter opens another browser split.
-- Ctrl+Shift+T opens another browser tab.
-- Ctrl+Shift+N opens another Kitty OS window.
+```sh
+nix run . -- https://example.com
+```
 
-Mouse input uses Kitty SGR pixel coordinates, so WPE receives pane-relative
-pixel positions rather than guessed terminal-cell positions.
-
-## Frame behavior
-
-`MUX_MAX_FPS` controls the presentation ceiling and defaults to 60. Values up
-to 240 are accepted. This is a ceiling, not a redraw request: static pages
-remain at zero frames per second.
-
-The adapter keeps exactly one WPE buffer pending until its presentation
-deadline. It copies only WebKit's damaged area, edits the existing Kitty image
-in place, then reports the WPE buffer rendered and released. Kitty receives raw
-RGBA from a short-lived POSIX shared-memory object that is unlinked after use.
+Both launch paths ensure `muxd` is running, put the WPE runtime processes on
+`PATH`, set the initial logical layer and global-bar environment, and start a
+dedicated Kitty instance with Mux's WPE configuration.
 
 ## Runtime architecture
 
-`muxd` owns the control plane, layers, pane routing, and clipboard broker. A
-profile-specific `mux-engine` owns the WPE display, WebKit network session, and
-all page views for that profile. Each Kitty window runs a thin `mux-pane` that
-forwards input and presents the selected view's frames.
+`muxd` owns the local control plane, logical layers, pane routing, and clipboard
+broker. One `mux-engine` owns a WPE display, WebKit session, and page views for
+each profile. Each Kitty browser pane runs `mux-pane` to forward input and
+present frames. `mux-bar` follows focus, and `mux-layer` creates the initial
+pane collection.
 
-The same engine-to-pane extension channel carries trusted browser UI requests:
-script dialogs, permissions, authentication, file selection, downloads,
-option menus, context menus, popup attachment, and crash recovery. Clipboard
-traffic uses an atomic binary protocol so all MIME variants remain related.
+WebKit still launches its own sandboxed web, network, and GPU processes. Mux
+centralizes browser coordination; it does not merge untrusted web content into
+the daemon.
 
-## Current release gate
+## Frame pacing
 
-The source implementation is complete enough for an end-to-end Linux exercise.
-Before treating it as released, run it interactively with WPE WebKit 2.52 and
-Kitty and cover navigation, animated damage, splits, layers, clipboard history,
-downloads, prompts, popups, and renderer termination. The GitHub workflow proves
-compilation only; it has no interactive Kitty terminal.
+`MUX_MAX_FPS` sets the intended presentation ceiling and defaults to 60. Values
+up to 240 are accepted. It is a ceiling rather than a redraw request, so static
+pages should not require a continuous stream of identical frames.
+
+The adapter retains one submitted WPE buffer until its presentation deadline,
+copies the damaged region into shared memory, updates the Kitty image, and then
+reports the WPE buffer rendered and released. The shared-memory object is
+short-lived and unlinked after use.
+
+This design is implemented but still needs interactive measurement under
+scrolling, video, animation, resize, high-DPI output, and background layers.
+
+## Wired input and browser UI
+
+The current code carries keyboard, pointer, focus, resize, and input-method
+events between Kitty panes and WPE views. It also has trusted request paths for
+dialogs, permission decisions, authentication, file selection, downloads,
+menus, popups, notifications, clipboard operations, and renderer crashes.
+
+The intended browser bindings are:
+
+- `Ctrl+L`: edit the global URL bar
+- `Ctrl+R`: reload
+- `Alt+Left` and `Alt+Right`: navigate page history
+- `Ctrl+Shift+V`: open profile clipboard history
+- `Ctrl+Shift+P`: open commands, bookmarks, history, and recently closed pages
+- `Ctrl+D`: toggle a bookmark for the current page
+- `Ctrl+Q`: close the pane
+- `Ctrl+Shift+Enter`: open a split
+- `Ctrl+Shift+T`: open a layer in another Kitty tab
+- `Ctrl+Shift+N`: open a Kitty OS window
+
+These paths are not all release-qualified. User Kitty mappings may override or
+conflict with Mux bindings.
+
+## Clipboard boundary
+
+The clipboard broker can keep related MIME variants in one bounded,
+memory-only snapshot and isolate history by profile. Text, HTML, images, and
+arbitrary binary variants are representable. Pages can request only the current
+clipboard through WebKit's permission path; they cannot enumerate history.
+
+History records traffic observed by Mux, not every external desktop clipboard
+change. Full Kitty-to-WPE behavior, large payload handling, and private-profile
+isolation still require interactive validation.
+
+## Known runtime limitations
+
+- Workspace metadata survives daemon restart, but offline panes are not
+  relaunched automatically after a full desktop logout.
+- In-flight trusted UI requests are cancelled when an engine is replaced.
+- Logical layer moves do not yet guarantee physical Kitty moves.
+- Closing a pane can bypass a page's before-unload flow.
+- Browser UI paths such as uploads, downloads, popups, notifications, and
+  permission prompts need live-site testing.
+- Shortcut routing has not been validated against a broad set of Kitty user
+  configurations.
+- Media support depends on the installed GStreamer plugins and site codec
+  requirements.
+
+## What CI proves
+
+The Linux workflow configures the real WPE Meson project as a release build,
+turns compiler warnings into errors, compiles every target, and runs the
+registered native tests. Those tests cover data models and local protocols;
+they do not open a graphical Kitty window or load live websites.
+
+Before calling v0.1 daily-driver ready, exercise navigation, frame pacing,
+splits, layers, clipboard history, uploads, downloads, prompts, popups,
+permissions, media, and renderer termination on a real Linux desktop.

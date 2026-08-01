@@ -13,6 +13,10 @@ typedef gboolean (*MuxBrowserAffordanceSendFunc)(GBytes *payload,
                                                   gpointer user_data,
                                                   GError **error);
 
+typedef gboolean (*MuxBrowserAffordanceChoiceFunc)(guint32 choice_id,
+                                                    gpointer user_data,
+                                                    GError **error);
+
 MuxBrowserAffordanceBridge *mux_browser_affordance_bridge_new(
     WebKitWebView *web_view,
     gboolean private_profile,
@@ -36,6 +40,16 @@ void mux_browser_affordance_bridge_cancel_all(
 
 guint mux_browser_affordance_bridge_pending_count(
     const MuxBrowserAffordanceBridge *bridge);
+
+gboolean mux_browser_affordance_bridge_show_command_surface(
+    MuxBrowserAffordanceBridge *bridge,
+    const gchar *heading,
+    const gchar *message,
+    const GPtrArray *choices,
+    MuxBrowserAffordanceChoiceFunc choice_func,
+    gpointer user_data,
+    GDestroyNotify user_data_destroy,
+    GError **error);
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxBrowserAffordanceBridge,
                               mux_browser_affordance_bridge_free)
