@@ -159,6 +159,7 @@
             ];
             buildInputs = [
               pkgs.glib
+              pkgs.libxkbcommon
               wpeWebKit
             ];
 
@@ -167,7 +168,7 @@
             doCheck = true;
             checkPhase = ''
               runHook preCheck
-              meson test -C build --print-errorlogs --no-rebuild
+              meson test --print-errorlogs --no-rebuild
               runHook postCheck
             '';
 
@@ -177,7 +178,7 @@
               runHook preInstall
               mkdir -p "$out/bin"
               for program in muxd muxctl mux-bar mux-layer mux-engine mux-pane; do
-                install -Dm755 "build/$program" "$out/bin/$program"
+                install -Dm755 "$program" "$out/bin/$program"
               done
               runHook postInstall
             '';
@@ -209,7 +210,9 @@
 
               if [[ $# -gt 0 && $1 == ctl ]]; then
                 shift
-                muxd --ensure
+                if [[ $# -gt 0 && $1 != stop ]]; then
+                  muxd --ensure
+                fi
                 exec muxctl "$@"
               fi
 
