@@ -24,6 +24,7 @@ struct _MuxPopupManager {
     WebKitWebView *parent;
     GHashTable *by_token;
     GHashTable *by_child;
+    guint creating_count;
     MuxPopupCreateFunc create_func;
     MuxPopupOfferFunc offer_func;
     MuxPopupDestroyFunc destroy_func;
@@ -31,6 +32,15 @@ struct _MuxPopupManager {
     GDestroyNotify user_data_destroy;
     gulong create_handler;
 };
+
+static gboolean
+popup_request_is_admissible(gboolean user_gesture,
+                            guint pending_count,
+                            guint creating_count)
+{
+    return user_gesture && pending_count < MUX_POPUP_MAX_PENDING &&
+           creating_count < MUX_POPUP_MAX_PENDING - pending_count;
+}
 
 static gboolean
 random_bytes(guint8 *data, gsize length)
@@ -128,6 +138,8 @@ on_child_ready(WebKitWebView *child, PopupRecord *record)
     g_autoptr(GError) error = NULL;
     gboolean offered;
 
+    if (record->ready)
+        return;
     record->ready = TRUE;
     record->expires_at_us =
         g_get_monotonic_time() +
@@ -166,14 +178,22 @@ on_create(WebKitWebView *parent,
     WebKitWebView *child;
     PopupRecord *record;
     gchar *token;
+    guint pending_count = g_hash_table_size(manager->by_token);
+    gboolean user_gesture =
+        navigation_action &&
+        webkit_navigation_action_is_user_gesture(navigation_action);
 
-    if (g_hash_table_size(manager->by_token) >= MUX_POPUP_MAX_PENDING)
+    if (!popup_request_is_admissible(user_gesture,
+                                     pending_count,
+                                     manager->creating_count))
         return NULL;
 
+    manager->creating_count++;
     child = manager->create_func(parent,
                                  navigation_action,
                                  manager->user_data,
                                  &error);
+    manager->creating_count--;
     if (!child) {
         if (error)
             g_warning("popup creation denied: %s", error->message);

@@ -362,6 +362,25 @@ test(
   timeout: 20,
 )
 
+download_engine_test = executable(
+  'test-download-engine',
+  [
+    'tests/test-download-engine.c',
+    'mux-ui-protocol.c',
+  ],
+  dependencies: engine_dependencies,
+)
+
+test('download-engine', download_engine_test)
+
+popup_engine_test = executable(
+  'test-popup-engine',
+  'tests/test-popup-engine.c',
+  dependencies: engine_dependencies,
+)
+
+test('popup-engine', popup_engine_test)
+
 configure_file(
   input: 'packaging/mux',
   output: 'mux',
