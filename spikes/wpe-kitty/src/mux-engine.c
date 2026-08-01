@@ -64,6 +64,21 @@
 #define MUX_ENGINE_BACKPRESSURE_RETRY_MIN_MS 50U
 #define MUX_ENGINE_BACKPRESSURE_RETRY_MAX_MS 1000U
 #define MUX_POPUP_LAUNCH_TIMEOUT_MS 5000U
+#define MUX_ENGINE_REGISTRY_VERSION 1U
+#define MUX_ENGINE_MUXD_RETRY_MS 250U
+#define MUX_ENGINE_MUXD_HANDSHAKE_MS 1000U
+#define MUX_ENGINE_IDLE_EXIT_MS 5000U
+#define MUX_ENGINE_MUXD_INPUT_BYTES 4096U
+
+static gboolean
+engine_idle_fallback_should_arm(gboolean had_owned_views,
+                                guint active_views,
+                                gboolean muxd_connected,
+                                gboolean shutting_down)
+{
+    return had_owned_views && active_views == 0 &&
+        !muxd_connected && !shutting_down;
+}
 
 static gboolean
 engine_view_capacity_available(guint active_views, guint pending_views)
@@ -145,6 +160,18 @@ WebKitNetworkSession *
 mux_engine_test_private_network_session_new(void)
 {
     return engine_private_network_session_new();
+}
+
+gboolean
+mux_engine_test_idle_fallback_should_arm(gboolean had_owned_views,
+                                         guint active_views,
+                                         gboolean muxd_connected,
+                                         gboolean shutting_down)
+{
+    return engine_idle_fallback_should_arm(had_owned_views,
+                                           active_views,
+                                           muxd_connected,
+                                           shutting_down);
 }
 
 #else
@@ -274,6 +301,12 @@ struct _Engine {
     guint listen_watch_id;
     guint sigint_watch_id;
     guint sigterm_watch_id;
+    int muxd_fd;
+    guint muxd_watch_id;
+    guint muxd_retry_id;
+    guint muxd_handshake_id;
+    guint idle_exit_id;
+    GString *muxd_input;
     guint64 next_view_id;
     guint64 next_event_serial;
     guint64 clipboard_reply_view_id;
@@ -289,6 +322,9 @@ struct _Engine {
     gchar *data_directory;
     gchar *cache_directory;
     gboolean socket_bound;
+    gboolean muxd_registered;
+    gboolean had_owned_views;
+    gboolean shutting_down;
 };
 
 typedef struct {
@@ -482,6 +518,8 @@ mux_display_create_view(WPEDisplay *display)
 static void engine_view_free(gpointer data);
 static void client_free(gpointer data);
 static gboolean client_ready(gint fd, GIOCondition condition, gpointer data);
+static void engine_update_idle_fallback(Engine *engine);
+static void engine_muxd_schedule_reconnect(Engine *engine);
 
 static gboolean
 text_is_valid(const gchar *value, gsize maximum)
@@ -590,6 +628,299 @@ default_socket_path(const gchar *profile)
     g_free(filename);
     g_free(directory);
     return path;
+}
+
+static gchar *
+muxd_socket_path(void)
+{
+    gchar *directory = runtime_directory();
+    gchar *path = g_build_filename(directory, "muxd.sock", NULL);
+
+    g_free(directory);
+    return path;
+}
+
+static gboolean
+engine_muxd_send_bytes(int fd, const gchar *data, gsize length)
+{
+    while (length > 0) {
+        ssize_t written;
+
+        do {
+            written = send(fd, data, length, MSG_NOSIGNAL);
+        } while (written < 0 && errno == EINTR);
+        if (written <= 0)
+            return FALSE;
+        data += written;
+        length -= (gsize)written;
+    }
+    return TRUE;
+}
+
+static gboolean
+engine_idle_exit(gpointer data)
+{
+    Engine *engine = data;
+    guint active_views = engine->views
+        ? g_hash_table_size(engine->views)
+        : 0;
+
+    engine->idle_exit_id = 0;
+    if (!engine_idle_fallback_should_arm(engine->had_owned_views,
+                                         active_views,
+                                         engine->muxd_fd >= 0,
+                                         engine->shutting_down))
+        return G_SOURCE_REMOVE;
+    engine->shutting_down = TRUE;
+    g_main_loop_quit(engine->loop);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+engine_update_idle_fallback(Engine *engine)
+{
+    guint active_views = engine->views
+        ? g_hash_table_size(engine->views)
+        : 0;
+    gboolean arm = engine_idle_fallback_should_arm(
+        engine->had_owned_views,
+        active_views,
+        engine->muxd_fd >= 0,
+        engine->shutting_down);
+
+    if (!arm && engine->idle_exit_id) {
+        g_source_remove(engine->idle_exit_id);
+        engine->idle_exit_id = 0;
+    } else if (arm && !engine->idle_exit_id) {
+        engine->idle_exit_id = g_timeout_add(MUX_ENGINE_IDLE_EXIT_MS,
+                                             engine_idle_exit,
+                                             engine);
+    }
+}
+
+static void
+engine_muxd_drop(Engine *engine, gboolean from_watch)
+{
+    if (!from_watch && engine->muxd_watch_id)
+        g_source_remove(engine->muxd_watch_id);
+    engine->muxd_watch_id = 0;
+    if (engine->muxd_handshake_id) {
+        g_source_remove(engine->muxd_handshake_id);
+        engine->muxd_handshake_id = 0;
+    }
+    if (engine->muxd_fd >= 0) {
+        close(engine->muxd_fd);
+        engine->muxd_fd = -1;
+    }
+    engine->muxd_registered = FALSE;
+    if (engine->muxd_input)
+        g_string_truncate(engine->muxd_input, 0);
+    if (!engine->shutting_down)
+        engine_muxd_schedule_reconnect(engine);
+    engine_update_idle_fallback(engine);
+}
+
+static gboolean
+engine_muxd_handle_line(Engine *engine, const gchar *line)
+{
+    if (g_strcmp0(line, "ENGINE_OK\t1") == 0) {
+        engine->muxd_registered = TRUE;
+        if (engine->muxd_handshake_id) {
+            g_source_remove(engine->muxd_handshake_id);
+            engine->muxd_handshake_id = 0;
+        }
+        engine_update_idle_fallback(engine);
+        return TRUE;
+    }
+    if (engine->muxd_registered &&
+        g_strcmp0(line, "ENGINE_STOP") == 0) {
+        static const gchar bye[] = "ENGINE_BYE\n";
+
+        engine->shutting_down = TRUE;
+        (void)engine_muxd_send_bytes(engine->muxd_fd,
+                                     bye,
+                                     sizeof(bye) - 1);
+        g_main_loop_quit(engine->loop);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean
+engine_muxd_ready(gint fd, GIOCondition condition, gpointer data)
+{
+    Engine *engine = data;
+    gchar buffer[1024];
+    gsize received = 0;
+
+    (void)fd;
+    if (!(condition & G_IO_IN)) {
+        engine_muxd_drop(engine, TRUE);
+        return G_SOURCE_REMOVE;
+    }
+
+    while (received < MUX_ENGINE_MUXD_INPUT_BYTES) {
+        ssize_t count;
+
+        do {
+            count = recv(engine->muxd_fd,
+                         buffer,
+                         MIN(sizeof(buffer),
+                             MUX_ENGINE_MUXD_INPUT_BYTES - received),
+                         0);
+        } while (count < 0 && errno == EINTR);
+        if (count > 0) {
+            received += (gsize)count;
+            g_string_append_len(engine->muxd_input, buffer, count);
+            if (engine->muxd_input->len > MUX_ENGINE_MUXD_INPUT_BYTES) {
+                engine_muxd_drop(engine, TRUE);
+                return G_SOURCE_REMOVE;
+            }
+            for (;;) {
+                gchar *newline = memchr(engine->muxd_input->str,
+                                        '\n',
+                                        engine->muxd_input->len);
+                gchar *line;
+                gsize length;
+
+                if (!newline)
+                    break;
+                length = (gsize)(newline - engine->muxd_input->str);
+                line = g_strndup(engine->muxd_input->str, length);
+                g_strchomp(line);
+                g_string_erase(engine->muxd_input, 0, length + 1);
+                if (!engine_muxd_handle_line(engine, line)) {
+                    g_free(line);
+                    engine_muxd_drop(engine, TRUE);
+                    return G_SOURCE_REMOVE;
+                }
+                g_free(line);
+                if (engine->shutting_down)
+                    return G_SOURCE_CONTINUE;
+            }
+            continue;
+        }
+        if (count == 0) {
+            engine_muxd_drop(engine, TRUE);
+            return G_SOURCE_REMOVE;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            break;
+        engine_muxd_drop(engine, TRUE);
+        return G_SOURCE_REMOVE;
+    }
+
+    if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
+        engine_muxd_drop(engine, TRUE);
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean
+engine_muxd_handshake_timed_out(gpointer data)
+{
+    Engine *engine = data;
+
+    engine->muxd_handshake_id = 0;
+    if (!engine->muxd_registered)
+        engine_muxd_drop(engine, FALSE);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean
+engine_muxd_connect(Engine *engine)
+{
+    g_autofree gchar *path = muxd_socket_path();
+    g_autofree gchar *encoded_profile = NULL;
+    g_autofree gchar *registration = NULL;
+    struct sockaddr_un address = { 0 };
+    struct ucred credentials;
+    struct stat status;
+    socklen_t credentials_size = sizeof(credentials);
+    int fd;
+    int flags;
+
+    if (strlen(path) >= sizeof(address.sun_path) ||
+        lstat(path, &status) < 0 || !S_ISSOCK(status.st_mode) ||
+        status.st_uid != getuid() || (status.st_mode & 0077) != 0)
+        return FALSE;
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return FALSE;
+    address.sun_family = AF_UNIX;
+    g_strlcpy(address.sun_path, path, sizeof(address.sun_path));
+    if (connect(fd,
+                (const struct sockaddr *)&address,
+                sizeof(address)) < 0 ||
+        getsockopt(fd,
+                   SOL_SOCKET,
+                   SO_PEERCRED,
+                   &credentials,
+                   &credentials_size) < 0 ||
+        credentials_size != sizeof(credentials) ||
+        credentials.uid != getuid()) {
+        close(fd);
+        return FALSE;
+    }
+
+    encoded_profile = g_base64_encode((const guchar *)engine->profile,
+                                      strlen(engine->profile));
+    registration = g_strdup_printf("ENGINE\t%u\t%s\t%ld\n",
+                                   MUX_ENGINE_REGISTRY_VERSION,
+                                   encoded_profile,
+                                   (long)getpid());
+    if (!engine_muxd_send_bytes(fd,
+                                registration,
+                                strlen(registration))) {
+        close(fd);
+        return FALSE;
+    }
+    flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(fd);
+        return FALSE;
+    }
+
+    engine->muxd_fd = fd;
+    if (!engine->muxd_input)
+        engine->muxd_input = g_string_new(NULL);
+    else
+        g_string_truncate(engine->muxd_input, 0);
+    engine->muxd_watch_id = g_unix_fd_add_full(
+        G_PRIORITY_DEFAULT,
+        fd,
+        G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+        engine_muxd_ready,
+        engine,
+        NULL);
+    engine->muxd_handshake_id = g_timeout_add(
+        MUX_ENGINE_MUXD_HANDSHAKE_MS,
+        engine_muxd_handshake_timed_out,
+        engine);
+    engine_update_idle_fallback(engine);
+    return TRUE;
+}
+
+static gboolean
+engine_muxd_retry(gpointer data)
+{
+    Engine *engine = data;
+
+    engine->muxd_retry_id = 0;
+    if (!engine->shutting_down && !engine_muxd_connect(engine))
+        engine_muxd_schedule_reconnect(engine);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+engine_muxd_schedule_reconnect(Engine *engine)
+{
+    if (!engine->shutting_down && engine->muxd_fd < 0 &&
+        !engine->muxd_retry_id)
+        engine->muxd_retry_id = g_timeout_add(MUX_ENGINE_MUXD_RETRY_MS,
+                                              engine_muxd_retry,
+                                              engine);
 }
 
 static gboolean
@@ -2735,6 +3066,8 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
     *key = view->id;
     client->view_count++;
     g_hash_table_insert(engine->views, key, view);
+    engine->had_owned_views = TRUE;
+    engine_update_idle_fallback(engine);
 
     g_signal_connect(view->web_view,
                      "notify::uri",
@@ -2800,6 +3133,7 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
                      payload)) {
         g_bytes_unref(payload);
         g_hash_table_remove(engine->views, &view->id);
+        engine_update_idle_fallback(engine);
         g_free(uri);
         return FALSE;
     }
@@ -2822,6 +3156,7 @@ handle_destroy_view(Client *client, const MuxEngineMessage *request)
         return TRUE;
     client_send_ack(client, request);
     g_hash_table_remove(client->engine->views, &view->id);
+    engine_update_idle_fallback(client->engine);
     return !client->failed;
 }
 
@@ -4075,6 +4410,7 @@ remove_client_views(Client *client)
         if (view->owner == client)
             g_hash_table_iter_remove(&iterator);
     }
+    engine_update_idle_fallback(client->engine);
 }
 
 static void
@@ -4379,6 +4715,7 @@ quit_signal(gpointer data)
 {
     Engine *engine = data;
 
+    engine->shutting_down = TRUE;
     g_main_loop_quit(engine->loop);
     return G_SOURCE_CONTINUE;
 }
@@ -4386,6 +4723,19 @@ quit_signal(gpointer data)
 static void
 engine_clear(Engine *engine)
 {
+    engine->shutting_down = TRUE;
+    if (engine->idle_exit_id)
+        g_source_remove(engine->idle_exit_id);
+    if (engine->muxd_retry_id)
+        g_source_remove(engine->muxd_retry_id);
+    if (engine->muxd_handshake_id)
+        g_source_remove(engine->muxd_handshake_id);
+    if (engine->muxd_watch_id)
+        g_source_remove(engine->muxd_watch_id);
+    if (engine->muxd_fd >= 0)
+        close(engine->muxd_fd);
+    if (engine->muxd_input)
+        g_string_free(engine->muxd_input, TRUE);
     if (engine->listen_watch_id)
         g_source_remove(engine->listen_watch_id);
     if (engine->sigint_watch_id)
@@ -4496,6 +4846,7 @@ main(int argc, char **argv)
         .listen_fd = -1,
         .lock_fd = -1,
         .smoke_frame_ack_fd = -1,
+        .muxd_fd = -1,
         .next_view_id = 1,
     };
 
@@ -4603,6 +4954,8 @@ main(int argc, char **argv)
         engine_clear(&engine);
         return 1;
     }
+    if (!engine_muxd_connect(&engine))
+        engine_muxd_schedule_reconnect(&engine);
 
     engine.sigint_watch_id = g_unix_signal_add(SIGINT,
                                                 quit_signal,

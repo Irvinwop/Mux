@@ -19,6 +19,10 @@ gboolean mux_engine_test_view_capacity(guint active_views,
 guint mux_engine_test_frame_backpressure_retry_delay_ms(
     guint rejection_count);
 WebKitNetworkSession *mux_engine_test_private_network_session_new(void);
+gboolean mux_engine_test_idle_fallback_should_arm(gboolean had_owned_views,
+                                                   guint active_views,
+                                                   gboolean muxd_connected,
+                                                   gboolean shutting_down);
 gboolean mux_pane_test_schedule_retry_at(gint64 now_us,
                                          gint64 *retry_us,
                                          guint *backoff_ms);
@@ -810,6 +814,31 @@ test_private_network_sessions_are_distinct_and_ephemeral(void)
 }
 
 static void
+test_engine_idle_fallback_policy(void)
+{
+    g_assert_false(mux_engine_test_idle_fallback_should_arm(FALSE,
+                                                            0,
+                                                            FALSE,
+                                                            FALSE));
+    g_assert_true(mux_engine_test_idle_fallback_should_arm(TRUE,
+                                                           0,
+                                                           FALSE,
+                                                           FALSE));
+    g_assert_false(mux_engine_test_idle_fallback_should_arm(TRUE,
+                                                            1,
+                                                            FALSE,
+                                                            FALSE));
+    g_assert_false(mux_engine_test_idle_fallback_should_arm(TRUE,
+                                                            0,
+                                                            TRUE,
+                                                            FALSE));
+    g_assert_false(mux_engine_test_idle_fallback_should_arm(TRUE,
+                                                            0,
+                                                            FALSE,
+                                                            TRUE));
+}
+
+static void
 test_frame_backpressure_retry_is_bounded(void)
 {
     g_assert_cmpuint(mux_engine_test_frame_backpressure_retry_delay_ms(0),
@@ -999,6 +1028,8 @@ main(int argc, char **argv)
                     test_engine_global_view_capacity);
     g_test_add_func("/engine-runtime/privacy/distinct-private-sessions",
                     test_private_network_sessions_are_distinct_and_ephemeral);
+    g_test_add_func("/engine-runtime/lifecycle/idle-fallback-policy",
+                    test_engine_idle_fallback_policy);
     g_test_add_func("/engine-runtime/graphics/backpressure-retry",
                     test_frame_backpressure_retry_is_bounded);
     g_test_add_func("/engine-runtime/shortcuts/exact-modifiers",

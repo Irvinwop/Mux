@@ -962,6 +962,103 @@ static pid_t spawn_transport_breaking_view(const gchar *socket_path,
     return pid;
 }
 
+static pid_t spawn_registered_engine(const gchar *socket_path,
+                                     const gchar *profile,
+                                     const gchar *ready_path,
+                                     gboolean graceful,
+                                     GError **error)
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        set_errno_error(error, "fork registered engine", errno);
+        return -1;
+    }
+    if (pid == 0) {
+        GError *child_error = NULL;
+        g_autofree gchar *encoded_profile = mux_encode(profile);
+        int fd;
+
+        if (!graceful)
+            signal(SIGTERM, SIG_IGN);
+        fd = connect_unix_socket(socket_path,
+                                 CONNECT_TIMEOUT_MS,
+                                 &child_error);
+        if (fd < 0 ||
+            !mux_send_line(fd,
+                           "ENGINE\t1\t%s\t%ld",
+                           encoded_profile,
+                           (long)getpid()))
+            _exit(2);
+        {
+            g_autofree gchar *response =
+                mux_read_line(fd, RESPONSE_TIMEOUT_MS);
+
+            if (g_strcmp0(response, "ENGINE_OK\t1") != 0)
+                _exit(3);
+        }
+        if (!publish_marker(ready_path, "ready"))
+            _exit(4);
+
+        for (;;) {
+            g_autofree gchar *line = mux_read_line(fd, -1);
+
+            if (line == NULL) {
+                if (graceful)
+                    _exit(5);
+                for (;;)
+                    pause();
+            }
+            if (g_strcmp0(line, "ENGINE_STOP") != 0)
+                continue;
+            if (!graceful)
+                continue;
+            if (!mux_send_line(fd, "ENGINE_BYE"))
+                _exit(6);
+            close(fd);
+            _exit(0);
+        }
+    }
+    return pid;
+}
+
+static gboolean engine_registration_denied(const gchar *socket_path,
+                                           const gchar *profile,
+                                           pid_t claimed_pid,
+                                           GError **error)
+{
+    g_autofree gchar *encoded_profile = mux_encode(profile);
+    g_autofree gchar *response = NULL;
+    int fd = connect_unix_socket(socket_path,
+                                 RESPONSE_TIMEOUT_MS,
+                                 error);
+
+    if (fd < 0)
+        return FALSE;
+    if (!mux_send_line(fd,
+                       "ENGINE\t1\t%s\t%ld",
+                       encoded_profile,
+                       (long)claimed_pid)) {
+        int saved_errno = errno;
+
+        close(fd);
+        set_errno_error(error,
+                        "send rejected engine registration",
+                        saved_errno);
+        return FALSE;
+    }
+    response = mux_read_line(fd, RESPONSE_TIMEOUT_MS);
+    close(fd);
+    if (response && g_str_has_prefix(response, "ERR\t"))
+        return TRUE;
+    g_set_error(error,
+                G_IO_ERROR,
+                G_IO_ERROR_INVALID_DATA,
+                "engine registration was not denied: %s",
+                response ? response : "(connection closed)");
+    return FALSE;
+}
+
 static pid_t spawn_stoppable_bar(const gchar *socket_path,
                                  const gchar *ready_path,
                                  const gchar *closed_path,
@@ -2115,6 +2212,149 @@ cleanup:
     g_free(old_runtime);
 }
 
+static void test_muxctl_engine_lifecycle(void)
+{
+    gchar *root = NULL;
+    gchar *runtime_dir = NULL;
+    gchar *state_dir = NULL;
+    gchar *socket_path = NULL;
+    gchar *graceful_ready = NULL;
+    gchar *stubborn_ready = NULL;
+    gchar *output = NULL;
+    gchar *old_runtime = g_strdup(g_getenv("XDG_RUNTIME_DIR"));
+    gchar *old_state = g_strdup(g_getenv("XDG_STATE_HOME"));
+    GError *error = NULL;
+    struct ucred credentials;
+    int guard_fd = -1;
+    pid_t daemon_pid = -1;
+    pid_t graceful_pid = -1;
+    pid_t stubborn_pid = -1;
+    mode_t old_umask = umask(0077);
+
+    root = g_dir_make_tmp("muxctl-engine-integration-XXXXXX", &error);
+    REQUIRE_CALL(root != NULL, "create engine lifecycle root");
+    runtime_dir = g_build_filename(root, "runtime", NULL);
+    state_dir = g_build_filename(root, "state", NULL);
+    socket_path = g_build_filename(runtime_dir, "mux", "muxd.sock", NULL);
+    graceful_ready = g_build_filename(root, "graceful-ready", NULL);
+    stubborn_ready = g_build_filename(root, "stubborn-ready", NULL);
+    REQUIRE(g_mkdir(runtime_dir, 0700) == 0,
+            "create engine runtime directory: %s",
+            g_strerror(errno));
+    REQUIRE(g_mkdir(state_dir, 0700) == 0,
+            "create engine state directory: %s",
+            g_strerror(errno));
+    REQUIRE(g_setenv("XDG_RUNTIME_DIR", runtime_dir, TRUE),
+            "set engine XDG_RUNTIME_DIR");
+    REQUIRE(g_setenv("XDG_STATE_HOME", state_dir, TRUE),
+            "set engine XDG_STATE_HOME");
+
+    REQUIRE_CALL(run_command(muxd_executable,
+                             "--ensure",
+                             CHILD_TIMEOUT_MS,
+                             &error),
+                 "start muxd for engine lifecycle");
+    guard_fd = connect_unix_socket(socket_path,
+                                   CONNECT_TIMEOUT_MS,
+                                   &error);
+    REQUIRE_CALL(guard_fd >= 0, "connect engine lifecycle guard");
+    REQUIRE_CALL(get_peer_credentials(guard_fd, &credentials, &error),
+                 "identify engine lifecycle muxd");
+    daemon_pid = credentials.pid;
+
+    REQUIRE_CALL(engine_registration_denied(socket_path,
+                                            "spoofed",
+                                            getpid() + 1,
+                                            &error),
+                 "deny spoofed engine pid");
+    REQUIRE_CALL(engine_registration_denied(socket_path,
+                                            "../malformed",
+                                            getpid(),
+                                            &error),
+                 "deny malformed engine profile");
+
+    graceful_pid = spawn_registered_engine(socket_path,
+                                           "graceful",
+                                           graceful_ready,
+                                           TRUE,
+                                           &error);
+    REQUIRE_CALL(graceful_pid > 0, "spawn graceful engine");
+    stubborn_pid = spawn_registered_engine(socket_path,
+                                           "stubborn",
+                                           stubborn_ready,
+                                           FALSE,
+                                           &error);
+    REQUIRE_CALL(stubborn_pid > 0, "spawn stubborn engine");
+    REQUIRE(wait_for_path(graceful_ready, STATE_TIMEOUT_MS),
+            "graceful engine did not register");
+    REQUIRE(wait_for_path(stubborn_ready, STATE_TIMEOUT_MS),
+            "stubborn engine did not register");
+
+    output = run_command_capture(muxctl_executable,
+                                 "stop",
+                                 7000,
+                                 &error);
+    REQUIRE_CALL(output != NULL, "stop muxd with registered engines");
+    REQUIRE(g_strcmp0(output, "muxd stopped\n") == 0,
+            "unexpected engine stop output: %s",
+            output);
+    g_clear_pointer(&output, g_free);
+    REQUIRE_CALL(reap_child_exit_now(graceful_pid, 0, &error),
+                 "graceful engine was alive after successful stop");
+    graceful_pid = -1;
+    REQUIRE_CALL(reap_child_signal_now(stubborn_pid, SIGKILL, &error),
+                 "stubborn engine did not reach pidfd SIGKILL");
+    stubborn_pid = -1;
+    close(guard_fd);
+    guard_fd = -1;
+    REQUIRE(wait_for_path_absent(socket_path, STATE_TIMEOUT_MS),
+            "engine lifecycle stop left muxd socket behind");
+    REQUIRE(wait_for_pid_terminated(daemon_pid, STATE_TIMEOUT_MS),
+            "engine lifecycle stop left muxd running");
+    daemon_pid = -1;
+
+    output = run_command_capture(muxctl_executable,
+                                 "stop",
+                                 CHILD_TIMEOUT_MS,
+                                 &error);
+    REQUIRE_CALL(output != NULL, "repeat engine lifecycle stop");
+    REQUIRE(g_strcmp0(output, "muxd is not running\n") == 0,
+            "unexpected repeated engine stop output: %s",
+            output);
+
+cleanup:
+    if (graceful_pid > 0)
+        reap_forcefully(graceful_pid);
+    if (stubborn_pid > 0)
+        reap_forcefully(stubborn_pid);
+    if (daemon_pid > 1 && socket_path != NULL) {
+        GError *stop_error = NULL;
+
+        if (!stop_identified_daemon(socket_path,
+                                    daemon_pid,
+                                    &stop_error))
+            g_test_message("stop engine lifecycle muxd: %s",
+                           stop_error ? stop_error->message : "unknown error");
+        g_clear_error(&stop_error);
+    }
+    if (guard_fd >= 0)
+        close(guard_fd);
+    g_clear_error(&error);
+    remove_tree(root);
+    restore_environment("XDG_RUNTIME_DIR", old_runtime);
+    restore_environment("XDG_STATE_HOME", old_state);
+    (void)umask(old_umask);
+    g_free(output);
+    g_free(stubborn_ready);
+    g_free(graceful_ready);
+    g_free(socket_path);
+    g_free(state_dir);
+    g_free(runtime_dir);
+    g_free(root);
+    g_free(old_state);
+    g_free(old_runtime);
+}
+
 static void test_muxd_ensure_timeout_reaps_owned_child(void)
 {
     gchar *root = NULL;
@@ -2257,6 +2497,8 @@ int main(int argc, char **argv)
                     test_muxctl_requires_complete_response);
     g_test_add_func("/muxd/integration/muxctl-stop-lifecycle",
                     test_muxctl_stop_lifecycle);
+    g_test_add_func("/muxd/integration/muxctl-engine-lifecycle",
+                    test_muxctl_engine_lifecycle);
     g_test_add_func("/muxd/integration/ensure-timeout-reaps-owned-child",
                     test_muxd_ensure_timeout_reaps_owned_child);
     result = g_test_run();

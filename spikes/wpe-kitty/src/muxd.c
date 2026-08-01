@@ -26,7 +26,10 @@ typedef enum {
     CLIENT_VIEW,
     CLIENT_SUBSCRIBER,
     CLIENT_BAR,
+    CLIENT_ENGINE,
 } ClientKind;
+
+typedef struct _EngineRegistration EngineRegistration;
 
 typedef struct {
     int fd;
@@ -55,12 +58,24 @@ typedef struct {
     gboolean stop_abandon;
     guint64 session_view_id;
     gboolean focused;
+    EngineRegistration *engine;
 } Client;
+
+struct _EngineRegistration {
+    gchar *profile;
+    pid_t peer_pid;
+    int peer_pidfd;
+    Client *client;
+    gboolean stop_term_sent;
+    gboolean stop_kill_sent;
+    gboolean stop_abandon;
+};
 
 typedef struct {
     int listener;
     int lock_fd;
     GPtrArray *clients;
+    GPtrArray *engines;
     gchar *socket_path;
     gchar *active_id;
     gchar *current_layer;
@@ -73,6 +88,9 @@ typedef struct {
     gboolean stop_term_sent;
     gboolean stop_kill_sent;
     gboolean stop_cleanup_failed;
+    gboolean stop_engines_requested;
+    gboolean stop_engine_term_sent;
+    gboolean stop_engine_kill_sent;
     gint64 stop_deadline_us;
     Client *stop_client;
     gboolean session_dirty;
@@ -105,6 +123,9 @@ typedef struct {
 #define MAX_KITTY_SOCKET_BYTES 4096u
 #define MAX_KITTY_WINDOW_ID_BYTES 20u
 #define MAX_CLIENTS 128u
+#define MAX_ENGINES 32u
+#define ENGINE_REGISTRY_VERSION 1u
+#define MAX_ENGINE_PROFILE_BYTES 64u
 #define MAX_CLIENT_OUTPUT_BYTES (1024u * 1024u)
 #define MAX_CLIENT_IO_BYTES_PER_TICK (64u * 1024u)
 #define KITTY_MOVE_TIMEOUT_MS 2500u
@@ -116,6 +137,9 @@ typedef struct {
 #define STOP_CLIENT_GRACE_MS 1500u
 #define STOP_CLIENT_TERM_GRACE_MS 500u
 #define STOP_CLIENT_KILL_GRACE_MS 500u
+#define STOP_ENGINE_GRACE_MS 1000u
+#define STOP_ENGINE_TERM_GRACE_MS 250u
+#define STOP_ENGINE_KILL_GRACE_MS 250u
 #define STOP_OWNED_CHILD_REAP_MS 500u
 #define STOP_REPLY_FLUSH_MS 500u
 
@@ -183,6 +207,63 @@ static gboolean peer_pidfd_exited(Client *client)
     } while (result < 0 && errno == EINTR);
     return result > 0 &&
         (descriptor.revents & (POLLIN | POLLHUP | POLLERR));
+}
+
+static gboolean engine_pidfd_signal(EngineRegistration *engine,
+                                    int signal_number)
+{
+#ifdef SYS_pidfd_send_signal
+    long result;
+
+    if (engine->peer_pidfd < 0) {
+        errno = ENOTSUP;
+        return FALSE;
+    }
+    do {
+        result = syscall(SYS_pidfd_send_signal,
+                         engine->peer_pidfd,
+                         signal_number,
+                         NULL,
+                         0);
+    } while (result < 0 && errno == EINTR);
+    return result == 0 || errno == ESRCH;
+#else
+    (void)engine;
+    (void)signal_number;
+    errno = ENOSYS;
+    return FALSE;
+#endif
+}
+
+static gboolean engine_pidfd_exited(EngineRegistration *engine)
+{
+    struct pollfd descriptor = {
+        .fd = engine->peer_pidfd,
+        .events = POLLIN,
+    };
+    int result;
+
+    if (engine->peer_pidfd < 0)
+        return FALSE;
+    do {
+        result = poll(&descriptor, 1, 0);
+    } while (result < 0 && errno == EINTR);
+    return result > 0 &&
+        (descriptor.revents & (POLLIN | POLLHUP | POLLERR));
+}
+
+static void engine_registration_free(gpointer data)
+{
+    EngineRegistration *engine = data;
+
+    if (!engine)
+        return;
+    if (engine->client && engine->client->engine == engine)
+        engine->client->engine = NULL;
+    if (engine->peer_pidfd >= 0)
+        close(engine->peer_pidfd);
+    g_free(engine->profile);
+    g_free(engine);
 }
 
 static gboolean signal_stopping_view(Server *server,
@@ -570,6 +651,8 @@ static gboolean client_flush_bounded(Client *client, guint timeout_ms)
 static void client_free(gpointer data)
 {
     Client *client = data;
+    if (client->engine && client->engine->client == client)
+        client->engine->client = NULL;
     if (client->fd >= 0)
         close(client->fd);
     if (client->peer_pidfd >= 0)
@@ -962,6 +1045,11 @@ static guint view_count(Server *server)
     return count;
 }
 
+static guint engine_count(Server *server)
+{
+    return server->engines ? server->engines->len : 0;
+}
+
 static gboolean send_snapshot_line(Client *client,
                                    const gchar *format,
                                    ...)
@@ -1148,6 +1236,153 @@ static void control_error(Client *client, const gchar *message)
     client_close_after_flush(client);
 }
 
+static gboolean engine_profile_is_valid(const gchar *profile)
+{
+    gsize length;
+
+    if (!profile || !*profile ||
+        g_str_equal(profile, ".") || g_str_equal(profile, ".."))
+        return FALSE;
+    length = strlen(profile);
+    if (length > MAX_ENGINE_PROFILE_BYTES)
+        return FALSE;
+    for (gsize i = 0; i < length; i++) {
+        const gchar byte = profile[i];
+
+        if (!g_ascii_isalnum(byte) && byte != '-' &&
+            byte != '_' && byte != '.')
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static gchar *decode_engine_profile(const gchar *encoded)
+{
+    g_autofree gchar *profile = NULL;
+    g_autofree gchar *canonical = NULL;
+
+    if (!encoded || strlen(encoded) > 4 * MAX_ENGINE_PROFILE_BYTES + 4)
+        return NULL;
+    profile = mux_decode(encoded);
+    if (!engine_profile_is_valid(profile))
+        return NULL;
+    canonical = mux_encode(profile);
+    if (g_strcmp0(canonical, encoded) != 0)
+        return NULL;
+    return g_steal_pointer(&profile);
+}
+
+static gboolean parse_engine_pid(const gchar *text, pid_t *pid)
+{
+    gchar *end = NULL;
+    gint64 parsed;
+
+    if (!text || !*text)
+        return FALSE;
+    errno = 0;
+    parsed = g_ascii_strtoll(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' ||
+        parsed <= 0 || parsed > G_MAXINT)
+        return FALSE;
+    *pid = (pid_t)parsed;
+    return TRUE;
+}
+
+static EngineRegistration *find_engine(Server *server,
+                                       const gchar *profile)
+{
+    for (guint i = 0; i < server->engines->len; i++) {
+        EngineRegistration *engine =
+            g_ptr_array_index(server->engines, i);
+
+        if (g_strcmp0(engine->profile, profile) == 0)
+            return engine;
+    }
+    return NULL;
+}
+
+static void remove_exited_engines(Server *server)
+{
+    if (!server->engines)
+        return;
+    for (gint i = (gint)server->engines->len - 1; i >= 0; i--) {
+        EngineRegistration *engine =
+            g_ptr_array_index(server->engines, (guint)i);
+
+        if (!engine_pidfd_exited(engine))
+            continue;
+        if (engine->client) {
+            engine->client->engine = NULL;
+            engine->client->closing = TRUE;
+            engine->client = NULL;
+        }
+        g_ptr_array_remove_index(server->engines, (guint)i);
+    }
+}
+
+static gboolean register_engine(Server *server,
+                                Client *client,
+                                gchar **fields,
+                                guint field_count)
+{
+    g_autofree gchar *profile = NULL;
+    EngineRegistration *engine;
+    pid_t claimed_pid;
+
+    if (field_count != 4 ||
+        g_strcmp0(fields[1], "1") != 0 ||
+        !parse_engine_pid(fields[3], &claimed_pid) ||
+        claimed_pid != client->peer_pid || client->peer_pidfd < 0 ||
+        !(profile = decode_engine_profile(fields[2]))) {
+        control_error(client, "invalid engine registration");
+        return FALSE;
+    }
+
+    remove_exited_engines(server);
+    engine = find_engine(server, profile);
+    if (engine) {
+        if (engine->peer_pid != client->peer_pid || engine->client) {
+            control_error(client, "engine profile is already registered");
+            return FALSE;
+        }
+        close(client->peer_pidfd);
+        client->peer_pidfd = -1;
+    } else {
+        if (server->engines->len >= MAX_ENGINES) {
+            control_error(client, "engine registry is full");
+            return FALSE;
+        }
+        engine = g_new0(EngineRegistration, 1);
+        engine->profile = g_steal_pointer(&profile);
+        engine->peer_pid = client->peer_pid;
+        engine->peer_pidfd = client->peer_pidfd;
+        client->peer_pidfd = -1;
+        g_ptr_array_add(server->engines, engine);
+    }
+
+    client->kind = CLIENT_ENGINE;
+    client->engine = engine;
+    engine->client = client;
+    if (!client_send_line(client,
+                          "ENGINE_OK\t%u",
+                          ENGINE_REGISTRY_VERSION))
+        client->closing = TRUE;
+    return !client->closing;
+}
+
+static void handle_engine(Client *client,
+                          gchar **fields,
+                          guint field_count)
+{
+    if (field_count == 1 &&
+        g_strcmp0(fields[0], "ENGINE_BYE") == 0) {
+        client->graceful_bye = TRUE;
+        client->closing = TRUE;
+        return;
+    }
+    client->closing = TRUE;
+}
+
 static Client *control_target(Server *server, const gchar *encoded)
 {
     gchar *target = mux_decode(encoded);
@@ -1192,7 +1427,7 @@ static gboolean begin_controlled_stop(Server *server, Client *control)
         if (client->kind == CLIENT_VIEW && !client->closing) {
             if (!client_send_line(client, "DO\tQUIT\t"))
                 client->closing = TRUE;
-        } else {
+        } else if (client->kind != CLIENT_ENGINE) {
             client->closing = TRUE;
         }
     }
@@ -1485,8 +1720,16 @@ static void handle_line(Server *server, Client *client, const gchar *line)
         g_strfreev(fields);
         return;
     }
+    if (client->kind == CLIENT_ENGINE) {
+        handle_engine(client, fields, field_count);
+        g_strfreev(fields);
+        return;
+    }
 
     if (client->kind == CLIENT_UNKNOWN &&
+        g_strcmp0(fields[0], "ENGINE") == 0) {
+        (void)register_engine(server, client, fields, field_count);
+    } else if (client->kind == CLIENT_UNKNOWN &&
         g_strcmp0(fields[0], "VIEW") == 0 &&
         field_count >= 7 && encoded_layer_is_valid(fields[5])) {
         g_autofree gchar *proposed_id = mux_decode(fields[1]);
@@ -1653,8 +1896,42 @@ static void remove_closed_clients(Server *server)
             broadcast_view(server, client, "REMOVE");
             reconcile_active(server, NULL);
         }
+        if (client->kind == CLIENT_ENGINE && client->engine &&
+            client->engine->client == client)
+            client->engine->client = NULL;
         g_ptr_array_remove_index(server->clients, (guint)i);
     }
+}
+
+static gboolean signal_stopping_engine(Server *server,
+                                       EngineRegistration *engine,
+                                       int signal_number)
+{
+    if (engine_pidfd_signal(engine, signal_number))
+        return TRUE;
+
+    server->stop_cleanup_failed = TRUE;
+    engine->stop_abandon = TRUE;
+    g_warning("cannot signal tracked engine %s pid %ld safely: %s",
+              engine->profile,
+              (long)engine->peer_pid,
+              g_strerror(errno));
+    return FALSE;
+}
+
+static void request_engine_shutdown(Server *server, gint64 now_us)
+{
+    for (guint i = 0; i < server->engines->len; i++) {
+        EngineRegistration *engine =
+            g_ptr_array_index(server->engines, i);
+
+        if (engine->client && !engine->client->closing &&
+            !client_send_line(engine->client, "ENGINE_STOP"))
+            engine->client->closing = TRUE;
+    }
+    server->stop_engines_requested = TRUE;
+    server->stop_deadline_us = now_us +
+        ((gint64)STOP_ENGINE_GRACE_MS * 1000);
 }
 
 static void update_controlled_stop(Server *server)
@@ -1663,66 +1940,121 @@ static void update_controlled_stop(Server *server)
 
     if (!server->stopping)
         return;
-    if (view_count(server) == 0) {
+    now_us = g_get_monotonic_time();
+    if (view_count(server) > 0) {
+        if (now_us < server->stop_deadline_us)
+            return;
+        if (!server->stop_term_sent) {
+            for (guint i = 0; i < server->clients->len; i++) {
+                Client *client = g_ptr_array_index(server->clients, i);
+
+                if (client->kind != CLIENT_VIEW)
+                    continue;
+                if (peer_pidfd_exited(client)) {
+                    client->closing = TRUE;
+                    continue;
+                }
+                if (!client->stop_term_sent &&
+                    signal_stopping_view(server, client, SIGTERM))
+                    client->stop_term_sent = TRUE;
+                if (client->stop_abandon)
+                    client->closing = TRUE;
+            }
+            server->stop_term_sent = TRUE;
+            server->stop_deadline_us = now_us +
+                ((gint64)STOP_CLIENT_TERM_GRACE_MS * 1000);
+            return;
+        }
+
+        if (!server->stop_kill_sent) {
+            for (guint i = 0; i < server->clients->len; i++) {
+                Client *client = g_ptr_array_index(server->clients, i);
+
+                if (client->kind != CLIENT_VIEW)
+                    continue;
+                if (peer_pidfd_exited(client)) {
+                    client->closing = TRUE;
+                    continue;
+                }
+                if (!client->stop_kill_sent &&
+                    signal_stopping_view(server, client, SIGKILL))
+                    client->stop_kill_sent = TRUE;
+                client->closing = TRUE;
+            }
+            server->stop_kill_sent = TRUE;
+            server->stop_deadline_us = now_us +
+                ((gint64)STOP_CLIENT_KILL_GRACE_MS * 1000);
+            return;
+        }
+
+        for (guint i = 0; i < server->clients->len; i++) {
+            Client *client = g_ptr_array_index(server->clients, i);
+
+            if (client->kind != CLIENT_VIEW || peer_pidfd_exited(client))
+                continue;
+            server->stop_cleanup_failed = TRUE;
+            client->stop_abandon = TRUE;
+            client->closing = TRUE;
+            g_warning("tracked pane %ld did not terminate within the stop deadline",
+                      (long)client->peer_pid);
+        }
+        return;
+    }
+
+    if (!server->stop_engines_requested) {
+        request_engine_shutdown(server, now_us);
+        if (engine_count(server) == 0)
+            server->running = FALSE;
+        return;
+    }
+    if (engine_count(server) == 0) {
         server->running = FALSE;
         return;
     }
-
-    now_us = g_get_monotonic_time();
     if (now_us < server->stop_deadline_us)
         return;
-    if (!server->stop_term_sent) {
-        for (guint i = 0; i < server->clients->len; i++) {
-            Client *client = g_ptr_array_index(server->clients, i);
 
-            if (client->kind != CLIENT_VIEW)
-                continue;
-            if (peer_pidfd_exited(client)) {
-                client->closing = TRUE;
-                continue;
-            }
-            if (!client->stop_term_sent &&
-                signal_stopping_view(server, client, SIGTERM))
-                client->stop_term_sent = TRUE;
-            if (client->stop_abandon)
-                client->closing = TRUE;
+    if (!server->stop_engine_term_sent) {
+        for (guint i = 0; i < server->engines->len; i++) {
+            EngineRegistration *engine =
+                g_ptr_array_index(server->engines, i);
+
+            if (!engine->stop_term_sent &&
+                signal_stopping_engine(server, engine, SIGTERM))
+                engine->stop_term_sent = TRUE;
         }
-        server->stop_term_sent = TRUE;
+        server->stop_engine_term_sent = TRUE;
         server->stop_deadline_us = now_us +
-            ((gint64)STOP_CLIENT_TERM_GRACE_MS * 1000);
+            ((gint64)STOP_ENGINE_TERM_GRACE_MS * 1000);
         return;
     }
 
-    if (!server->stop_kill_sent) {
-        for (guint i = 0; i < server->clients->len; i++) {
-            Client *client = g_ptr_array_index(server->clients, i);
+    if (!server->stop_engine_kill_sent) {
+        for (guint i = 0; i < server->engines->len; i++) {
+            EngineRegistration *engine =
+                g_ptr_array_index(server->engines, i);
 
-            if (client->kind != CLIENT_VIEW)
-                continue;
-            if (peer_pidfd_exited(client)) {
-                client->closing = TRUE;
-                continue;
-            }
-            if (!client->stop_kill_sent &&
-                signal_stopping_view(server, client, SIGKILL))
-                client->stop_kill_sent = TRUE;
-            client->closing = TRUE;
+            if (!engine->stop_kill_sent &&
+                signal_stopping_engine(server, engine, SIGKILL))
+                engine->stop_kill_sent = TRUE;
         }
-        server->stop_kill_sent = TRUE;
+        server->stop_engine_kill_sent = TRUE;
         server->stop_deadline_us = now_us +
-            ((gint64)STOP_CLIENT_KILL_GRACE_MS * 1000);
+            ((gint64)STOP_ENGINE_KILL_GRACE_MS * 1000);
         return;
     }
 
-    for (guint i = 0; i < server->clients->len; i++) {
-        Client *client = g_ptr_array_index(server->clients, i);
+    for (guint i = 0; i < server->engines->len; i++) {
+        EngineRegistration *engine =
+            g_ptr_array_index(server->engines, i);
 
-        if (client->kind != CLIENT_VIEW || peer_pidfd_exited(client))
+        if (engine_pidfd_exited(engine))
             continue;
         server->stop_cleanup_failed = TRUE;
-        client->stop_abandon = TRUE;
-        g_warning("tracked pane %ld did not terminate within the stop deadline",
-                  (long)client->peer_pid);
+        engine->stop_abandon = TRUE;
+        g_warning("tracked engine %s pid %ld did not terminate within the stop deadline",
+                  engine->profile,
+                  (long)engine->peer_pid);
     }
     server->running = FALSE;
 }
@@ -1985,6 +2317,8 @@ static int run_server(void)
         g_main_context_unref(server.main_context);
         return EXIT_FAILURE;
     }
+    server.engines = g_ptr_array_new_with_free_func(
+        engine_registration_free);
 
     signal(SIGINT, stop_signal);
     signal(SIGTERM, stop_signal);
@@ -2034,6 +2368,7 @@ static int run_server(void)
         while (g_main_context_iteration(server.main_context, FALSE))
             ;
         remove_closed_clients(&server);
+        remove_exited_engines(&server);
         flush_session_if_due(&server);
         update_controlled_stop(&server);
     }
@@ -2058,6 +2393,7 @@ static int run_server(void)
     if (server.stopping)
         send_controlled_stop_response(&server);
     g_ptr_array_unref(server.clients);
+    g_ptr_array_unref(server.engines);
     g_ptr_array_unref(server.pending_moves);
     g_free(server.socket_path);
     g_free(server.active_id);
