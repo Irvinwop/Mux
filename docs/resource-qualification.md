@@ -36,7 +36,7 @@ system ticks for every process in scope divided by wall time.
 | Measurement | Default budget |
 | --- | ---: |
 | Idle aggregate CPU | 25% of one core |
-| Active aggregate CPU | 220% of one core |
+| Active aggregate CPU | 220% on ARM64; 425% on x86_64 |
 | Peak aggregate RSS | 1800 MiB |
 | Peak aggregate PSS, when readable | 1280 MiB |
 | Peak scoped process count | 48 |
@@ -51,6 +51,12 @@ The active acknowledgement floor prevents a false low-CPU pass when rendering
 is stalled. The same animation remains loaded for the idle phase, but its Kitty
 layer is hidden. Its acknowledgement delta is reported and enforced separately
 to qualify hidden-layer suspension.
+
+The active fixture deliberately drives an unthrottled full-screen canvas through
+the software-rendered headless stack. Its ceiling is architecture-specific
+because x86_64 GitHub runners use substantially more aggregate WPE and Kitty CPU
+for that workload. Idle, memory, process, shared-memory, and cleanup limits are
+architecture-independent.
 
 ## Measurement scope and method
 

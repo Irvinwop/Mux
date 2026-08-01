@@ -40,7 +40,11 @@ idle_seconds=${MUX_RESOURCE_IDLE_SECONDS:-20}
 active_warmup_seconds=${MUX_RESOURCE_ACTIVE_WARMUP_SECONDS:-4}
 idle_settle_seconds=${MUX_RESOURCE_IDLE_SETTLE_SECONDS:-4}
 idle_cpu_budget=${MUX_RESOURCE_IDLE_CPU_PCT:-25}
-active_cpu_budget=${MUX_RESOURCE_ACTIVE_CPU_PCT:-220}
+case $(uname -m) in
+    x86_64|amd64) default_active_cpu_budget=425 ;;
+    *) default_active_cpu_budget=220 ;;
+esac
+active_cpu_budget=${MUX_RESOURCE_ACTIVE_CPU_PCT:-$default_active_cpu_budget}
 rss_budget_mib=${MUX_RESOURCE_MAX_RSS_MIB:-1800}
 pss_budget_mib=${MUX_RESOURCE_MAX_PSS_MIB:-1280}
 process_budget=${MUX_RESOURCE_MAX_PROCESSES:-48}
