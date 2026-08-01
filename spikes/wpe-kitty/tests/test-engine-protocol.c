@@ -3,6 +3,7 @@
 #include "../mux-uri.h"
 
 #include <glib.h>
+#include <wpe/webkit.h>
 
 #include <string.h>
 #include <sys/socket.h>
@@ -17,6 +18,7 @@ gboolean mux_engine_test_view_capacity(guint active_views,
                                        guint pending_views);
 guint mux_engine_test_frame_backpressure_retry_delay_ms(
     guint rejection_count);
+WebKitNetworkSession *mux_engine_test_private_network_session_new(void);
 gboolean mux_pane_test_schedule_retry_at(gint64 now_us,
                                          gint64 *retry_us,
                                          guint *backoff_ms);
@@ -785,6 +787,29 @@ test_engine_global_view_capacity(void)
 }
 
 static void
+test_private_network_sessions_are_distinct_and_ephemeral(void)
+{
+    g_autoptr(WebKitNetworkSession) first =
+        mux_engine_test_private_network_session_new();
+    g_autoptr(WebKitNetworkSession) second =
+        mux_engine_test_private_network_session_new();
+
+    g_assert_nonnull(first);
+    g_assert_nonnull(second);
+    g_assert_true(first != second);
+    g_assert_true(webkit_network_session_is_ephemeral(first));
+    g_assert_true(webkit_network_session_is_ephemeral(second));
+    g_assert_true(webkit_network_session_get_itp_enabled(first));
+    g_assert_true(webkit_network_session_get_itp_enabled(second));
+    g_assert_false(
+        webkit_network_session_get_persistent_credential_storage_enabled(
+            first));
+    g_assert_false(
+        webkit_network_session_get_persistent_credential_storage_enabled(
+            second));
+}
+
+static void
 test_frame_backpressure_retry_is_bounded(void)
 {
     g_assert_cmpuint(mux_engine_test_frame_backpressure_retry_delay_ms(0),
@@ -972,6 +997,8 @@ main(int argc, char **argv)
                     test_kitty_frame_trusted_overlay_layering);
     g_test_add_func("/engine-runtime/popup/global-view-capacity",
                     test_engine_global_view_capacity);
+    g_test_add_func("/engine-runtime/privacy/distinct-private-sessions",
+                    test_private_network_sessions_are_distinct_and_ephemeral);
     g_test_add_func("/engine-runtime/graphics/backpressure-retry",
                     test_frame_backpressure_retry_is_bounded);
     g_test_add_func("/engine-runtime/shortcuts/exact-modifiers",

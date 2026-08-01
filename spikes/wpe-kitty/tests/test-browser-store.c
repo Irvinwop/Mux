@@ -25,7 +25,7 @@ remove_profile(const gchar *directory)
 }
 
 static void
-test_history_is_bounded_and_private(void)
+test_history_is_bounded_and_private_is_discarded(void)
 {
     g_autofree gchar *directory = temporary_profile();
     g_autoptr(MuxBrowserStore) store = NULL;
@@ -51,11 +51,34 @@ test_history_is_bounded_and_private(void)
     g_assert_cmpstr(((MuxBrowserEntry *)g_ptr_array_index(normal, 0))->uri,
                     ==,
                     "https://example.test/275");
-    g_assert_cmpuint(private_entries->len, ==, 1);
-    g_assert_cmpstr(
-        ((MuxBrowserEntry *)g_ptr_array_index(private_entries, 0))->uri,
-        ==,
-        "https://private.test/");
+    g_assert_cmpuint(private_entries->len, ==, 0);
+
+    remove_profile(directory);
+}
+
+static void
+test_private_metadata_is_never_recorded(void)
+{
+    g_autofree gchar *directory = temporary_profile();
+    g_autoptr(MuxBrowserStore) store = mux_browser_store_new(directory, NULL);
+    g_autoptr(GPtrArray) history = NULL;
+    g_autoptr(GPtrArray) closed = NULL;
+
+    mux_browser_store_record_navigation(store,
+                                        99,
+                                        TRUE,
+                                        "https://private.test/secret",
+                                        "private");
+    mux_browser_store_close_view(store, 99);
+
+    history = mux_browser_store_copy_history(store, TRUE, 0);
+    closed = mux_browser_store_copy_recently_closed(store, TRUE, 0);
+    g_assert_cmpuint(history->len, ==, 0);
+    g_assert_cmpuint(closed->len, ==, 0);
+    g_assert_cmpuint(mux_browser_store_history_count(store, FALSE), ==, 0);
+    g_assert_cmpuint(mux_browser_store_recently_closed_count(store, FALSE),
+                     ==,
+                     0);
 
     remove_profile(directory);
 }
@@ -160,7 +183,9 @@ main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/browser-store/history-bounds",
-                    test_history_is_bounded_and_private);
+                    test_history_is_bounded_and_private_is_discarded);
+    g_test_add_func("/browser-store/private-no-write",
+                    test_private_metadata_is_never_recorded);
     g_test_add_func("/browser-store/recently-closed",
                     test_recently_closed_is_bounded);
     g_test_add_func("/browser-store/bookmark-persistence",

@@ -403,7 +403,7 @@ mux_browser_store_record_navigation(MuxBrowserStore *store,
     guint index;
 
     g_return_if_fail(store);
-    if (!view_id)
+    if (!view_id || private_profile)
         return;
     entry = browser_entry_new(view_id,
                               private_profile,

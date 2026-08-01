@@ -248,6 +248,20 @@ clipboard_wire_test = executable(
 
 test('clipboard-wire', clipboard_wire_test)
 
+clipboard_engine_link_test = executable(
+  'test-clipboard-engine-link',
+  [
+    'tests/test-clipboard-engine-link.c',
+    'mux-clipboard.c',
+    'mux-clipboard-wire.c',
+    'mux-wpe-clipboard.c',
+    'mux-clipboard-engine-link.c',
+  ],
+  dependencies: engine_dependencies,
+)
+
+test('clipboard-engine-link', clipboard_engine_link_test)
+
 local_transport_test = executable(
   'test-local-transport',
   [

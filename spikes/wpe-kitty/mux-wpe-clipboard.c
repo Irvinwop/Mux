@@ -5,7 +5,9 @@
 struct _MuxWpeClipboard {
     WPEClipboard parent_instance;
     MuxClipboardSnapshot *external;
+    MuxWpeClipboardPublishBeginFunc publish_begin_func;
     MuxWpeClipboardPublishFunc publish_func;
+    GDestroyNotify publication_data_destroy;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     guint64 next_serial;
@@ -192,9 +194,19 @@ mux_wpe_clipboard_changed(WPEClipboard *base,
         WPE_CLIPBOARD_CLASS(mux_wpe_clipboard_parent_class);
     g_autoptr(MuxClipboardSnapshot) snapshot = NULL;
     g_autoptr(GError) error = NULL;
+    MuxWpeClipboardPublishFunc publish_func = clipboard->publish_func;
+    GDestroyNotify publication_data_destroy =
+        clipboard->publication_data_destroy;
+    gpointer user_data = clipboard->user_data;
+    gpointer publication_data = NULL;
+    gboolean should_publish = is_local && publish_func != NULL;
+
+    if (should_publish && clipboard->publish_begin_func != NULL)
+        publication_data = clipboard->publish_begin_func(clipboard,
+                                                         user_data);
 
     parent_class->changed(base, formats, is_local, content);
-    if (!is_local || clipboard->publish_func == NULL)
+    if (!should_publish)
         return;
 
     snapshot = snapshot_from_content(clipboard, formats, content, &error);
@@ -202,9 +214,13 @@ mux_wpe_clipboard_changed(WPEClipboard *base,
         if (error != NULL)
             g_warning("WebKit clipboard publication rejected: %s",
                       error->message);
-        return;
+        goto out;
     }
-    clipboard->publish_func(clipboard, snapshot, clipboard->user_data);
+    publish_func(clipboard, snapshot, publication_data, user_data);
+
+out:
+    if (publication_data_destroy != NULL)
+        publication_data_destroy(publication_data);
 }
 
 static void
@@ -238,7 +254,9 @@ mux_wpe_clipboard_init(MuxWpeClipboard *clipboard)
 
 MuxWpeClipboard *
 mux_wpe_clipboard_new(WPEDisplay *display,
+                      MuxWpeClipboardPublishBeginFunc publish_begin_func,
                       MuxWpeClipboardPublishFunc publish_func,
+                      GDestroyNotify publication_data_destroy,
                       gpointer user_data,
                       GDestroyNotify user_data_destroy)
 {
@@ -250,7 +268,9 @@ mux_wpe_clipboard_new(WPEDisplay *display,
                              "display",
                              display,
                              NULL);
+    clipboard->publish_begin_func = publish_begin_func;
     clipboard->publish_func = publish_func;
+    clipboard->publication_data_destroy = publication_data_destroy;
     clipboard->user_data = user_data;
     clipboard->user_data_destroy = user_data_destroy;
     return clipboard;

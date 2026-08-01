@@ -17,6 +17,17 @@ struct _MuxClipboardEngineLink {
     GDestroyNotify user_data_destroy;
 };
 
+struct _MuxClipboardEngineWrite {
+    MuxClipboardEngineLink *owner;
+    gchar *profile;
+    gchar *source_origin;
+    guint64 source_view_id;
+    guint64 transaction_id;
+    gint64 created_us;
+    guint32 flags;
+    gboolean completed;
+};
+
 static gboolean
 valid_text(const gchar *text, gsize limit, gboolean required)
 {
@@ -74,29 +85,94 @@ send_ack(MuxClipboardEngineLink *link,
     return result;
 }
 
+MuxClipboardEngineWrite *
+mux_clipboard_engine_link_begin_write(MuxClipboardEngineLink *link)
+{
+    MuxClipboardEngineWrite *write;
+
+    g_return_val_if_fail(link != NULL, NULL);
+    write = g_new0(MuxClipboardEngineWrite, 1);
+    write->owner = link;
+    write->profile = g_strdup(link->profile);
+    write->source_origin = g_strdup(link->active_origin);
+    write->source_view_id = link->active_view_id;
+    write->transaction_id = next_transaction(link);
+    write->created_us = g_get_monotonic_time();
+    write->flags = MUX_CLIPBOARD_WIRE_FLAG_CURRENT |
+                   MUX_CLIPBOARD_WIRE_FLAG_HISTORY;
+    if (link->ephemeral)
+        write->flags |= MUX_CLIPBOARD_WIRE_FLAG_EPHEMERAL;
+    return write;
+}
+
+gboolean
+mux_clipboard_engine_link_complete_write(
+    MuxClipboardEngineLink *link,
+    MuxClipboardEngineWrite *write,
+    const MuxClipboardSnapshot *snapshot,
+    GError **error)
+{
+    g_return_val_if_fail(link != NULL, FALSE);
+    if (!write || write->owner != link || write->completed) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "clipboard write transaction is invalid or complete");
+        return FALSE;
+    }
+    if (!snapshot || !mux_clipboard_snapshot_is_sealed(snapshot)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_DATA,
+                            "clipboard write snapshot must be sealed");
+        return FALSE;
+    }
+
+    write->completed = TRUE;
+    return mux_clipboard_wire_send_snapshot(write->transaction_id,
+                                            write->flags,
+                                            write->profile,
+                                            write->source_origin,
+                                            write->source_view_id,
+                                            write->created_us,
+                                            snapshot,
+                                            wire_output,
+                                            link,
+                                            error);
+}
+
+void
+mux_clipboard_engine_write_free(MuxClipboardEngineWrite *write)
+{
+    if (!write)
+        return;
+    g_free(write->profile);
+    g_free(write->source_origin);
+    g_free(write);
+}
+
+static gpointer
+on_webkit_publish_begin(MuxWpeClipboard *clipboard, gpointer user_data)
+{
+    (void)clipboard;
+    return mux_clipboard_engine_link_begin_write(user_data);
+}
+
 static void
 on_webkit_publish(MuxWpeClipboard *clipboard,
                   MuxClipboardSnapshot *snapshot,
+                  gpointer publication_data,
                   gpointer user_data)
 {
     MuxClipboardEngineLink *link = user_data;
+    MuxClipboardEngineWrite *write = publication_data;
     g_autoptr(GError) error = NULL;
-    guint32 flags = MUX_CLIPBOARD_WIRE_FLAG_CURRENT |
-                    MUX_CLIPBOARD_WIRE_FLAG_HISTORY;
 
     (void)clipboard;
-    if (link->ephemeral)
-        flags |= MUX_CLIPBOARD_WIRE_FLAG_EPHEMERAL;
-    if (!mux_clipboard_wire_send_snapshot(next_transaction(link),
-                                          flags,
-                                          link->profile,
-                                          link->active_origin,
-                                          link->active_view_id,
-                                          g_get_monotonic_time(),
-                                          snapshot,
-                                          wire_output,
-                                          link,
-                                          &error))
+    if (!mux_clipboard_engine_link_complete_write(link,
+                                                  write,
+                                                  snapshot,
+                                                  &error))
         report_failure(link, "webkit-copy", error);
 }
 
@@ -131,7 +207,10 @@ mux_clipboard_engine_link_new(WPEDisplay *display,
     link->user_data_destroy = user_data_destroy;
     link->assembler = mux_clipboard_wire_assembler_new(0);
     link->clipboard = mux_wpe_clipboard_new(display,
+                                            on_webkit_publish_begin,
                                             on_webkit_publish,
+                                            (GDestroyNotify)
+                                                mux_clipboard_engine_write_free,
                                             link,
                                             NULL);
     if (link->assembler == NULL || link->clipboard == NULL) {
@@ -167,6 +246,7 @@ gboolean
 mux_clipboard_engine_link_set_active_source(MuxClipboardEngineLink *link,
                                             guint64 view_id,
                                             const gchar *origin,
+                                            gboolean ephemeral,
                                             GError **error)
 {
     g_return_val_if_fail(link != NULL, FALSE);
@@ -179,17 +259,10 @@ mux_clipboard_engine_link_set_active_source(MuxClipboardEngineLink *link,
     }
 
     link->active_view_id = view_id;
+    link->ephemeral = ephemeral;
     g_free(link->active_origin);
     link->active_origin = g_strdup(origin);
     return TRUE;
-}
-
-void
-mux_clipboard_engine_link_set_ephemeral(MuxClipboardEngineLink *link,
-                                        gboolean ephemeral)
-{
-    g_return_if_fail(link != NULL);
-    link->ephemeral = ephemeral;
 }
 
 static gboolean

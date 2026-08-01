@@ -100,6 +100,19 @@ frame_backpressure_retry_delay_ms(guint rejection_count)
     return MIN(delay, MUX_ENGINE_BACKPRESSURE_RETRY_MAX_MS);
 }
 
+static WebKitNetworkSession *
+engine_private_network_session_new(void)
+{
+    WebKitNetworkSession *session = webkit_network_session_new_ephemeral();
+
+    if (!session)
+        return NULL;
+    webkit_network_session_set_itp_enabled(session, TRUE);
+    webkit_network_session_set_persistent_credential_storage_enabled(session,
+                                                                     FALSE);
+    return session;
+}
+
 #ifdef MUX_ENGINE_LOGIC_TEST
 
 gboolean
@@ -126,6 +139,12 @@ guint
 mux_engine_test_frame_backpressure_retry_delay_ms(guint rejection_count)
 {
     return frame_backpressure_retry_delay_ms(rejection_count);
+}
+
+WebKitNetworkSession *
+mux_engine_test_private_network_session_new(void)
+{
+    return engine_private_network_session_new();
 }
 
 #else
@@ -191,6 +210,8 @@ struct _EngineView {
     Client *owner;
     guint64 id;
     WebKitWebView *web_view;
+    WebKitNetworkSession *network_session;
+    MuxDownloadManager *download_manager;
     MuxInputMethodContext *input_method;
     GHashTable *suppressed_text_keys;
     MuxUiEngineBridge *ui_bridge;
@@ -244,11 +265,9 @@ struct _Engine {
     MuxPermissionStore *permission_store;
     MuxPermissionStore *ephemeral_permission_store;
     MuxDownloadManager *download_manager;
-    MuxDownloadManager *ephemeral_download_manager;
     MuxBrowserStore *browser_store;
     WebKitWebContext *web_context;
     WebKitNetworkSession *persistent_session;
-    WebKitNetworkSession *ephemeral_session;
     int listen_fd;
     int lock_fd;
     int smoke_frame_ack_fd;
@@ -1156,6 +1175,35 @@ download_output(WebKitWebView *source_view,
 }
 
 static gboolean
+engine_view_prepare_private_network(EngineView *view, GError **error)
+{
+    g_return_val_if_fail(view != NULL, FALSE);
+    g_return_val_if_fail(view->ephemeral, FALSE);
+
+    view->network_session = engine_private_network_session_new();
+    if (!view->network_session) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "private WebKit network session construction failed");
+        return FALSE;
+    }
+    view->download_manager = mux_download_manager_new(view->network_session,
+                                                      download_output,
+                                                      NULL,
+                                                      view->engine,
+                                                      NULL);
+    if (!view->download_manager) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "private WebKit download manager construction failed");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
 popup_token_valid(const gchar *token)
 {
     if (!token || strlen(token) != MUX_POPUP_TOKEN_LENGTH)
@@ -1243,12 +1291,27 @@ popup_create(WebKitWebView *parent,
     child->scale_milli = parent_view->scale_milli;
     child->ephemeral = parent_view->ephemeral;
 
+    if (child->ephemeral &&
+        !engine_view_prepare_private_network(child, error)) {
+        engine_view_free(child);
+        return NULL;
+    }
+
     engine->pending_view = child;
-    child->web_view = WEBKIT_WEB_VIEW(
-        g_object_new(WEBKIT_TYPE_WEB_VIEW,
-                     "related-view", parent,
-                     "display", engine->display,
-                     NULL));
+    if (child->ephemeral) {
+        child->web_view = WEBKIT_WEB_VIEW(
+            g_object_new(WEBKIT_TYPE_WEB_VIEW,
+                         "web-context", engine->web_context,
+                         "network-session", child->network_session,
+                         "display", engine->display,
+                         NULL));
+    } else {
+        child->web_view = WEBKIT_WEB_VIEW(
+            g_object_new(WEBKIT_TYPE_WEB_VIEW,
+                         "related-view", parent,
+                         "display", engine->display,
+                         NULL));
+    }
     engine->pending_view = NULL;
     if (!child->web_view || !child->platform_view) {
         g_set_error_literal(error,
@@ -2064,7 +2127,8 @@ view_record_navigation(EngineView *view)
     const gchar *uri;
     const gchar *title;
 
-    if (!view->engine->browser_store || !view->web_view || !view->id)
+    if (view->ephemeral || !view->engine->browser_store ||
+        !view->web_view || !view->id)
         return;
     uri = webkit_web_view_get_uri(view->web_view);
     title = webkit_web_view_get_title(view->web_view);
@@ -2181,19 +2245,20 @@ engine_view_free(gpointer data)
         return;
     if (view->owner && view->owner->view_count)
         view->owner->view_count--;
-    if (view->engine && view->engine->browser_store && view->id)
+    if (!view->ephemeral && view->engine &&
+        view->engine->browser_store && view->id)
         mux_browser_store_close_view(view->engine->browser_store,
                                      view->id);
     if (view->engine && view->web_view) {
-        if (view->engine->download_manager)
-            mux_download_manager_cancel_view(
-                view->engine->download_manager,
-                view->web_view);
-        if (view->engine->ephemeral_download_manager)
-            mux_download_manager_cancel_view(
-                view->engine->ephemeral_download_manager,
-                view->web_view);
+        MuxDownloadManager *download_manager = view->ephemeral
+            ? view->download_manager
+            : view->engine->download_manager;
+
+        if (download_manager)
+            mux_download_manager_cancel_view(download_manager,
+                                             view->web_view);
     }
+    g_clear_pointer(&view->download_manager, mux_download_manager_free);
     engine_view_reset_surface(view);
     g_clear_pointer(&view->popup_manager, mux_popup_manager_free);
     g_clear_pointer(&view->file_chooser_bridge,
@@ -2210,6 +2275,7 @@ engine_view_free(gpointer data)
     g_clear_object(&view->input_method);
     g_clear_pointer(&view->suppressed_text_keys, g_hash_table_unref);
     g_clear_object(&view->web_view);
+    g_clear_object(&view->network_session);
     g_free(view->layer);
     g_free(view);
 }
@@ -2408,6 +2474,7 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
     GBytes *payload;
     gboolean popup_claim;
     gboolean requested_ephemeral;
+    g_autoptr(GError) private_network_error = NULL;
 
     if (request->view_id) {
         client_send_error(client,
@@ -2510,8 +2577,19 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
         view->height = height;
         view->scale_milli = scale_milli;
         view->ephemeral = requested_ephemeral;
+        if (view->ephemeral &&
+            !engine_view_prepare_private_network(
+                view, &private_network_error)) {
+            client_send_error(client,
+                              request,
+                              MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                              private_network_error->message);
+            engine_view_free(view);
+            g_free(uri);
+            return TRUE;
+        }
         session = view->ephemeral
-            ? engine->ephemeral_session
+            ? view->network_session
             : engine->persistent_session;
 
         engine->pending_view = view;
@@ -3693,6 +3771,7 @@ handle_set_focus(Client *client, const MuxEngineMessage *request)
                     client->engine->clipboard_link,
                     view->id,
                     origin,
+                    view->ephemeral,
                     &clipboard_error)) {
                 clipboard_failure(client->engine->clipboard_link,
                                   "focus-source",
@@ -3700,9 +3779,6 @@ handle_set_focus(Client *client, const MuxEngineMessage *request)
                                   client->engine);
                 g_clear_error(&clipboard_error);
             }
-            mux_clipboard_engine_link_set_ephemeral(
-                client->engine->clipboard_link,
-                view->ephemeral);
             g_free(origin);
         }
         wpe_view_focus_in(view->platform_view);
@@ -3855,18 +3931,18 @@ handle_extension(Client *client, const MuxEngineMessage *request)
                 packet,
                 packet_size,
                 &error);
-        if (handled && engine->download_manager)
-            handled = mux_download_manager_handle_payload(
-                engine->download_manager,
-                packet,
-                packet_size,
-                &error);
-        if (handled && engine->ephemeral_download_manager)
-            handled = mux_download_manager_handle_payload(
-                engine->ephemeral_download_manager,
-                packet,
-                packet_size,
-                &error);
+        if (handled) {
+            MuxDownloadManager *download_manager = view->ephemeral
+                ? view->download_manager
+                : engine->download_manager;
+
+            if (download_manager)
+                handled = mux_download_manager_handle_payload(
+                    download_manager,
+                    packet,
+                    packet_size,
+                    &error);
+        }
         if (!handled) {
             client_send_error(client,
                               request,
@@ -3891,6 +3967,7 @@ handle_extension(Client *client, const MuxEngineMessage *request)
     if (!mux_clipboard_engine_link_set_active_source(engine->clipboard_link,
                                                      view->id,
                                                      origin,
+                                                     view->ephemeral,
                                                      &error)) {
         client_send_error(client,
                           request,
@@ -3901,8 +3978,6 @@ handle_extension(Client *client, const MuxEngineMessage *request)
         return TRUE;
     }
     g_free(origin);
-    mux_clipboard_engine_link_set_ephemeral(engine->clipboard_link,
-                                            view->ephemeral);
 
     engine->clipboard_reply_client = client;
     engine->clipboard_reply_view_id = view->id;
@@ -4274,8 +4349,7 @@ initialize_browser(Engine *engine, GError **error)
     engine->persistent_session =
         webkit_network_session_new(engine->data_directory,
                                    engine->cache_directory);
-    engine->ephemeral_session = webkit_network_session_new_ephemeral();
-    if (!engine->persistent_session || !engine->ephemeral_session) {
+    if (!engine->persistent_session) {
         g_set_error_literal(error,
                             G_IO_ERROR,
                             G_IO_ERROR_FAILED,
@@ -4288,14 +4362,7 @@ initialize_browser(Engine *engine, GError **error)
         NULL,
         engine,
         NULL);
-    engine->ephemeral_download_manager = mux_download_manager_new(
-        engine->ephemeral_session,
-        download_output,
-        NULL,
-        engine,
-        NULL);
-    if (!engine->download_manager ||
-        !engine->ephemeral_download_manager) {
+    if (!engine->download_manager) {
         g_set_error_literal(error,
                             G_IO_ERROR,
                             G_IO_ERROR_FAILED,
@@ -4304,7 +4371,6 @@ initialize_browser(Engine *engine, GError **error)
     }
 
     webkit_network_session_set_itp_enabled(engine->persistent_session, TRUE);
-    webkit_network_session_set_itp_enabled(engine->ephemeral_session, TRUE);
     return TRUE;
 }
 
@@ -4329,8 +4395,6 @@ engine_clear(Engine *engine)
     if (engine->clipboard_tick_id)
         g_source_remove(engine->clipboard_tick_id);
 
-    g_clear_pointer(&engine->ephemeral_download_manager,
-                    mux_download_manager_free);
     g_clear_pointer(&engine->download_manager,
                     mux_download_manager_free);
 
@@ -4375,7 +4439,6 @@ engine_clear(Engine *engine)
                     mux_permission_store_free);
     g_clear_pointer(&engine->permission_store,
                     mux_permission_store_free);
-    g_clear_object(&engine->ephemeral_session);
     g_clear_object(&engine->persistent_session);
     g_clear_object(&engine->web_context);
     g_clear_object(&engine->display);
