@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+deps_only=0
+declare -a mux_args=()
+
+usage() {
+  cat <<'EOF'
+Usage: ./setup [--deps-only] [--] [MUX_ARGUMENTS...]
+
+Install Mux's Arch Linux dependencies, check the environment, and launch Mux.
+
+  ./setup
+  ./setup https://example.com
+  ./setup --deps-only
+
+Arch Linux and Arch Linux ARM are the package-supported distributions.
+Current Debian and Fedora WPE packages omit the required WPEPlatform API;
+custom builds remain usable when they provide wpe-platform-2.0 >= 2.52.
+EOF
+}
+
+for argument in "$@"; do
+  case "$argument" in
+    --deps-only)
+      deps_only=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      ;;
+    *)
+      mux_args+=("$argument")
+      ;;
+  esac
+done
+
+if [[ "$(uname -s)" != Linux ]]; then
+  printf 'Mux currently requires Linux: WPEPlatform, shared memory, and SO_PEERCRED are Linux APIs.\n' >&2
+  exit 1
+fi
+
+run_root() {
+  if (( EUID == 0 )); then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    printf 'setup needs root privileges and sudo is unavailable.\n' >&2
+    exit 1
+  fi
+}
+
+if command -v pacman >/dev/null 2>&1; then
+  printf 'Installing Arch Linux dependencies...\n'
+  run_root pacman -Syu --needed --noconfirm \
+    base-devel \
+    kitty \
+    meson \
+    ninja \
+    pkgconf \
+    wpewebkit \
+    gst-libav \
+    gst-plugins-good \
+    gst-plugins-bad \
+    noto-fonts
+elif command -v apt-get >/dev/null 2>&1 ||
+     command -v dnf >/dev/null 2>&1; then
+  if ! command -v pkg-config >/dev/null 2>&1 ||
+     ! pkg-config --exists 'wpe-platform-2.0 >= 2.52'; then
+    cat >&2 <<'EOF'
+This distribution's WPE packages omit wpe-platform-2.0, even when WPE WebKit
+itself is version 2.52 or newer. Mux will not install a known-incomplete
+dependency set. Use Arch Linux/Arch Linux ARM, or install WPE WebKit built with
+WPEPlatform 2.52+ and rerun ./setup.
+EOF
+    exit 1
+  fi
+  printf 'Using the externally installed WPEPlatform dependency set.\n'
+else
+  cat >&2 <<'EOF'
+No supported package manager was found.
+
+Install these manually:
+  kitty, meson, ninja, pkg-config, a C17 compiler, GLib/GIO development files,
+  WPE WebKit 2.52+, WPEPlatform headless 2.52+, GStreamer codecs, and fonts.
+EOF
+  exit 1
+fi
+
+"$ROOT/doctor"
+
+if (( deps_only )); then
+  printf 'Dependencies are ready. Run ./mux to start Mux.\n'
+  exit 0
+fi
+
+exec "$ROOT/mux" "${mux_args[@]}"

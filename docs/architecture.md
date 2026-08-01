@@ -1,0 +1,528 @@
+# Mux architecture
+
+Status: selected personal-project baseline
+Research snapshot: 2026-07-31
+Runtime: local Linux desktop using the Kitty instance packaged with Mux
+
+## 1. Decision
+
+Use Kitty directly as both the terminal and the multiplexer.
+
+A Kitty window runs `mux-view`. The view receives keyboard and pixel-mouse
+events directly, emits Kitty graphics commands directly, and talks to one
+central `muxd` daemon over a local Unix socket. There is no nested terminal
+multiplexer and therefore no graphics pass-through or mouse-coordinate
+translation layer.
+
+Use WPE WebKit as the engine. Mux implements browser chrome and the renderer
+bridge, but leaves HTML, JavaScript, networking, storage, service workers, TLS,
+media, and process isolation to WebKit.
+
+Package the complete supported stack with Nix. The project optimizes for a
+one-command launch rather than native support for every operating system.
+
+## 2. Scope
+
+### Included
+
+- Ordinary modern websites supported by current WPE WebKit.
+- One local user and one default persistent profile.
+- Multiple pages sharing cookies, cache, storage, and service workers.
+- Kitty tabs, splits, layouts, overlays, sessions, and key mappings.
+- A global active-URL display and modal URL prompt.
+- Page persistence independent of the lifetime of a Kitty window.
+- Downloads, permissions, file selection, clipboard, and external-browser
+  fallback after basic navigation works.
+- Measured frame damage, backpressure, memory use, and latency.
+
+### Deliberately excluded
+
+- tmux, Zellij, WezTerm, or a multiplexer compatibility abstraction.
+- macOS and Windows runtime support.
+- Remote sessions or collaborative attachment.
+- Browser extensions and a public plugin API.
+- Multiple profiles, synchronization, and enterprise policy in version one.
+- DRM/EME promises.
+- Building or forking a web engine.
+- A custom HTTP stack, cookie jar, cache, or service-worker implementation.
+- Perfect video, games, WebGPU, or full-screen high-frame-rate WebGL.
+- Screen-reader-grade accessibility from a raster terminal surface.
+
+This is a GitHub personal project, not a browser platform. Features should be
+added because they improve the author's daily use, not to imitate every browser
+preference page.
+
+## 3. Runtime and distribution
+
+The primary entry point is:
+
+~~~sh
+nix run .
+~~~
+
+The default Nix app performs these steps:
+
+1. Create the XDG runtime and data directories if needed.
+2. Start or discover `muxd`.
+3. Start the packaged Kitty binary with Mux's generated configuration.
+4. Open one Kitty window running `mux-view` and attach it to a restored or new
+   page.
+5. Register the Kitty remote-control socket with `muxd`.
+6. Restore the most recent workspace when one exists.
+
+The flake pins:
+
+- Kitty.
+- WPE WebKit and WPEPlatform.
+- GLib and the media/rendering dependencies required by WPE.
+- Meson, Ninja, GLib, and the C toolchain for all Mux binaries.
+
+Mux uses a dedicated Kitty configuration passed at launch. It must not edit
+`~/.config/kitty`. User state follows XDG conventions:
+
+~~~text
+$XDG_RUNTIME_DIR/mux/        socket, pid, transient frame tracking
+$XDG_CONFIG_HOME/mux/        optional personal key and appearance overrides
+$XDG_DATA_HOME/mux/          workspace metadata, history, downloads metadata
+$XDG_CACHE_HOME/mux/         Mux cache and disposable diagnostics
+~~~
+
+WebKit's website data remains in its own profile directory beneath the Mux data
+directory.
+
+A GitHub release can later provide a Nix bundle or a small bootstrap script.
+Flatpak, AppImage, distro packages, and native macOS builds are not initial
+work.
+
+## 4. Object model
+
+| Kitty concept | Browser concept | Notes |
+| --- | --- | --- |
+| OS window | Attached Mux client | Normally one dedicated OS window. |
+| session | Saved workspace | Programs and layouts can be reconstructed. |
+| tab | Layer | Switching tabs switches browser layers. |
+| window | Page attachment | A split or tiled region containing `mux-view`. |
+| overlay | Trusted prompt | URL, permission, auth, file, or download UI. |
+| active title | Current URL state | Source for the global tab-bar display. |
+
+A WebKit page has a stable Mux page ID independent of the current Kitty window
+ID. Moving, replacing, or restarting a view does not require reloading the page.
+
+## 5. Process architecture
+
+~~~mermaid
+flowchart LR
+    K["Kitty: tabs, splits, overlays"] <--> V["mux-view per Kitty window"]
+    V <--> D["muxd browser control plane"]
+    C["muxctl and Kitty mappings"] <--> D
+    C <--> K
+    D <--> W["WPE WebKit API"]
+    W <--> P["Sandboxed WebKit processes"]
+    D --> S["POSIX shared-memory damage buffers"]
+    S --> K
+~~~
+
+Pixel bytes do not travel through the terminal PTY. `muxd` writes pixels to a
+named POSIX shared-memory object and sends only its name and frame metadata to
+`mux-view`. The view emits a small Kitty command; Kitty opens and unlinks the
+object.
+
+### `muxd`
+
+`muxd` owns:
+
+- The WPE display and custom platform view implementation.
+- One default WebKit profile, data store, and network session.
+- Page creation, opener relationships, navigation, and lifecycle.
+- Render-buffer fences, damage coalescing, and frame production.
+- Browser policy such as permissions, downloads, file selection, external
+  schemes, TLS errors, HTTP authentication, and crashes.
+- Workspace metadata and page-to-Kitty attachment state.
+- The authenticated local control socket.
+- Structured performance counters and diagnostics.
+
+The initial implementation should be C17 with GLib and Meson because WPEPlatform
+is a C/GObject API. This keeps the highest-risk integration aligned with
+upstream documentation and avoids making generated bindings part of the first
+spike.
+
+### `mux-view`
+
+`mux-view` is a small C17/GLib terminal program. It:
+
+- Enters Kitty's alternate screen.
+- Enables the Kitty keyboard protocol and SGR pixel-mouse reporting.
+- Reports viewport cells, viewport pixels, focus, and scale to `muxd`.
+- Forwards keyboard, committed text, pointer, button, drag, wheel, resize, and
+  focus events.
+- Receives frame descriptors and emits Kitty graphics commands.
+- Maintains one persistent image and placement for its page.
+- Displays a text recovery screen if `muxd` disconnects.
+- Updates its trusted Kitty title with sanitized URL and loading state.
+
+It never receives HTML or JavaScript and never emits page-provided terminal
+escapes.
+
+### `muxctl`
+
+`muxctl` is a C17 CLI and interactive prompt:
+
+~~~text
+muxctl prompt
+muxctl open URL
+muxctl back
+muxctl forward
+muxctl reload
+muxctl stop
+muxctl new-page [URL]
+muxctl new-layer [URL]
+muxctl close
+muxctl reopen
+muxctl list
+muxctl restore
+~~~
+
+Commands target the active Kitty window by default. Explicit page and window
+IDs are available for scripts.
+
+## 6. Kitty integration
+
+Kitty already provides the required primitives:
+
+- Tabs containing multiple windows arranged by layouts.
+- Horizontal and vertical splits.
+- Overlay and overlay-main windows.
+- Session files and session switching.
+- Remote-control commands for launching, matching, moving, focusing, and
+  closing windows.
+- A customizable tab bar.
+- POSIX shared-memory graphics.
+- SGR pixel-coordinate mouse reporting.
+- An extended keyboard protocol.
+
+Mux uses supported remote-control commands from `muxctl`. It should avoid
+Kitty's undocumented in-process Python APIs. A minimal custom `tab_bar.py` is
+acceptable because custom tab bars are a documented extension point, but it
+must only format state already present in trusted titles or user variables and
+must never perform blocking IPC.
+
+### Global URL
+
+The active Kitty tab title is maintained from the active page's sanitized URL.
+The custom tab bar renders:
+
+~~~text
+[layer names]  https://active.example/path  [loading] [audio] [tls]
+~~~
+
+Pressing Ctrl-L launches `muxctl prompt` as an overlay over the active page.
+The entered URL goes directly to `muxd` over the Unix socket. It is never
+inserted into a shell command or Kitty configuration string.
+
+### Layers
+
+A Kitty tab is a browser layer. Each layer contains one or more tiled page
+views. This gives fast non-overlapping layer switching with no custom
+compositor.
+
+A Kitty overlay is trusted transient UI over one page. Arbitrary partially
+overlapping browser windows are not a version-one feature. If that later
+matters, it requires either Kitty support or a custom compositor rather than a
+fake cell-based implementation.
+
+## 7. WPE rendering
+
+WPEPlatform's custom view callback supplies a `WPEBuffer` and damage rectangles.
+The rendering path is:
+
+1. WebKit submits a buffer and damage list.
+2. `muxd` waits for the rendering fence when present.
+3. `muxd` maps or imports the buffer.
+4. Damage is coalesced and copied into a mode-0600 Kitty shared-memory object.
+5. A frame descriptor is sent to the attached `mux-view`.
+6. `mux-view` emits the Kitty command.
+7. Kitty consumes and unlinks the shared-memory object.
+8. `muxd` releases the WPE buffer as soon as the copy is independent of it.
+
+The first WPE spike must establish whether the selected backend yields
+CPU-mappable shared-memory buffers or DMA-BUF buffers requiring readback.
+Nothing in the initial plan assumes zero copy.
+
+The exact partial-update operation is selected by the Kitty transport spike.
+Candidates are:
+
+- Persistent-image rectangle composition.
+- Fixed-size dirty tiles.
+- Full-frame replacement as a recovery path.
+
+An accepted method must not create an animation queue, leave seams, leak Kitty
+image storage, or require raw pixel bytes in the PTY.
+
+## 8. Input path
+
+Direct Kitty removes the former tmux precision problem.
+
+| Event | Path |
+| --- | --- |
+| Keyboard | Kitty protocol -> `mux-view` -> WPE key event |
+| Text | committed UTF-8 -> `mux-view` -> WPE input method context |
+| Pointer | SGR pixel coordinates -> viewport coordinates -> WPE pointer event |
+| Wheel | Kitty wheel delta -> WPE scroll event |
+| Resize | SIGWINCH and pixel dimensions -> WPE viewport resize |
+| Focus | terminal focus event -> page visibility/focus state |
+
+Full IME preedit remains a spike because terminal input generally exposes less
+composition state than a native text widget. Initial support requires physical
+keys plus committed Unicode text.
+
+CSS cursor shapes can initially fall back to the normal system pointer. Mapping
+browser cursor requests to Kitty-supported pointer shapes is a polish task.
+
+## 9. Local protocol
+
+Use a user-only `AF_UNIX` `SOCK_SEQPACKET` socket under
+`$XDG_RUNTIME_DIR/mux`. Messages use a small fixed envelope and JSON payloads.
+Pixels never use this socket.
+
+The protocol is internal and may change with the repository. It still needs a
+major version in the handshake so mismatched Nix closures fail clearly rather
+than corrupting state.
+
+Core messages are:
+
+- `Hello` and `AttachPage`.
+- `Viewport`, `Focus`, and `Visibility`.
+- `Key`, `Text`, `Pointer`, and `Scroll`.
+- `Navigate`, `Back`, `Forward`, `Reload`, and `Stop`.
+- `PageState`.
+- `Frame` and `FrameSubmitted`.
+- `Detach`, `Close`, and `Error`.
+
+The socket directory and socket are user-only. Linux peer credentials must
+match the daemon user. A random attachment token prevents an unrelated
+same-user process from impersonating a stale Kitty window accidentally.
+
+## 10. Lifecycle and persistence
+
+Pages are engine objects, while Kitty windows are disposable attachments.
+
+| State | Engine page | Rendering |
+| --- | --- | --- |
+| Visible | live | foreground frame budget |
+| Hidden | live | frame transport stopped |
+| DetachedHot | live | no frames, waiting for reattachment |
+| Discarded | absent | URL and metadata remain for reload |
+
+Explicitly closing a page destroys it. Losing a Kitty client marks the page
+detached rather than closed. The personal default can retain detached pages
+until `muxd` exits; a memory-pressure policy may discard old pages.
+
+Workspace persistence stores:
+
+- Layer and split topology.
+- Page IDs and last committed URLs.
+- Active layer and focused page.
+- Page-to-profile association.
+- Enough metadata to distinguish a live reattachment from a reload.
+
+Kitty topology can be regenerated through its session and remote-control APIs.
+WebKit owns cookies, cache, history internals, storage, and service workers.
+
+## 11. Browser-shell requirements
+
+An engine alone is not a usable browser. After rendering and navigation, Mux
+must implement trusted handling for:
+
+- New windows and opener policy.
+- Downloads.
+- File chooser requests.
+- Clipboard access.
+- Camera, microphone, geolocation, notifications, and capture.
+- TLS and HTTP authentication failures.
+- External URL schemes.
+- Web-process crashes.
+- Audio and capture indicators.
+- Before-unload and unsaved-form warnings.
+- Open-in-external-browser fallback.
+
+For personal use, these can be intentionally plain terminal overlays. They
+cannot be silently auto-approved because pages are untrusted.
+
+## 12. Performance rules
+
+A 1200 by 800 RGBA page at 30 FPS represents about 115 MB/s of pixel copies.
+Shared memory removes base64 and PTY overhead, but not memory bandwidth.
+
+Required rules are:
+
+- One submitted and one coalesced pending frame per visible page.
+- New frames replace stale pending frames and merge their damage.
+- No frame transport for hidden tabs.
+- Full keyframes only after attach, resize, protocol recovery, or large damage.
+- Foreground cap of 30 FPS until measurements justify more.
+- Lower rate for visible but unfocused splits.
+- Damage-area threshold for choosing rectangles versus a full frame.
+- Cleanup timeout for orphaned shared-memory objects.
+- Per-page counters for copy bytes, damage ratio, dropped frames, latency, and
+  outstanding images.
+
+The control-plane target is below 25 MiB plus 3 MiB per `mux-view`, excluding
+Kitty and WebKit. The product target is materially lower aggregate memory than
+Chromium on the same page set. If it is not, the project should say so rather
+than manufacturing a favorable benchmark.
+
+## 13. Security floor
+
+Personal software still renders hostile web content. Mux must:
+
+- Keep WebKit sandboxing and its multiprocess architecture enabled.
+- Track security-patched WPE releases through the pinned Nix input.
+- Restrict the local socket and profile directories to the user.
+- Validate all image dimensions, strides, damage rectangles, and frame sizes.
+- Generate random shared-memory names and create them mode 0600.
+- Never provide a generic JavaScript-to-shell bridge.
+- Never treat URLs, titles, downloads, MIME types, or filenames as trusted.
+- Assemble terminal escapes only from validated numeric and enumerated fields.
+- Prompt for privileged origin permissions in trusted overlays.
+- Restrict supported URL schemes and require confirmation for external ones.
+- Ensure page content cannot modify Kitty remote-control credentials.
+
+Remote control should use a dedicated Kitty socket and scoped password or file
+permissions. Mux must not enable unrestricted control in the user's normal Kitty
+instances.
+
+## 14. Compatibility boundaries
+
+Expected limitations include:
+
+- DRM services without a licensed content-decryption module.
+- Chromium-only sites and extension-dependent workflows.
+- Host media codecs not available to WPE/GStreamer.
+- OAuth providers that reject embedded browser contexts.
+- High-damage games, WebGL, WebGPU, and video.
+- Full IME composition and accessibility through raster output.
+- Sites with browser-specific identity checks.
+
+`muxctl open-external` is part of the first usable browser milestone so an
+incompatible site is recoverable.
+
+## 15. Repository shape
+
+The intended repository structure is:
+
+~~~text
+flake.nix
+flake.lock
+README.md
+docs/
+  architecture.md
+spikes/
+  kitty-transport/
+daemon/
+  muxd/
+  wpe-platform/
+view/
+  mux-view/
+control/
+  muxctl/
+kitty/
+  kitty.conf
+  tab_bar.py
+  session.conf
+protocol/
+~~~
+
+Do not create all directories at once. Add each only when its vertical slice
+requires it.
+
+## 16. Build phases
+
+### Phase 0: direct Kitty transport
+
+No WebKit.
+
+Build one C17 program that produces synthetic RGBA frames and consumes real
+input.
+
+Pass when:
+
+- Shared-memory graphics work in the packaged Kitty without base64 pixels.
+- A 1200 by 800 page sustains 30 FPS at 10 percent damage without unbounded
+  storage or more than one CPU core of transport work.
+- Pixel pointer motion, buttons, drag, wheel, keys, focus, and resize are exact.
+- Splits, layouts, tab changes, overlays, view restart, and Kitty restart leave
+  no stale image.
+- Partial updates and full recovery keyframes are both reliable.
+
+### Phase 1: one WPE page
+
+Implement the minimum custom WPE display and view on Linux.
+
+Pass when:
+
+- One page renders from WPE damage callbacks through the proven Kitty path.
+- Navigation, typing, clicking, scrolling, resize, URL state, and crash reporting
+  work.
+- WPE buffer ownership and fences remain correct during sustained use.
+- A small corpus covers static pages, forms, an SPA, canvas, media, WebSockets,
+  and service workers.
+- Buffer mapping or readback cost does not dominate the frame budget.
+
+### Phase 2: daemon and multiple pages
+
+Introduce `muxd`, the local protocol, Kitty remote control, layers, and shared
+profile state.
+
+Pass when:
+
+- Four page views operate independently.
+- Hidden tabs stop rendering.
+- Cookies, storage, and service workers are shared.
+- Closing and moving Kitty windows preserve the intended page identity.
+- Kitty restart reconstructs the workspace.
+- A web-process crash does not kill unrelated views.
+
+### Phase 3: personal daily browser
+
+Add trusted prompts, downloads, file selection, clipboard, external fallback,
+history metadata, audio indicators, and lifecycle policy.
+
+Pass when ordinary browsing no longer requires manual daemon intervention and
+every privileged request has a visible deny path.
+
+### Phase 4: optimize only measured bottlenecks
+
+Possible work includes a Kitty DMA-BUF extension, smarter tile composition,
+page discarding, and media-specific frame policy. Do not fork Kitty unless the
+architecture is otherwise successful and pixel copying is the measured dominant
+cost.
+
+## 17. Immediate next slice
+
+Create only:
+
+~~~text
+flake.nix
+spikes/kitty-transport/
+kitty/kitty.conf
+~~~
+
+The default `nix run .` launches the packaged Kitty into a synthetic page. The
+spike should expose a small on-screen diagnostics line with frame rate, copied
+bytes, damage percentage, dropped frames, viewport pixels, and last input
+coordinates.
+
+Do not add WPE until this spike has a written pass/fail result.
+
+## 18. Primary references
+
+- [Kitty overview](https://sw.kovidgoyal.net/kitty/overview/)
+- [Kitty remote control](https://sw.kovidgoyal.net/kitty/remote-control/)
+- [Kitty launch and overlays](https://sw.kovidgoyal.net/kitty/launch/)
+- [Kitty sessions](https://sw.kovidgoyal.net/kitty/sessions/)
+- [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
+- [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
+- [Kitty custom tab bar configuration](https://sw.kovidgoyal.net/kitty/conf/)
+- [WPE WebKit developer documentation](https://wpewebkit.org/developers/)
+- [WPEPlatform API](https://wpewebkit.org/reference/stable/wpe-platform-2.0/)
+- [WPE WebKit releases](https://wpewebkit.org/release/)

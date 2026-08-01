@@ -1,0 +1,43 @@
+name: Linux build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arch:
+    name: Arch Linux / WPE 2.52
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: >-
+          pacman -Syu --needed --noconfirm
+          base-devel
+          git
+          kitty
+          meson
+          ninja
+          pkgconf
+          wpewebkit
+
+      - name: Check dependency surface
+        run: ./doctor
+
+      - name: Configure
+        run: meson setup --werror build/ci spikes/wpe-kitty
+
+      - name: Compile
+        run: meson compile -C build/ci
+
+      - name: Test
+        run: meson test -C build/ci --print-errorlogs

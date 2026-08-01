@@ -1,0 +1,65 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+if [ "$(uname -s)" != "Linux" ]; then
+    printf '%s\n' "Mux currently runs on Linux because WPEPlatform is Linux-only." >&2
+    exit 1
+fi
+
+for command in kitty kitten meson ninja pkg-config; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+        printf '%s\n' "Missing required command: $command" >&2
+        exit 1
+    fi
+done
+
+if ! pkg-config --atleast-version=2.52 wpe-webkit-2.0 ||
+   ! pkg-config --atleast-version=2.52 wpe-platform-2.0; then
+    cat >&2 <<'EOF'
+Mux needs WPE WebKit 2.52 or newer built with:
+
+    -DENABLE_WPE_PLATFORM=ON
+
+The required pkg-config modules are wpe-webkit-2.0 and wpe-platform-2.0.
+See docs/running-wpe.md for the exact runtime boundary.
+EOF
+    exit 1
+fi
+
+cache_root=$(printenv XDG_CACHE_HOME 2>/dev/null || true)
+if [ -z "$cache_root" ]; then
+    cache_root=$HOME/.cache
+fi
+build_dir=$cache_root/mux/wpe-kitty
+
+if [ ! -f "$build_dir/build.ninja" ]; then
+    mkdir -p "$build_dir"
+    meson setup \
+        --buildtype=release \
+        "$build_dir" \
+        "$repo_root/spikes/wpe-kitty"
+fi
+
+meson compile -C "$build_dir"
+"$build_dir/muxd" --ensure
+
+PATH=$build_dir:$PATH
+export PATH
+
+if [ "$#" -gt 0 ] && [ "$1" = "ctl" ]; then
+    shift
+    exec "$build_dir/muxctl" "$@"
+fi
+
+MUX_LAYER=main
+MUX_GLOBAL_BAR=1
+KITTY_LISTEN_ON=unix:@mux-kitty-$$
+export MUX_LAYER MUX_GLOBAL_BAR KITTY_LISTEN_ON
+
+exec kitty \
+    --config "$repo_root/kitty/wpe.conf" \
+    --listen-on "$KITTY_LISTEN_ON" \
+    --title Mux \
+    "$build_dir/mux-layer" "$@"

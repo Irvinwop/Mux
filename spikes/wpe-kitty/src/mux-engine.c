@@ -1,0 +1,3210 @@
+#define _GNU_SOURCE
+
+#include "mux-engine-protocol.h"
+#include "mux-clipboard-engine-link.h"
+#include "mux-ui-engine.h"
+#include "mux-download-engine.h"
+#include "mux-file-chooser-engine.h"
+#include "mux-popup-engine.h"
+#include "mux-browser-affordance-engine.h"
+#include "mux-input-method.h"
+#include "mux-notification-engine.h"
+#include "mux-navigation-policy.h"
+#include "mux-uri.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <glib-unix.h>
+#include <glib.h>
+#include <signal.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <wpe/webkit.h>
+#include <wpe/wpe-platform.h>
+
+#define MUX_ENGINE_MAX_CLIENTS 128u
+#define MUX_ENGINE_MAX_VIEWS 256u
+#define MUX_ENGINE_MAX_CLIENT_VIEWS 32u
+#define MUX_ENGINE_MAX_DIMENSION 16384u
+#define MUX_ENGINE_MIN_SCALE 250u
+#define MUX_ENGINE_MAX_SCALE 8000u
+#define MUX_ENGINE_MAX_LAYER_BYTES 128u
+#define MUX_ENGINE_MAX_KITTY_ID_BYTES 128u
+#define MUX_ENGINE_MAX_URI_BYTES (16u * 1024u)
+#define MUX_ENGINE_TEXT_SHORTCUT_MODIFIERS \
+    ((1u << 0) | (1u << 2) | (1u << 3))
+
+typedef struct _Engine Engine;
+typedef struct _Client Client;
+typedef struct _EngineView EngineView;
+
+typedef struct {
+    guint x;
+    guint y;
+    guint width;
+    guint height;
+} DamageRect;
+
+struct _Client {
+    Engine *engine;
+    int fd;
+    guint watch_id;
+    pid_t peer_pid;
+    uid_t peer_uid;
+    gboolean welcomed;
+    gboolean failed;
+    guint view_count;
+    gchar *kitty_window;
+    gchar *layer;
+    gchar *initial_uri;
+    guint width;
+    guint height;
+    guint scale_milli;
+};
+
+struct _EngineView {
+    Engine *engine;
+    Client *owner;
+    guint64 id;
+    WebKitWebView *web_view;
+    MuxInputMethodContext *input_method;
+    GHashTable *suppressed_text_keys;
+    MuxUiEngineBridge *ui_bridge;
+    MuxBrowserAffordanceBridge *affordance_bridge;
+    MuxNotificationEngine *notification_engine;
+    MuxNavigationPolicy *navigation_policy;
+    MuxFileChooserBridge *file_chooser_bridge;
+    MuxPopupManager *popup_manager;
+    gboolean fullscreen;
+    gchar *layer;
+    guint width;
+    guint height;
+    guint scale_milli;
+    gboolean ephemeral;
+    gboolean focused;
+    WPEView *platform_view;
+    guint8 *pixels;
+    gsize pixels_size;
+    guint surface_width;
+    guint surface_height;
+    DamageRect dirty;
+    gboolean dirty_valid;
+    gboolean dirty_replaces_pending;
+    gboolean root_frame_sent;
+    gboolean frame_pending;
+    guint64 pending_frame_serial;
+    gchar *pending_shm_name;
+    guint frame_timeout_id;
+};
+
+struct _Engine {
+    GMainLoop *loop;
+    GPtrArray *clients;
+    GHashTable *views;
+    GHashTable *pending_popups;
+    WPEDisplay *display;
+    MuxClipboardEngineLink *clipboard_link;
+    MuxPermissionStore *permission_store;
+    MuxPermissionStore *ephemeral_permission_store;
+    MuxDownloadManager *download_manager;
+    MuxDownloadManager *ephemeral_download_manager;
+    WebKitWebContext *web_context;
+    WebKitNetworkSession *persistent_session;
+    WebKitNetworkSession *ephemeral_session;
+    int listen_fd;
+    int lock_fd;
+    guint listen_watch_id;
+    guint sigint_watch_id;
+    guint sigterm_watch_id;
+    guint64 next_view_id;
+    guint64 next_event_serial;
+    guint64 clipboard_reply_view_id;
+    Client *clipboard_reply_client;
+    guint clipboard_tick_id;
+    EngineView *pending_view;
+    WPEView *(*original_create_view)(WPEDisplay *display);
+    WPEClipboard *(*original_get_clipboard)(WPEDisplay *display);
+    gchar *profile;
+    gchar *socket_path;
+    gchar *lock_path;
+    gchar *data_directory;
+    gchar *cache_directory;
+    gboolean socket_bound;
+};
+
+typedef struct {
+    WPEView parent_instance;
+    EngineView *engine_view;
+} MuxPlatformView;
+
+typedef struct {
+    WPEViewClass parent_class;
+} MuxPlatformViewClass;
+
+#define MUX_TYPE_PLATFORM_VIEW (mux_platform_view_get_type())
+
+static Engine *display_engine;
+static gboolean mux_platform_render_buffer(WPEView *platform_view,
+                                           WPEBuffer *buffer,
+                                           const WPERectangle *damage_rects,
+                                           guint damage_count,
+                                           GError **error);
+static void engine_view_send_frame(EngineView *view);
+static void engine_view_reset_surface(EngineView *view);
+
+G_DEFINE_TYPE(MuxPlatformView, mux_platform_view, WPE_TYPE_VIEW)
+
+static void
+mux_platform_view_dispose(GObject *object)
+{
+    MuxPlatformView *platform_view = (MuxPlatformView *)object;
+
+    if (platform_view->engine_view &&
+        platform_view->engine_view->platform_view == WPE_VIEW(object))
+        platform_view->engine_view->platform_view = NULL;
+    platform_view->engine_view = NULL;
+    G_OBJECT_CLASS(mux_platform_view_parent_class)->dispose(object);
+}
+
+static void
+mux_platform_view_class_init(MuxPlatformViewClass *view_class)
+{
+    GObjectClass *object_class = G_OBJECT_CLASS(view_class);
+    WPEViewClass *wpe_view_class = WPE_VIEW_CLASS(view_class);
+
+    object_class->dispose = mux_platform_view_dispose;
+    wpe_view_class->render_buffer = mux_platform_render_buffer;
+}
+
+static void
+mux_platform_view_init(MuxPlatformView *view)
+{
+    (void)view;
+}
+
+static WPEView *
+mux_display_create_view(WPEDisplay *display)
+{
+    MuxPlatformView *platform_view;
+    EngineView *engine_view;
+
+    if (!display_engine || !display_engine->pending_view) {
+        if (display_engine && display_engine->original_create_view)
+            return display_engine->original_create_view(display);
+        return NULL;
+    }
+
+    engine_view = display_engine->pending_view;
+    platform_view = g_object_new(MUX_TYPE_PLATFORM_VIEW,
+                                 "display",
+                                 display,
+                                 NULL);
+    platform_view->engine_view = engine_view;
+    engine_view->platform_view = WPE_VIEW(platform_view);
+    return WPE_VIEW(platform_view);
+}
+
+static void engine_view_free(gpointer data);
+static void client_free(gpointer data);
+static gboolean client_ready(gint fd, GIOCondition condition, gpointer data);
+
+static gboolean
+text_is_valid(const gchar *value, gsize maximum)
+{
+    gsize length;
+
+    if (!value)
+        return FALSE;
+    length = strlen(value);
+    return length <= maximum && g_utf8_validate(value, length, NULL);
+}
+
+static gboolean
+profile_is_valid(const gchar *profile)
+{
+    gsize length;
+
+    if (!profile || !*profile ||
+        g_str_equal(profile, ".") || g_str_equal(profile, ".."))
+        return FALSE;
+
+    length = strlen(profile);
+    if (length > 64)
+        return FALSE;
+
+    for (gsize i = 0; i < length; i++) {
+        gchar byte = profile[i];
+        if (!g_ascii_isalnum(byte) && byte != '-' && byte != '_' && byte != '.')
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+dimensions_are_valid(guint width, guint height, guint scale_milli)
+{
+    return width > 0 && width <= MUX_ENGINE_MAX_DIMENSION &&
+        height > 0 && height <= MUX_ENGINE_MAX_DIMENSION &&
+        scale_milli >= MUX_ENGINE_MIN_SCALE &&
+        scale_milli <= MUX_ENGINE_MAX_SCALE;
+}
+
+static gboolean
+ensure_private_directory(const gchar *path, GError **error)
+{
+    struct stat status;
+
+    if (g_mkdir_with_parents(path, 0700) < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "create directory %s: %s",
+                    path,
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (stat(path, &status) < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "inspect directory %s: %s",
+                    path,
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (!S_ISDIR(status.st_mode) || status.st_uid != getuid()) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    G_FILE_ERROR_ACCES,
+                    "%s must be a directory owned by uid %u",
+                    path,
+                    (guint)getuid());
+        return FALSE;
+    }
+    if (chmod(path, 0700) < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "restrict directory %s: %s",
+                    path,
+                    g_strerror(errno));
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gchar *
+runtime_directory(void)
+{
+    const gchar *xdg_runtime = g_getenv("XDG_RUNTIME_DIR");
+
+    if (xdg_runtime && g_path_is_absolute(xdg_runtime))
+        return g_build_filename(xdg_runtime, "mux", NULL);
+    return g_strdup_printf("/tmp/mux-%u", (guint)getuid());
+}
+
+static gchar *
+default_socket_path(const gchar *profile)
+{
+    gchar *directory = runtime_directory();
+    gchar *filename = g_strdup_printf("mux-engine-%s.sock", profile);
+    gchar *path = g_build_filename(directory, filename, NULL);
+
+    g_free(filename);
+    g_free(directory);
+    return path;
+}
+
+static gboolean
+prepare_paths(Engine *engine, const gchar *socket_override, GError **error)
+{
+    const gchar *socket_environment = g_getenv("MUX_ENGINE_SOCKET");
+    const gchar *data_environment = g_getenv("MUX_PROFILE_DATA_DIR");
+    const gchar *cache_environment = g_getenv("MUX_PROFILE_CACHE_DIR");
+    gchar *socket_directory;
+
+    if (socket_override)
+        engine->socket_path = g_strdup(socket_override);
+    else if (socket_environment && *socket_environment)
+        engine->socket_path = g_strdup(socket_environment);
+    else
+        engine->socket_path = default_socket_path(engine->profile);
+
+    if (!g_path_is_absolute(engine->socket_path)) {
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_INVAL,
+                            "engine socket path must be absolute");
+        return FALSE;
+    }
+    if (strlen(engine->socket_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    G_FILE_ERROR_NAMETOOLONG,
+                    "engine socket path is too long: %s",
+                    engine->socket_path);
+        return FALSE;
+    }
+
+    socket_directory = g_path_get_dirname(engine->socket_path);
+    if (!ensure_private_directory(socket_directory, error)) {
+        g_free(socket_directory);
+        return FALSE;
+    }
+    g_free(socket_directory);
+
+    engine->lock_path = g_strconcat(engine->socket_path, ".lock", NULL);
+    engine->data_directory = data_environment && *data_environment
+        ? g_strdup(data_environment)
+        : g_build_filename(g_get_user_data_dir(),
+                           "mux",
+                           "profiles",
+                           engine->profile,
+                           NULL);
+    engine->cache_directory = cache_environment && *cache_environment
+        ? g_strdup(cache_environment)
+        : g_build_filename(g_get_user_cache_dir(),
+                           "mux",
+                           "profiles",
+                           engine->profile,
+                           NULL);
+
+    if (!g_path_is_absolute(engine->data_directory) ||
+        !g_path_is_absolute(engine->cache_directory)) {
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_INVAL,
+                            "profile data and cache directories must be absolute");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+acquire_engine_lock(Engine *engine, gboolean *already_running, GError **error)
+{
+    *already_running = FALSE;
+    engine->lock_fd = open(engine->lock_path,
+                           O_RDWR | O_CREAT | O_CLOEXEC,
+                           0600);
+    if (engine->lock_fd < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "open engine lock %s: %s",
+                    engine->lock_path,
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (fchmod(engine->lock_fd, 0600) < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "restrict engine lock %s: %s",
+                    engine->lock_path,
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (flock(engine->lock_fd, LOCK_EX | LOCK_NB) < 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            *already_running = TRUE;
+            close(engine->lock_fd);
+            engine->lock_fd = -1;
+            return TRUE;
+        }
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "lock engine profile %s: %s",
+                    engine->profile,
+                    g_strerror(errno));
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+write_lock_pid(Engine *engine, GError **error)
+{
+    gchar buffer[64];
+    gsize length;
+    ssize_t written;
+
+    length = (gsize)g_snprintf(buffer, sizeof(buffer), "%ld\n", (long)getpid());
+    if (ftruncate(engine->lock_fd, 0) < 0 ||
+        lseek(engine->lock_fd, 0, SEEK_SET) < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "prepare engine lock pid: %s",
+                    g_strerror(errno));
+        return FALSE;
+    }
+    do {
+        written = write(engine->lock_fd, buffer, length);
+    } while (written < 0 && errno == EINTR);
+    if (written < 0 || (gsize)written != length) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    written < 0 ? g_file_error_from_errno(errno) : G_FILE_ERROR_FAILED,
+                    "write engine lock pid: %s",
+                    written < 0 ? g_strerror(errno) : "short write");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gint
+daemonize_engine(GError **error)
+{
+    pid_t child = fork();
+
+    if (child < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "fork engine daemon: %s",
+                    g_strerror(errno));
+        return -1;
+    }
+    if (child > 0)
+        return 1;
+
+    if (setsid() < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "create engine daemon session: %s",
+                    g_strerror(errno));
+        return -1;
+    }
+
+    gint null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (null_fd < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "open /dev/null: %s",
+                    g_strerror(errno));
+        return -1;
+    }
+    if (dup2(null_fd, STDIN_FILENO) < 0 ||
+        dup2(null_fd, STDOUT_FILENO) < 0 ||
+        dup2(null_fd, STDERR_FILENO) < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "redirect engine daemon streams: %s",
+                    g_strerror(errno));
+        close(null_fd);
+        return -1;
+    }
+    if (null_fd > STDERR_FILENO)
+        close(null_fd);
+    return 0;
+}
+
+static gboolean
+client_send(Client *client,
+            guint16 type,
+            guint32 flags,
+            guint64 view_id,
+            guint64 serial,
+            GBytes *payload)
+{
+    MuxEngineMessage message = {
+        .type = type,
+        .flags = flags,
+        .view_id = view_id,
+        .serial = serial,
+        .payload = payload,
+    };
+    GError *error = NULL;
+
+    if (client->failed)
+        return FALSE;
+    if (mux_engine_send_message(client->fd, &message, &error))
+        return TRUE;
+
+    g_warning("engine client %ld send failed: %s",
+              (long)client->peer_pid,
+              error->message);
+    g_clear_error(&error);
+    client->failed = TRUE;
+    shutdown(client->fd, SHUT_RDWR);
+    return FALSE;
+}
+
+static EngineView *
+clipboard_find_view(Engine *engine, guint64 view_id, Client *owner)
+{
+    GHashTableIter iterator;
+    gpointer value;
+    EngineView *fallback = NULL;
+
+    if (!engine || !engine->views)
+        return NULL;
+
+    g_hash_table_iter_init(&iterator, engine->views);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        EngineView *view = value;
+
+        if (owner && view->owner != owner)
+            continue;
+        if (view_id && view->id == view_id)
+            return view;
+        if (!fallback || view->focused)
+            fallback = view;
+    }
+    return view_id ? NULL : fallback;
+}
+
+static gchar *
+clipboard_origin(EngineView *view)
+{
+    const gchar *uri = webkit_web_view_get_uri(view->web_view);
+    GUri *parsed;
+    const gchar *scheme;
+    const gchar *host;
+    gchar *origin;
+    gint port;
+
+    if (!uri || !*uri)
+        return g_strdup("unknown");
+
+    parsed = g_uri_parse(uri, G_URI_FLAGS_PARSE_RELAXED, NULL);
+    if (!parsed)
+        return g_strdup("unknown");
+    scheme = g_uri_get_scheme(parsed);
+    host = g_uri_get_host(parsed);
+    if (!scheme || !host) {
+        g_uri_unref(parsed);
+        return g_strdup("unknown");
+    }
+
+    port = g_uri_get_port(parsed);
+    origin = port > 0
+        ? g_strdup_printf("%s://%s:%d", scheme, host, port)
+        : g_strdup_printf("%s://%s", scheme, host);
+    g_uri_unref(parsed);
+    return origin;
+}
+
+static gboolean
+clipboard_output(MuxClipboardEngineLink *link,
+                 GBytes *packet,
+                 gpointer data,
+                 GError **error)
+{
+    Engine *engine = data;
+    EngineView *view;
+
+    (void)link;
+    view = clipboard_find_view(engine,
+                               engine->clipboard_reply_view_id,
+                               engine->clipboard_reply_client);
+    if (!view)
+        view = clipboard_find_view(engine, 0, NULL);
+    if (!view) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_CONNECTED,
+                            "no pane owns the active clipboard view");
+        return FALSE;
+    }
+
+    if (client_send(view->owner,
+                    MUX_ENGINE_MESSAGE_EXTENSION,
+                    MUX_ENGINE_FLAG_NONE,
+                    view->id,
+                    ++engine->next_event_serial,
+                    packet))
+        return TRUE;
+
+    g_set_error_literal(error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_BROKEN_PIPE,
+                        "clipboard packet could not be sent to its pane");
+    return FALSE;
+}
+
+static void
+clipboard_paste(MuxClipboardEngineLink *link,
+                guint64 target_view_id,
+                const MuxClipboardSnapshot *snapshot,
+                gpointer data)
+{
+    Engine *engine = data;
+    EngineView *view = clipboard_find_view(engine, target_view_id, NULL);
+
+    (void)link;
+    (void)snapshot;
+    if (!view)
+        view = clipboard_find_view(engine, 0, NULL);
+    if (view)
+        webkit_web_view_execute_editing_command(view->web_view, "Paste");
+}
+
+static void
+clipboard_failure(MuxClipboardEngineLink *link,
+                  const gchar *operation,
+                  const GError *error,
+                  gpointer data)
+{
+    (void)link;
+    (void)data;
+    g_warning("clipboard %s failed: %s",
+              operation ? operation : "operation",
+              error ? error->message : "unknown error");
+}
+
+static WPEClipboard *
+mux_display_get_clipboard(WPEDisplay *display)
+{
+    if (display_engine && display_engine->clipboard_link)
+        return mux_clipboard_engine_link_get_clipboard(
+            display_engine->clipboard_link);
+    if (display_engine && display_engine->original_get_clipboard)
+        return display_engine->original_get_clipboard(display);
+    return NULL;
+}
+
+static gboolean
+clipboard_tick(gpointer data)
+{
+    Engine *engine = data;
+    GHashTableIter iterator;
+    gpointer value;
+
+    if (engine->clipboard_link)
+        (void)mux_clipboard_engine_link_tick(engine->clipboard_link,
+                                             g_get_monotonic_time());
+    if (engine->views) {
+        g_hash_table_iter_init(&iterator, engine->views);
+        while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+            EngineView *view = value;
+
+            if (view->popup_manager)
+                (void)mux_popup_manager_tick(view->popup_manager,
+                                             g_get_monotonic_time());
+        }
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean
+ui_output(GBytes *payload, gpointer data, GError **error)
+{
+    EngineView *view = data;
+
+    if (view->owner &&
+        client_send(view->owner,
+                    MUX_ENGINE_MESSAGE_EXTENSION,
+                    MUX_ENGINE_FLAG_NONE,
+                    view->id,
+                    ++view->engine->next_event_serial,
+                    payload))
+        return TRUE;
+
+    g_set_error_literal(error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_BROKEN_PIPE,
+                        "UI request could not be sent to its pane");
+    return FALSE;
+}
+
+static EngineView *
+view_for_web_view(Engine *engine, WebKitWebView *web_view)
+{
+    GHashTableIter iterator;
+    gpointer value;
+
+    if (!engine || !engine->views)
+        return NULL;
+    g_hash_table_iter_init(&iterator, engine->views);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        EngineView *view = value;
+
+        if (view->web_view == web_view)
+            return view;
+    }
+    return NULL;
+}
+
+static gboolean
+download_output(WebKitWebView *source_view,
+                GBytes *payload,
+                gpointer data,
+                GError **error)
+{
+    Engine *engine = data;
+    EngineView *view = view_for_web_view(engine, source_view);
+
+    if (!view)
+        view = clipboard_find_view(engine, 0, NULL);
+    if (view && view->owner &&
+        client_send(view->owner,
+                    MUX_ENGINE_MESSAGE_EXTENSION,
+                    MUX_ENGINE_FLAG_NONE,
+                    view->id,
+                    ++engine->next_event_serial,
+                    payload))
+        return TRUE;
+
+    g_set_error_literal(error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_BROKEN_PIPE,
+                        "download request could not be sent to a pane");
+    return FALSE;
+}
+
+static gboolean
+popup_token_valid(const gchar *token)
+{
+    if (!token || strlen(token) != MUX_POPUP_TOKEN_LENGTH)
+        return FALSE;
+    for (guint i = 0; i < MUX_POPUP_TOKEN_LENGTH; i++) {
+        if (!g_ascii_isxdigit(token[i]))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static WebKitWebView *
+popup_create(WebKitWebView *parent,
+             WebKitNavigationAction *navigation_action,
+             gpointer data,
+             GError **error)
+{
+    EngineView *parent_view = data;
+    Engine *engine = parent_view->engine;
+    EngineView *child = g_new0(EngineView, 1);
+
+    (void)navigation_action;
+    child->engine = engine;
+    child->layer = g_strdup(parent_view->layer);
+    child->width = parent_view->width;
+    child->height = parent_view->height;
+    child->scale_milli = parent_view->scale_milli;
+    child->ephemeral = parent_view->ephemeral;
+
+    engine->pending_view = child;
+    child->web_view = WEBKIT_WEB_VIEW(
+        g_object_new(WEBKIT_TYPE_WEB_VIEW,
+                     "related-view", parent,
+                     "display", engine->display,
+                     NULL));
+    engine->pending_view = NULL;
+    if (!child->web_view || !child->platform_view) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "related popup WebView construction failed");
+        engine_view_free(child);
+        return NULL;
+    }
+
+    g_hash_table_insert(engine->pending_popups,
+                        child->web_view,
+                        child);
+    return child->web_view;
+}
+
+static gboolean
+popup_offer(WebKitWebView *parent,
+            WebKitWebView *child,
+            const gchar *token,
+            gpointer data,
+            GError **error)
+{
+    EngineView *parent_view = data;
+    const gchar *listen_on = g_getenv("KITTY_LISTEN_ON");
+    g_autofree gchar *self = NULL;
+    g_autofree gchar *directory = NULL;
+    g_autofree gchar *pane_binary = NULL;
+    g_autofree gchar *source_match = NULL;
+    g_autofree gchar *profile_env = NULL;
+    g_autofree gchar *layer_env = NULL;
+    g_autofree gchar *token_env = NULL;
+    g_autofree gchar *ephemeral_env = NULL;
+    g_autoptr(GPtrArray) arguments = g_ptr_array_new();
+    gint wait_status = 0;
+
+    (void)parent;
+    (void)child;
+    if (!listen_on || !*listen_on || !parent_view->owner) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_CONNECTED,
+                            "Kitty remote control is unavailable");
+        return FALSE;
+    }
+
+    self = g_file_read_link("/proc/self/exe", NULL);
+    directory = self ? g_path_get_dirname(self) : NULL;
+    pane_binary = directory
+        ? g_build_filename(directory, "mux-pane", NULL)
+        : g_strdup("mux-pane");
+    if (parent_view->owner->kitty_window &&
+        *parent_view->owner->kitty_window)
+        source_match = g_strdup_printf(
+            "id:%s", parent_view->owner->kitty_window);
+    profile_env = g_strdup_printf("MUX_PROFILE=%s",
+                                  parent_view->engine->profile);
+    layer_env = g_strdup_printf("MUX_LAYER=%s", parent_view->layer);
+    token_env = g_strdup_printf("MUX_POPUP_TOKEN=%s", token);
+    ephemeral_env = g_strdup_printf("MUX_EPHEMERAL=%u",
+                                    parent_view->ephemeral ? 1 : 0);
+
+    g_ptr_array_add(arguments, (gpointer)"kitten");
+    g_ptr_array_add(arguments, (gpointer)"@");
+    g_ptr_array_add(arguments, (gpointer)"--to");
+    g_ptr_array_add(arguments, (gpointer)listen_on);
+    g_ptr_array_add(arguments, (gpointer)"launch");
+    g_ptr_array_add(arguments, (gpointer)"--type=window");
+    g_ptr_array_add(arguments, (gpointer)"--location=neighbor");
+    if (source_match) {
+        g_ptr_array_add(arguments, (gpointer)"--source-window");
+        g_ptr_array_add(arguments, source_match);
+        g_ptr_array_add(arguments, (gpointer)"--next-to");
+        g_ptr_array_add(arguments, source_match);
+    }
+    g_ptr_array_add(arguments, (gpointer)"--cwd=current");
+    g_ptr_array_add(arguments, (gpointer)"--copy-env");
+    g_ptr_array_add(arguments, (gpointer)"--env");
+    g_ptr_array_add(arguments, profile_env);
+    g_ptr_array_add(arguments, (gpointer)"--env");
+    g_ptr_array_add(arguments, layer_env);
+    g_ptr_array_add(arguments, (gpointer)"--env");
+    g_ptr_array_add(arguments, token_env);
+    g_ptr_array_add(arguments, (gpointer)"--env");
+    g_ptr_array_add(arguments, ephemeral_env);
+    g_ptr_array_add(arguments, (gpointer)"--title");
+    g_ptr_array_add(arguments, (gpointer)"Mux popup");
+    g_ptr_array_add(arguments, pane_binary);
+    g_ptr_array_add(arguments, (gpointer)"about:blank");
+    g_ptr_array_add(arguments, NULL);
+
+    if (!g_spawn_sync(NULL,
+                      (gchar **)arguments->pdata,
+                      NULL,
+                      G_SPAWN_SEARCH_PATH,
+                      NULL,
+                      NULL,
+                      NULL,
+                      NULL,
+                      &wait_status,
+                      error))
+        return FALSE;
+    return g_spawn_check_wait_status(wait_status, error);
+}
+
+static void
+popup_destroy(WebKitWebView *child, gpointer data)
+{
+    EngineView *parent_view = data;
+    EngineView *child_view = g_hash_table_lookup(
+        parent_view->engine->pending_popups,
+        child);
+
+    if (!child_view) {
+        g_object_unref(child);
+        return;
+    }
+    g_hash_table_steal(parent_view->engine->pending_popups, child);
+    engine_view_free(child_view);
+}
+
+static EngineView *
+claim_popup(Engine *engine, const gchar *token)
+{
+    GHashTableIter iterator;
+    gpointer value;
+    WebKitWebView *child = NULL;
+    EngineView *view;
+
+    g_hash_table_iter_init(&iterator, engine->views);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        EngineView *parent_view = value;
+        g_autoptr(GError) claim_error = NULL;
+
+        if (!parent_view->popup_manager)
+            continue;
+        child = mux_popup_manager_claim(parent_view->popup_manager,
+                                        token,
+                                        &claim_error);
+        if (child)
+            break;
+    }
+    if (!child)
+        return NULL;
+
+    view = g_hash_table_lookup(engine->pending_popups, child);
+    if (!view) {
+        g_object_unref(child);
+        return NULL;
+    }
+    g_hash_table_steal(engine->pending_popups, child);
+    return view;
+}
+
+static gboolean
+attach_popup_manager(EngineView *view, GError **error)
+{
+    view->popup_manager = mux_popup_manager_new(view->web_view,
+                                                popup_create,
+                                                popup_offer,
+                                                popup_destroy,
+                                                view,
+                                                NULL);
+    if (view->popup_manager)
+        return TRUE;
+    g_set_error_literal(error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_FAILED,
+                        "popup manager construction failed");
+    return FALSE;
+}
+
+static gboolean
+client_send_empty(Client *client,
+                  guint16 type,
+                  guint64 view_id,
+                  guint64 serial)
+{
+    GBytes *payload = g_bytes_new(NULL, 0);
+    gboolean result = client_send(client,
+                                  type,
+                                  MUX_ENGINE_FLAG_NONE,
+                                  view_id,
+                                  serial,
+                                  payload);
+
+    g_bytes_unref(payload);
+    return result;
+}
+
+static gboolean
+client_send_error(Client *client,
+                  const MuxEngineMessage *request,
+                  MuxEngineRemoteError code,
+                  const gchar *detail)
+{
+    MuxEngineBuilder builder;
+    GBytes *payload;
+    gboolean result;
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, code);
+    mux_engine_builder_put_string(&builder, detail ? detail : "engine error");
+    payload = mux_engine_builder_finish(&builder);
+    result = client_send(client,
+                         MUX_ENGINE_MESSAGE_ERROR,
+                         MUX_ENGINE_FLAG_NONE,
+                         request ? request->view_id : 0,
+                         request ? request->serial : 0,
+                         payload);
+    g_bytes_unref(payload);
+    return result;
+}
+
+static gboolean
+client_send_ack(Client *client, const MuxEngineMessage *request)
+{
+    return client_send_empty(client,
+                             MUX_ENGINE_MESSAGE_ACK,
+                             request->view_id,
+                             request->serial);
+}
+
+#define DRM_FOURCC(a, b, c, d) \
+    ((guint32)(a) | ((guint32)(b) << 8) | \
+     ((guint32)(c) << 16) | ((guint32)(d) << 24))
+#define DRM_FORMAT_XRGB8888 DRM_FOURCC('X', 'R', '2', '4')
+
+static DamageRect
+damage_full(guint width, guint height)
+{
+    DamageRect rectangle = { 0, 0, width, height };
+    return rectangle;
+}
+
+static gboolean
+damage_is_full(const DamageRect *rectangle, guint width, guint height)
+{
+    return rectangle->x == 0 && rectangle->y == 0 &&
+        rectangle->width == width && rectangle->height == height;
+}
+
+static void
+damage_union(DamageRect *destination, const DamageRect *source)
+{
+    guint64 right = MAX((guint64)destination->x + destination->width,
+                        (guint64)source->x + source->width);
+    guint64 bottom = MAX((guint64)destination->y + destination->height,
+                         (guint64)source->y + source->height);
+
+    destination->x = MIN(destination->x, source->x);
+    destination->y = MIN(destination->y, source->y);
+    destination->width = (guint)(right - destination->x);
+    destination->height = (guint)(bottom - destination->y);
+}
+
+static DamageRect
+coalesce_damage(const WPERectangle *rectangles,
+                guint rectangle_count,
+                guint width,
+                guint height)
+{
+    DamageRect result = { 0 };
+    gboolean found = FALSE;
+
+    for (guint i = 0; i < rectangle_count; i++) {
+        gint64 left = CLAMP((gint64)rectangles[i].x, 0, (gint64)width);
+        gint64 top = CLAMP((gint64)rectangles[i].y, 0, (gint64)height);
+        gint64 right = CLAMP((gint64)rectangles[i].x +
+                                 rectangles[i].width,
+                             0,
+                             (gint64)width);
+        gint64 bottom = CLAMP((gint64)rectangles[i].y +
+                                  rectangles[i].height,
+                              0,
+                              (gint64)height);
+        DamageRect rectangle;
+
+        if (right <= left || bottom <= top)
+            continue;
+        rectangle.x = (guint)left;
+        rectangle.y = (guint)top;
+        rectangle.width = (guint)(right - left);
+        rectangle.height = (guint)(bottom - top);
+        if (found)
+            damage_union(&result, &rectangle);
+        else {
+            result = rectangle;
+            found = TRUE;
+        }
+    }
+    return found ? result : damage_full(width, height);
+}
+
+static void
+engine_view_clear_pending_frame(EngineView *view)
+{
+    if (view->frame_timeout_id) {
+        g_source_remove(view->frame_timeout_id);
+        view->frame_timeout_id = 0;
+    }
+    if (view->pending_shm_name) {
+        shm_unlink(view->pending_shm_name);
+        g_clear_pointer(&view->pending_shm_name, g_free);
+    }
+    view->frame_pending = FALSE;
+    view->pending_frame_serial = 0;
+}
+
+static gboolean
+frame_timeout(gpointer data)
+{
+    EngineView *view = data;
+    guint64 serial = view->pending_frame_serial;
+
+    view->frame_timeout_id = 0;
+    if (view->pending_shm_name) {
+        shm_unlink(view->pending_shm_name);
+        g_clear_pointer(&view->pending_shm_name, g_free);
+    }
+    view->frame_pending = FALSE;
+    view->pending_frame_serial = 0;
+    if (view->owner && !view->owner->failed) {
+        g_warning("Kitty did not acknowledge frame %" G_GUINT64_FORMAT
+                  " for view %" G_GUINT64_FORMAT,
+                  serial,
+                  view->id);
+        view->owner->failed = TRUE;
+        shutdown(view->owner->fd, SHUT_RDWR);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static gchar *
+create_frame_shm(const EngineView *view,
+                 const DamageRect *rectangle,
+                 gsize *size_out)
+{
+    gsize row_bytes = (gsize)rectangle->width * 4;
+    gsize size = row_bytes * rectangle->height;
+    gchar *name = NULL;
+    int fd = -1;
+    guint8 *mapping;
+
+    for (guint attempt = 0; attempt < 16; attempt++) {
+        g_free(name);
+        name = g_strdup_printf(
+            "/mux-tty-graphics-protocol-%u-%ld-%" G_GUINT64_FORMAT "-%08x",
+            (guint)getuid(),
+            (long)getpid(),
+            view->id,
+            g_random_int());
+        fd = shm_open(name,
+                      O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
+                      0600);
+        if (fd >= 0)
+            break;
+        if (errno != EEXIST)
+            break;
+    }
+    if (fd < 0) {
+        g_warning("create Kitty frame shared memory: %s",
+                  g_strerror(errno));
+        g_free(name);
+        return NULL;
+    }
+    if (ftruncate(fd, (off_t)size) < 0) {
+        g_warning("size Kitty frame shared memory: %s",
+                  g_strerror(errno));
+        close(fd);
+        shm_unlink(name);
+        g_free(name);
+        return NULL;
+    }
+
+    mapping = mmap(NULL,
+                   size,
+                   PROT_READ | PROT_WRITE,
+                   MAP_SHARED,
+                   fd,
+                   0);
+    close(fd);
+    if (mapping == MAP_FAILED) {
+        g_warning("map Kitty frame shared memory: %s",
+                  g_strerror(errno));
+        shm_unlink(name);
+        g_free(name);
+        return NULL;
+    }
+
+    for (guint row = 0; row < rectangle->height; row++) {
+        const guint8 *source =
+            view->pixels +
+            ((gsize)rectangle->y + row) * view->surface_width * 4 +
+            (gsize)rectangle->x * 4;
+        memcpy(mapping + (gsize)row * row_bytes, source, row_bytes);
+    }
+    munmap(mapping, size);
+    *size_out = size;
+    return name;
+}
+
+static void
+engine_view_send_frame(EngineView *view)
+{
+    DamageRect rectangle;
+    gchar *shm_name;
+    gsize shm_size;
+    guint32 flags = 0;
+    guint64 serial;
+    MuxEngineBuilder builder;
+    GBytes *payload;
+
+    if (view->frame_pending || !view->dirty_valid ||
+        !view->pixels || !view->owner || view->owner->failed)
+        return;
+
+    rectangle = view->dirty;
+    if (!view->root_frame_sent) {
+        rectangle = damage_full(view->surface_width,
+                                view->surface_height);
+        flags |= MUX_ENGINE_FLAG_FULL_DAMAGE;
+    } else if (damage_is_full(&rectangle,
+                              view->surface_width,
+                              view->surface_height))
+        flags |= MUX_ENGINE_FLAG_FULL_DAMAGE;
+    if (view->dirty_replaces_pending)
+        flags |= MUX_ENGINE_FLAG_REPLACES_PENDING;
+
+    shm_name = create_frame_shm(view, &rectangle, &shm_size);
+    if (!shm_name)
+        return;
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, view->surface_width);
+    mux_engine_builder_put_u32(&builder, view->surface_height);
+    mux_engine_builder_put_u32(&builder, rectangle.width * 4);
+    mux_engine_builder_put_u32(&builder, MUX_ENGINE_PIXEL_RGBA8888);
+    mux_engine_builder_put_u32(&builder, 1);
+    mux_engine_builder_put_u32(&builder, rectangle.x);
+    mux_engine_builder_put_u32(&builder, rectangle.y);
+    mux_engine_builder_put_u32(&builder, rectangle.width);
+    mux_engine_builder_put_u32(&builder, rectangle.height);
+    mux_engine_builder_put_u64(&builder, shm_size);
+    mux_engine_builder_put_string(&builder, shm_name);
+    payload = mux_engine_builder_finish(&builder);
+    serial = ++view->engine->next_event_serial;
+    if (!client_send(view->owner,
+                     MUX_ENGINE_MESSAGE_FRAME,
+                     flags,
+                     view->id,
+                     serial,
+                     payload)) {
+        g_bytes_unref(payload);
+        shm_unlink(shm_name);
+        g_free(shm_name);
+        return;
+    }
+    g_bytes_unref(payload);
+
+    view->frame_pending = TRUE;
+    view->pending_frame_serial = serial;
+    view->pending_shm_name = shm_name;
+    view->frame_timeout_id = g_timeout_add_seconds(30,
+                                                   frame_timeout,
+                                                   view);
+    view->dirty_valid = FALSE;
+    view->dirty_replaces_pending = FALSE;
+    view->root_frame_sent = TRUE;
+}
+
+static gboolean
+engine_view_update_pixels(EngineView *view,
+                          WPEBuffer *buffer,
+                          const WPERectangle *damage_rects,
+                          guint damage_count)
+{
+    GError *error = NULL;
+    GBytes *bytes;
+    const guint8 *source;
+    gsize source_size;
+    guint source_stride;
+    guint width;
+    guint height;
+    gboolean has_alpha = TRUE;
+    gboolean resized;
+    DamageRect damage;
+
+    width = (guint)wpe_buffer_get_width(buffer);
+    height = (guint)wpe_buffer_get_height(buffer);
+    if (!width || !height ||
+        width > MUX_ENGINE_MAX_DIMENSION ||
+        height > MUX_ENGINE_MAX_DIMENSION)
+        return FALSE;
+
+    bytes = wpe_buffer_import_to_pixels(buffer, &error);
+    if (!bytes) {
+        g_warning("import WPE buffer for Kitty: %s",
+                  error ? error->message : "unsupported buffer");
+        g_clear_error(&error);
+        return FALSE;
+    }
+    source = g_bytes_get_data(bytes, &source_size);
+    if (WPE_IS_BUFFER_SHM(buffer))
+        source_stride =
+            wpe_buffer_shm_get_stride(WPE_BUFFER_SHM(buffer));
+    else
+        source_stride = height ? (guint)(source_size / height) : 0;
+    if (WPE_IS_BUFFER_DMA_BUF(buffer) &&
+        wpe_buffer_dma_buf_get_format(WPE_BUFFER_DMA_BUF(buffer)) ==
+            DRM_FORMAT_XRGB8888)
+        has_alpha = FALSE;
+    if (source_stride < width * 4 ||
+        source_size < (gsize)source_stride * height)
+        return FALSE;
+
+    resized = view->surface_width != width ||
+        view->surface_height != height || !view->pixels;
+    if (resized) {
+        gsize pixels_size = (gsize)width * height * 4;
+
+        view->pixels = g_realloc(view->pixels, pixels_size);
+        view->pixels_size = pixels_size;
+        view->surface_width = width;
+        view->surface_height = height;
+        view->root_frame_sent = FALSE;
+        view->dirty_valid = FALSE;
+        damage = damage_full(width, height);
+    } else
+        damage = coalesce_damage(damage_rects,
+                                 damage_count,
+                                 width,
+                                 height);
+
+    for (guint row = damage.y;
+         row < damage.y + damage.height;
+         row++) {
+        const guint8 *source_row =
+            source + (gsize)row * source_stride;
+        guint8 *destination_row =
+            view->pixels + (gsize)row * width * 4;
+
+        for (guint column = damage.x;
+             column < damage.x + damage.width;
+             column++) {
+            const guint8 *pixel = source_row + (gsize)column * 4;
+            guint8 *destination =
+                destination_row + (gsize)column * 4;
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN
+            destination[0] = pixel[2];
+            destination[1] = pixel[1];
+            destination[2] = pixel[0];
+            destination[3] = has_alpha ? pixel[3] : 255;
+#else
+            destination[0] = pixel[1];
+            destination[1] = pixel[2];
+            destination[2] = pixel[3];
+            destination[3] = has_alpha ? pixel[0] : 255;
+#endif
+        }
+    }
+
+    if (view->dirty_valid)
+        damage_union(&view->dirty, &damage);
+    else {
+        view->dirty = damage;
+        view->dirty_valid = TRUE;
+    }
+    if (view->frame_pending)
+        view->dirty_replaces_pending = TRUE;
+    engine_view_send_frame(view);
+    return TRUE;
+}
+
+static gboolean
+mux_platform_render_buffer(WPEView *platform_view,
+                           WPEBuffer *buffer,
+                           const WPERectangle *damage_rects,
+                           guint damage_count,
+                           GError **error)
+{
+    MuxPlatformView *mux_view = (MuxPlatformView *)platform_view;
+
+    (void)error;
+    if (mux_view->engine_view)
+        engine_view_update_pixels(mux_view->engine_view,
+                                  buffer,
+                                  damage_rects,
+                                  damage_count);
+    wpe_view_buffer_rendered(platform_view, buffer);
+    wpe_view_buffer_released(platform_view, buffer);
+    return TRUE;
+}
+
+static void
+engine_view_reset_surface(EngineView *view)
+{
+    engine_view_clear_pending_frame(view);
+    g_clear_pointer(&view->pixels, g_free);
+    view->pixels_size = 0;
+    view->surface_width = 0;
+    view->surface_height = 0;
+    view->dirty_valid = FALSE;
+    view->dirty_replaces_pending = FALSE;
+    view->root_frame_sent = FALSE;
+}
+
+static void
+metadata_capture_flags(guint32 *flags,
+                       WebKitMediaCaptureState state,
+                       guint32 active_flag,
+                       guint32 muted_flag)
+{
+    if (state == WEBKIT_MEDIA_CAPTURE_STATE_ACTIVE)
+        *flags |= active_flag;
+    else if (state == WEBKIT_MEDIA_CAPTURE_STATE_MUTED)
+        *flags |= muted_flag;
+}
+
+static guint32
+view_metadata_flags(EngineView *view)
+{
+    guint32 flags = 0;
+
+    if (webkit_web_view_is_playing_audio(view->web_view))
+        flags |= MUX_ENGINE_METADATA_AUDIO_PLAYING;
+    if (webkit_web_view_get_is_muted(view->web_view))
+        flags |= MUX_ENGINE_METADATA_AUDIO_MUTED;
+    metadata_capture_flags(
+        &flags,
+        webkit_web_view_get_camera_capture_state(view->web_view),
+        MUX_ENGINE_METADATA_CAMERA_ACTIVE,
+        MUX_ENGINE_METADATA_CAMERA_MUTED);
+    metadata_capture_flags(
+        &flags,
+        webkit_web_view_get_microphone_capture_state(view->web_view),
+        MUX_ENGINE_METADATA_MICROPHONE_ACTIVE,
+        MUX_ENGINE_METADATA_MICROPHONE_MUTED);
+    metadata_capture_flags(
+        &flags,
+        webkit_web_view_get_display_capture_state(view->web_view),
+        MUX_ENGINE_METADATA_DISPLAY_ACTIVE,
+        MUX_ENGINE_METADATA_DISPLAY_MUTED);
+    if (view->fullscreen)
+        flags |= MUX_ENGINE_METADATA_FULLSCREEN;
+    return flags;
+}
+
+static void
+view_send_metadata(EngineView *view)
+{
+    MuxEngineBuilder builder;
+    GBytes *payload;
+    const gchar *uri;
+    const gchar *title;
+    gdouble progress;
+    guint progress_milli;
+
+    if (!view->owner || view->owner->failed)
+        return;
+
+    uri = webkit_web_view_get_uri(view->web_view);
+    title = webkit_web_view_get_title(view->web_view);
+    progress = webkit_web_view_get_estimated_load_progress(view->web_view);
+    progress_milli = (guint)(CLAMP(progress, 0.0, 1.0) * 1000.0);
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_string(&builder, uri ? uri : "");
+    mux_engine_builder_put_string(&builder, title ? title : "");
+    mux_engine_builder_put_string(&builder, view->layer);
+    mux_engine_builder_put_u32(&builder,
+                               webkit_web_view_is_loading(view->web_view));
+    mux_engine_builder_put_u32(&builder,
+                               webkit_web_view_can_go_back(view->web_view));
+    mux_engine_builder_put_u32(&builder,
+                               webkit_web_view_can_go_forward(view->web_view));
+    mux_engine_builder_put_u32(&builder, progress_milli);
+    mux_engine_builder_put_u32(&builder, view->width);
+    mux_engine_builder_put_u32(&builder, view->height);
+    mux_engine_builder_put_u32(&builder, view->scale_milli);
+    mux_engine_builder_put_u32(&builder, view_metadata_flags(view));
+    payload = mux_engine_builder_finish(&builder);
+    client_send(view->owner,
+                MUX_ENGINE_MESSAGE_METADATA,
+                view->ephemeral ? MUX_ENGINE_FLAG_EPHEMERAL : 0,
+                view->id,
+                ++view->engine->next_event_serial,
+                payload);
+    g_bytes_unref(payload);
+}
+
+static void
+view_property_changed(GObject *object, GParamSpec *spec, gpointer data)
+{
+    EngineView *view = data;
+
+    (void)object;
+    (void)spec;
+    view_send_metadata(view);
+}
+
+static void
+view_load_changed(WebKitWebView *web_view,
+                  WebKitLoadEvent load_event,
+                  gpointer data)
+{
+    EngineView *view = data;
+
+    (void)web_view;
+    if (load_event == WEBKIT_LOAD_STARTED)
+        view->fullscreen = FALSE;
+    view_send_metadata(view);
+}
+
+static gboolean
+view_enter_fullscreen(WebKitWebView *web_view, gpointer data)
+{
+    EngineView *view = data;
+
+    (void)web_view;
+    view->fullscreen = TRUE;
+    view_send_metadata(view);
+    return FALSE;
+}
+
+static gboolean
+view_leave_fullscreen(WebKitWebView *web_view, gpointer data)
+{
+    EngineView *view = data;
+
+    (void)web_view;
+    view->fullscreen = FALSE;
+    view_send_metadata(view);
+    return FALSE;
+}
+
+static void
+engine_view_free(gpointer data)
+{
+    EngineView *view = data;
+
+    if (!view)
+        return;
+    if (view->owner && view->owner->view_count)
+        view->owner->view_count--;
+    engine_view_reset_surface(view);
+    g_clear_pointer(&view->popup_manager, mux_popup_manager_free);
+    g_clear_pointer(&view->file_chooser_bridge,
+                    mux_file_chooser_bridge_free);
+    g_clear_pointer(&view->affordance_bridge,
+                    mux_browser_affordance_bridge_free);
+    g_clear_pointer(&view->notification_engine,
+                    mux_notification_engine_free);
+    g_clear_pointer(&view->navigation_policy,
+                    mux_navigation_policy_free);
+    g_clear_pointer(&view->ui_bridge, mux_ui_engine_bridge_free);
+    if (view->web_view && view->input_method)
+        webkit_web_view_set_input_method_context(view->web_view, NULL);
+    g_clear_object(&view->input_method);
+    g_clear_pointer(&view->suppressed_text_keys, g_hash_table_unref);
+    g_clear_object(&view->web_view);
+    g_free(view->layer);
+    g_free(view);
+}
+
+static EngineView *
+lookup_owned_view(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view;
+
+    view = g_hash_table_lookup(client->engine->views, &request->view_id);
+    if (!view) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_NOT_FOUND,
+                          "view not found");
+        return NULL;
+    }
+    if (view->owner != client) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_NOT_OWNER,
+                          "view belongs to another pane");
+        return NULL;
+    }
+    return view;
+}
+
+static gboolean
+handle_hello(Client *client, const MuxEngineMessage *request)
+{
+    MuxEngineCursor cursor;
+    guint32 claimed_pid;
+    guint32 width;
+    guint32 height;
+    guint32 scale_milli;
+    gchar *kitty_window = NULL;
+    gchar *layer = NULL;
+    gchar *initial_uri = NULL;
+    MuxEngineBuilder builder;
+    GBytes *payload;
+    gboolean sent;
+
+    if (client->welcomed) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_STATE,
+                          "HELLO was already received");
+        return FALSE;
+    }
+    if (request->view_id) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "HELLO must use view id zero");
+        return FALSE;
+    }
+
+    mux_engine_cursor_init(&cursor, request->payload);
+    if (!mux_engine_cursor_get_u32(&cursor, &claimed_pid) ||
+        !mux_engine_cursor_get_string(&cursor, &kitty_window) ||
+        !mux_engine_cursor_get_string(&cursor, &layer) ||
+        !mux_engine_cursor_get_u32(&cursor, &width) ||
+        !mux_engine_cursor_get_u32(&cursor, &height) ||
+        !mux_engine_cursor_get_u32(&cursor, &scale_milli) ||
+        !mux_engine_cursor_get_string(&cursor, &initial_uri) ||
+        !mux_engine_cursor_done(&cursor)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "invalid HELLO payload");
+        g_free(kitty_window);
+        g_free(layer);
+        g_free(initial_uri);
+        return FALSE;
+    }
+    if ((pid_t)claimed_pid != client->peer_pid ||
+        !text_is_valid(kitty_window, MUX_ENGINE_MAX_KITTY_ID_BYTES) ||
+        !text_is_valid(layer, MUX_ENGINE_MAX_LAYER_BYTES) ||
+        !text_is_valid(initial_uri, MUX_ENGINE_MAX_URI_BYTES) ||
+        !dimensions_are_valid(width, height, scale_milli)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "HELLO identity, text, or dimensions are invalid");
+        g_free(kitty_window);
+        g_free(layer);
+        g_free(initial_uri);
+        return FALSE;
+    }
+
+    client->kitty_window = kitty_window;
+    client->layer = *layer ? layer : g_strdup("main");
+    if (!*layer)
+        g_free(layer);
+    client->initial_uri = initial_uri;
+    client->width = width;
+    client->height = height;
+    client->scale_milli = scale_milli;
+    client->welcomed = TRUE;
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, (guint32)getpid());
+    mux_engine_builder_put_string(&builder, client->engine->profile);
+    mux_engine_builder_put_string(&builder, client->engine->socket_path);
+    payload = mux_engine_builder_finish(&builder);
+    sent = client_send(client,
+                       MUX_ENGINE_MESSAGE_WELCOME,
+                       MUX_ENGINE_FLAG_NONE,
+                       0,
+                       request->serial,
+                       payload);
+    g_bytes_unref(payload);
+    return sent;
+}
+
+static gboolean
+parse_create_payload(Client *client,
+                     GBytes *payload,
+                     guint *width,
+                     guint *height,
+                     guint *scale_milli,
+                     gchar **layer,
+                     gchar **uri,
+                     gchar **popup_token)
+{
+    MuxEngineCursor cursor;
+    guint32 parsed_width;
+    guint32 parsed_height;
+    guint32 parsed_scale;
+    gchar *parsed_layer = NULL;
+    gchar *parsed_uri = NULL;
+    gchar *parsed_popup_token = NULL;
+
+    *width = client->width;
+    *height = client->height;
+    *scale_milli = client->scale_milli;
+    *layer = g_strdup(client->layer);
+    *uri = g_strdup(client->initial_uri);
+    *popup_token = NULL;
+
+    if (!g_bytes_get_size(payload))
+        return TRUE;
+
+    mux_engine_cursor_init(&cursor, payload);
+    if (!mux_engine_cursor_get_u32(&cursor, &parsed_width) ||
+        !mux_engine_cursor_get_u32(&cursor, &parsed_height) ||
+        !mux_engine_cursor_get_u32(&cursor, &parsed_scale) ||
+        !mux_engine_cursor_get_string(&cursor, &parsed_layer) ||
+        !mux_engine_cursor_get_string(&cursor, &parsed_uri)) {
+        g_free(parsed_layer);
+        g_free(parsed_uri);
+        return FALSE;
+    }
+    if (!mux_engine_cursor_done(&cursor) &&
+        !mux_engine_cursor_get_string(&cursor, &parsed_popup_token)) {
+        g_free(parsed_layer);
+        g_free(parsed_uri);
+        return FALSE;
+    }
+    if (!mux_engine_cursor_done(&cursor)) {
+        g_free(parsed_layer);
+        g_free(parsed_uri);
+        g_free(parsed_popup_token);
+        return FALSE;
+    }
+
+    g_free(*layer);
+    g_free(*uri);
+    *width = parsed_width;
+    *height = parsed_height;
+    *scale_milli = parsed_scale;
+    *layer = parsed_layer;
+    *uri = parsed_uri;
+    *popup_token = parsed_popup_token;
+    return TRUE;
+}
+
+static gboolean
+handle_create_view(Client *client, const MuxEngineMessage *request)
+{
+    Engine *engine = client->engine;
+    EngineView *view = NULL;
+    WebKitNetworkSession *session;
+    WPEView *wpe_view;
+    WPEToplevel *toplevel;
+    guint width;
+    guint height;
+    guint scale_milli;
+    gchar *layer = NULL;
+    gchar *uri = NULL;
+    g_autofree gchar *popup_token = NULL;
+    gchar *normalized_uri;
+    GError *uri_error = NULL;
+    guint64 *key;
+    MuxEngineBuilder builder;
+    GBytes *payload;
+    gboolean popup_claim;
+    gboolean requested_ephemeral;
+
+    if (request->view_id) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "CREATE_VIEW must use view id zero");
+        return TRUE;
+    }
+    if (client->view_count >= MUX_ENGINE_MAX_CLIENT_VIEWS ||
+        g_hash_table_size(engine->views) >= MUX_ENGINE_MAX_VIEWS) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_LIMIT,
+                          "engine view limit reached");
+        return TRUE;
+    }
+    if (!parse_create_payload(client,
+                              request->payload,
+                              &width,
+                              &height,
+                              &scale_milli,
+                              &layer,
+                              &uri,
+                              &popup_token) ||
+        !dimensions_are_valid(width, height, scale_milli) ||
+        !text_is_valid(layer, MUX_ENGINE_MAX_LAYER_BYTES) ||
+        !text_is_valid(uri, MUX_ENGINE_MAX_URI_BYTES) ||
+        (popup_token && *popup_token &&
+         !popup_token_valid(popup_token))) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "invalid CREATE_VIEW payload");
+        g_free(layer);
+        g_free(uri);
+        return TRUE;
+    }
+
+    popup_claim = popup_token && *popup_token;
+    requested_ephemeral =
+        (request->flags & MUX_ENGINE_FLAG_EPHEMERAL) != 0;
+    if (popup_claim)
+        view = claim_popup(engine, popup_token);
+    if (popup_claim && !view) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_STATE,
+                          "popup token is unavailable or expired");
+        g_free(layer);
+        g_free(uri);
+        return TRUE;
+    }
+    if (view && view->ephemeral != requested_ephemeral) {
+        engine_view_free(view);
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_STATE,
+                          "popup crossed a profile privacy boundary");
+        g_free(layer);
+        g_free(uri);
+        return TRUE;
+    }
+
+    if (!view) {
+        view = g_new0(EngineView, 1);
+        view->engine = engine;
+        view->owner = client;
+        view->id = engine->next_view_id++;
+        view->layer = *layer ? layer : g_strdup("main");
+        if (!*layer)
+            g_free(layer);
+        view->width = width;
+        view->height = height;
+        view->scale_milli = scale_milli;
+        view->ephemeral = requested_ephemeral;
+        session = view->ephemeral
+            ? engine->ephemeral_session
+            : engine->persistent_session;
+
+        engine->pending_view = view;
+        view->web_view = WEBKIT_WEB_VIEW(
+            g_object_new(WEBKIT_TYPE_WEB_VIEW,
+                         "web-context", engine->web_context,
+                         "network-session", session,
+                         "display", engine->display,
+                         NULL));
+        engine->pending_view = NULL;
+    } else {
+        view->owner = client;
+        view->id = engine->next_view_id++;
+        g_free(view->layer);
+        view->layer = *layer ? layer : g_strdup("main");
+        if (!*layer)
+            g_free(layer);
+        view->width = width;
+        view->height = height;
+        view->scale_milli = scale_milli;
+    }
+    if (!view->web_view || !view->platform_view) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                          "WebKitWebView construction failed");
+        engine_view_free(view);
+        g_free(uri);
+        return TRUE;
+    }
+    view->input_method = mux_input_method_context_new();
+    view->suppressed_text_keys =
+        g_hash_table_new(g_direct_hash, g_direct_equal);
+    if (!view->input_method || !view->suppressed_text_keys) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                          "WebView input method construction failed");
+        engine_view_free(view);
+        g_free(uri);
+        return TRUE;
+    }
+    webkit_web_view_set_input_method_context(
+        view->web_view,
+        WEBKIT_INPUT_METHOD_CONTEXT(view->input_method));
+    view->ui_bridge = mux_ui_engine_bridge_new(view->web_view,
+                                               ui_output,
+                                               view,
+                                               NULL);
+    if (!view->ui_bridge) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                          "WebView UI bridge construction failed");
+        engine_view_free(view);
+        g_free(uri);
+        return TRUE;
+    }
+    mux_ui_engine_bridge_set_permission_store(
+        view->ui_bridge,
+        view->ephemeral ? engine->ephemeral_permission_store
+                        : engine->permission_store);
+    view->affordance_bridge = mux_browser_affordance_bridge_new(
+        view->web_view,
+        view->ephemeral,
+        ui_output,
+        view,
+        NULL);
+    if (!view->affordance_bridge) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                          "WebView browser affordance bridge construction failed");
+        engine_view_free(view);
+        g_free(uri);
+        return TRUE;
+    }
+    view->notification_engine = mux_notification_engine_new(
+        view->web_view,
+        view->ephemeral,
+        ui_output,
+        view,
+        NULL);
+    if (!view->notification_engine) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                          "WebView notification bridge construction failed");
+        engine_view_free(view);
+        g_free(uri);
+        return TRUE;
+    }
+    view->navigation_policy = mux_navigation_policy_new(
+        view->web_view,
+        view->ephemeral,
+        ui_output,
+        view,
+        NULL);
+    if (!view->navigation_policy) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                          "WebView navigation policy construction failed");
+        engine_view_free(view);
+        g_free(uri);
+        return TRUE;
+    }
+    view->file_chooser_bridge = mux_file_chooser_bridge_new(
+        view->web_view,
+        ui_output,
+        view,
+        NULL);
+    if (!view->file_chooser_bridge) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                          "WebView file chooser bridge construction failed");
+        engine_view_free(view);
+        g_free(uri);
+        return TRUE;
+    }
+    {
+        GError *popup_error = NULL;
+
+        if (!attach_popup_manager(view, &popup_error)) {
+            client_send_error(client,
+                              request,
+                              MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                              popup_error->message);
+            g_clear_error(&popup_error);
+            engine_view_free(view);
+            g_free(uri);
+            return TRUE;
+        }
+    }
+
+    wpe_view = webkit_web_view_get_wpe_view(view->web_view);
+    toplevel = wpe_view ? wpe_view_get_toplevel(wpe_view) : NULL;
+    if (toplevel)
+        wpe_toplevel_resize(toplevel, width, height);
+
+    key = g_new(guint64, 1);
+    *key = view->id;
+    client->view_count++;
+    g_hash_table_insert(engine->views, key, view);
+
+    g_signal_connect(view->web_view,
+                     "notify::uri",
+                     G_CALLBACK(view_property_changed),
+                     view);
+    g_signal_connect(view->web_view,
+                     "notify::title",
+                     G_CALLBACK(view_property_changed),
+                     view);
+    g_signal_connect(view->web_view,
+                     "notify::estimated-load-progress",
+                     G_CALLBACK(view_property_changed),
+                     view);
+    g_signal_connect(view->web_view,
+                     "notify::is-playing-audio",
+                     G_CALLBACK(view_property_changed),
+                     view);
+    g_signal_connect(view->web_view,
+                     "notify::is-muted",
+                     G_CALLBACK(view_property_changed),
+                     view);
+    g_signal_connect(view->web_view,
+                     "notify::camera-capture-state",
+                     G_CALLBACK(view_property_changed),
+                     view);
+    g_signal_connect(view->web_view,
+                     "notify::microphone-capture-state",
+                     G_CALLBACK(view_property_changed),
+                     view);
+    g_signal_connect(view->web_view,
+                     "notify::display-capture-state",
+                     G_CALLBACK(view_property_changed),
+                     view);
+    g_signal_connect(view->web_view,
+                     "enter-fullscreen",
+                     G_CALLBACK(view_enter_fullscreen),
+                     view);
+    g_signal_connect(view->web_view,
+                     "leave-fullscreen",
+                     G_CALLBACK(view_leave_fullscreen),
+                     view);
+    g_signal_connect(view->web_view,
+                     "load-changed",
+                     G_CALLBACK(view_load_changed),
+                     view);
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, width);
+    mux_engine_builder_put_u32(&builder, height);
+    mux_engine_builder_put_u32(&builder, scale_milli);
+    mux_engine_builder_put_string(&builder, view->layer);
+    payload = mux_engine_builder_finish(&builder);
+    if (!client_send(client,
+                     MUX_ENGINE_MESSAGE_VIEW_CREATED,
+                     view->ephemeral ? MUX_ENGINE_FLAG_EPHEMERAL : 0,
+                     view->id,
+                     request->serial,
+                     payload)) {
+        g_bytes_unref(payload);
+        g_hash_table_remove(engine->views, &view->id);
+        g_free(uri);
+        return FALSE;
+    }
+    g_bytes_unref(payload);
+
+    if (!popup_claim) {
+        normalized_uri = mux_uri_resolve_user_input(
+            uri,
+            g_getenv(MUX_URI_SEARCH_ENV),
+            &uri_error);
+        if (!normalized_uri) {
+            client_send_error(client,
+                              request,
+                              MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                              uri_error->message);
+            g_clear_error(&uri_error);
+            g_hash_table_remove(engine->views, &view->id);
+            g_free(uri);
+            return TRUE;
+        }
+        webkit_web_view_load_uri(view->web_view, normalized_uri);
+        g_free(normalized_uri);
+    }
+    g_free(uri);
+    view_send_metadata(view);
+    engine_view_send_frame(view);
+    return TRUE;
+}
+
+static gboolean
+handle_destroy_view(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+
+    if (!view)
+        return TRUE;
+    client_send_ack(client, request);
+    g_hash_table_remove(client->engine->views, &view->id);
+    return !client->failed;
+}
+
+static gboolean
+handle_resize(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+    MuxEngineCursor cursor;
+    guint32 width;
+    guint32 height;
+    guint32 scale_milli;
+    WPEView *wpe_view;
+    WPEToplevel *toplevel;
+
+    if (!view)
+        return TRUE;
+    mux_engine_cursor_init(&cursor, request->payload);
+    if (!mux_engine_cursor_get_u32(&cursor, &width) ||
+        !mux_engine_cursor_get_u32(&cursor, &height) ||
+        !mux_engine_cursor_get_u32(&cursor, &scale_milli) ||
+        !mux_engine_cursor_done(&cursor) ||
+        !dimensions_are_valid(width, height, scale_milli)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "invalid RESIZE payload");
+        return TRUE;
+    }
+
+    view->width = width;
+    view->height = height;
+    view->scale_milli = scale_milli;
+    engine_view_reset_surface(view);
+    wpe_view = webkit_web_view_get_wpe_view(view->web_view);
+    toplevel = wpe_view ? wpe_view_get_toplevel(wpe_view) : NULL;
+    if (toplevel)
+        wpe_toplevel_resize(toplevel, width, height);
+    client_send_ack(client, request);
+    view_send_metadata(view);
+    return !client->failed;
+}
+
+static gboolean
+handle_navigate(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+    MuxEngineCursor cursor;
+    guint16 action;
+    gchar *uri = NULL;
+    gchar *normalized_uri;
+    GError *uri_error = NULL;
+
+    if (!view)
+        return TRUE;
+    mux_engine_cursor_init(&cursor, request->payload);
+    if (!mux_engine_cursor_get_u16(&cursor, &action)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "NAVIGATE action is missing");
+        return TRUE;
+    }
+
+    if (action == MUX_ENGINE_NAVIGATE_LOAD) {
+        if (!mux_engine_cursor_get_string(&cursor, &uri) ||
+            !mux_engine_cursor_done(&cursor) ||
+            !text_is_valid(uri, MUX_ENGINE_MAX_URI_BYTES)) {
+            client_send_error(client,
+                              request,
+                              MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                              "invalid navigation URI");
+            g_free(uri);
+            return TRUE;
+        }
+        normalized_uri = mux_uri_resolve_user_input(
+            uri,
+            g_getenv(MUX_URI_SEARCH_ENV),
+            &uri_error);
+        if (!normalized_uri) {
+            client_send_error(client,
+                              request,
+                              MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                              uri_error->message);
+            g_clear_error(&uri_error);
+            g_free(uri);
+            return TRUE;
+        }
+        webkit_web_view_load_uri(view->web_view, normalized_uri);
+        g_free(normalized_uri);
+        g_free(uri);
+    } else {
+        if (!mux_engine_cursor_done(&cursor)) {
+            client_send_error(client,
+                              request,
+                              MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                              "unexpected NAVIGATE payload");
+            return TRUE;
+        }
+        switch (action) {
+        case MUX_ENGINE_NAVIGATE_BACK:
+            if (webkit_web_view_can_go_back(view->web_view))
+                webkit_web_view_go_back(view->web_view);
+            break;
+        case MUX_ENGINE_NAVIGATE_FORWARD:
+            if (webkit_web_view_can_go_forward(view->web_view))
+                webkit_web_view_go_forward(view->web_view);
+            break;
+        case MUX_ENGINE_NAVIGATE_RELOAD:
+            webkit_web_view_reload(view->web_view);
+            break;
+        case MUX_ENGINE_NAVIGATE_STOP:
+            webkit_web_view_stop_loading(view->web_view);
+            break;
+        default:
+            client_send_error(client,
+                              request,
+                              MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                              "unknown navigation action");
+            return TRUE;
+        }
+    }
+
+    client_send_ack(client, request);
+    return !client->failed;
+}
+
+static gboolean
+handle_input_key(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+    MuxEngineCursor cursor;
+    guint16 event_type;
+    guint32 time;
+    guint32 modifiers;
+    guint32 keycode;
+    guint32 keyval;
+    WPEEvent *event;
+
+    if (!view)
+        return TRUE;
+    mux_engine_cursor_init(&cursor, request->payload);
+    if (!mux_engine_cursor_get_u16(&cursor, &event_type) ||
+        !mux_engine_cursor_get_u32(&cursor, &time) ||
+        !mux_engine_cursor_get_u32(&cursor, &modifiers) ||
+        !mux_engine_cursor_get_u32(&cursor, &keycode) ||
+        !mux_engine_cursor_get_u32(&cursor, &keyval) ||
+        !mux_engine_cursor_done(&cursor) ||
+        event_type < MUX_ENGINE_KEY_PRESS ||
+        event_type > MUX_ENGINE_KEY_RELEASE) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "invalid INPUT_KEY payload");
+        return TRUE;
+    }
+
+    if (view->input_method && view->suppressed_text_keys) {
+        if (!mux_input_method_context_is_focused(view->input_method)) {
+            g_hash_table_remove_all(view->suppressed_text_keys);
+        } else if (!(modifiers & MUX_ENGINE_TEXT_SHORTCUT_MODIFIERS) &&
+                   g_hash_table_contains(view->suppressed_text_keys,
+                                         GUINT_TO_POINTER(keyval))) {
+            if (event_type == MUX_ENGINE_KEY_RELEASE)
+                g_hash_table_remove(view->suppressed_text_keys,
+                                    GUINT_TO_POINTER(keyval));
+            return TRUE;
+        }
+    }
+
+    event = wpe_event_keyboard_new(
+        event_type == MUX_ENGINE_KEY_RELEASE
+            ? WPE_EVENT_KEYBOARD_KEY_UP
+            : WPE_EVENT_KEYBOARD_KEY_DOWN,
+        view->platform_view,
+        WPE_INPUT_SOURCE_KEYBOARD,
+        time,
+        (WPEModifiers)modifiers,
+        keycode,
+        keyval);
+    if (event) {
+        wpe_view_event(view->platform_view, event);
+        wpe_event_unref(event);
+    }
+    return TRUE;
+}
+
+static gboolean
+handle_text_commit(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+    MuxEngineCursor cursor;
+    guint32 keyval;
+    guint32 text_length;
+    const guint8 *text;
+    g_autoptr(GError) error = NULL;
+
+    if (!view)
+        return TRUE;
+    mux_engine_cursor_init(&cursor, request->payload);
+    if (!mux_engine_cursor_get_u32(&cursor, &keyval) || !keyval ||
+        !mux_engine_cursor_get_u32(&cursor, &text_length) ||
+        !text_length || text_length > MUX_ENGINE_MAX_TEXT_BYTES ||
+        !mux_engine_cursor_get_bytes(&cursor, text_length, &text) ||
+        !mux_engine_cursor_done(&cursor) ||
+        memchr(text, '\0', text_length) ||
+        !g_utf8_validate((const gchar *)text, text_length, NULL)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "invalid TEXT_COMMIT payload");
+        return TRUE;
+    }
+
+    if (view->input_method &&
+        mux_input_method_context_commit(view->input_method,
+                                        text,
+                                        text_length,
+                                        &error))
+        g_hash_table_add(view->suppressed_text_keys,
+                         GUINT_TO_POINTER(keyval));
+    else if (error)
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          error->message);
+    return TRUE;
+}
+
+static gboolean
+handle_input_pointer(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+    MuxEngineCursor cursor;
+    guint16 event_type;
+    guint32 time;
+    guint32 modifiers;
+    guint32 button;
+    guint32 encoded_x;
+    guint32 encoded_y;
+    guint32 encoded_delta_x;
+    guint32 encoded_delta_y;
+    guint32 precise;
+    guint32 stop;
+    gdouble x;
+    gdouble y;
+    gdouble delta_x;
+    gdouble delta_y;
+    WPEEvent *event = NULL;
+
+    if (!view)
+        return TRUE;
+    mux_engine_cursor_init(&cursor, request->payload);
+    if (!mux_engine_cursor_get_u16(&cursor, &event_type) ||
+        !mux_engine_cursor_get_u32(&cursor, &time) ||
+        !mux_engine_cursor_get_u32(&cursor, &modifiers) ||
+        !mux_engine_cursor_get_u32(&cursor, &button) ||
+        !mux_engine_cursor_get_u32(&cursor, &encoded_x) ||
+        !mux_engine_cursor_get_u32(&cursor, &encoded_y) ||
+        !mux_engine_cursor_get_u32(&cursor, &encoded_delta_x) ||
+        !mux_engine_cursor_get_u32(&cursor, &encoded_delta_y) ||
+        !mux_engine_cursor_get_u32(&cursor, &precise) ||
+        !mux_engine_cursor_get_u32(&cursor, &stop) ||
+        !mux_engine_cursor_done(&cursor) ||
+        event_type < MUX_ENGINE_POINTER_MOVE ||
+        event_type > MUX_ENGINE_POINTER_SCROLL ||
+        precise > 1 || stop > 1) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "invalid INPUT_POINTER payload");
+        return TRUE;
+    }
+
+    x = (gdouble)(gint32)encoded_x / 1000.0;
+    y = (gdouble)(gint32)encoded_y / 1000.0;
+    delta_x = (gdouble)(gint32)encoded_delta_x / 1000.0;
+    delta_y = (gdouble)(gint32)encoded_delta_y / 1000.0;
+    switch (event_type) {
+    case MUX_ENGINE_POINTER_MOVE:
+    case MUX_ENGINE_POINTER_ENTER:
+    case MUX_ENGINE_POINTER_LEAVE:
+        event = wpe_event_pointer_move_new(
+            event_type == MUX_ENGINE_POINTER_ENTER
+                ? WPE_EVENT_POINTER_ENTER
+                : event_type == MUX_ENGINE_POINTER_LEAVE
+                    ? WPE_EVENT_POINTER_LEAVE
+                    : WPE_EVENT_POINTER_MOVE,
+            view->platform_view,
+            WPE_INPUT_SOURCE_MOUSE,
+            time,
+            (WPEModifiers)modifiers,
+            x,
+            y,
+            delta_x,
+            delta_y);
+        break;
+    case MUX_ENGINE_POINTER_DOWN:
+    case MUX_ENGINE_POINTER_UP: {
+        guint press_count = event_type == MUX_ENGINE_POINTER_DOWN
+            ? wpe_view_compute_press_count(view->platform_view,
+                                           x,
+                                           y,
+                                           button,
+                                           time)
+            : 1;
+        event = wpe_event_pointer_button_new(
+            event_type == MUX_ENGINE_POINTER_DOWN
+                ? WPE_EVENT_POINTER_DOWN
+                : WPE_EVENT_POINTER_UP,
+            view->platform_view,
+            WPE_INPUT_SOURCE_MOUSE,
+            time,
+            (WPEModifiers)modifiers,
+            button,
+            x,
+            y,
+            press_count);
+        break;
+    }
+    case MUX_ENGINE_POINTER_SCROLL:
+        event = wpe_event_scroll_new(view->platform_view,
+                                     WPE_INPUT_SOURCE_MOUSE,
+                                     time,
+                                     (WPEModifiers)modifiers,
+                                     delta_x,
+                                     delta_y,
+                                     precise,
+                                     stop,
+                                     x,
+                                     y);
+        break;
+    default:
+        break;
+    }
+    if (event) {
+        wpe_view_event(view->platform_view, event);
+        wpe_event_unref(event);
+    }
+    return TRUE;
+}
+
+static gboolean
+handle_frame_ack(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+
+    if (!view)
+        return TRUE;
+    if (g_bytes_get_size(request->payload) ||
+        !view->frame_pending ||
+        request->serial != view->pending_frame_serial) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_STATE,
+                          "FRAME_ACK does not match the pending frame");
+        return TRUE;
+    }
+
+    engine_view_clear_pending_frame(view);
+    engine_view_send_frame(view);
+    return TRUE;
+}
+
+static gboolean
+handle_set_focus(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+    MuxEngineCursor cursor;
+    guint32 focused;
+
+    if (!view)
+        return TRUE;
+    mux_engine_cursor_init(&cursor, request->payload);
+    if (!mux_engine_cursor_get_u32(&cursor, &focused) ||
+        !mux_engine_cursor_done(&cursor) ||
+        focused > 1) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "invalid SET_FOCUS payload");
+        return TRUE;
+    }
+    view->focused = focused != 0;
+    if (focused) {
+        if (client->engine->clipboard_link) {
+            GError *clipboard_error = NULL;
+            gchar *origin = clipboard_origin(view);
+
+            if (!mux_clipboard_engine_link_set_active_source(
+                    client->engine->clipboard_link,
+                    view->id,
+                    origin,
+                    &clipboard_error)) {
+                clipboard_failure(client->engine->clipboard_link,
+                                  "focus-source",
+                                  clipboard_error,
+                                  client->engine);
+                g_clear_error(&clipboard_error);
+            }
+            mux_clipboard_engine_link_set_ephemeral(
+                client->engine->clipboard_link,
+                view->ephemeral);
+            g_free(origin);
+        }
+        wpe_view_focus_in(view->platform_view);
+    } else {
+        wpe_view_focus_out(view->platform_view);
+    }
+    client_send_ack(client, request);
+    return !client->failed;
+}
+
+static gboolean
+handle_extension(Client *client, const MuxEngineMessage *request)
+{
+    Engine *engine = client->engine;
+    EngineView *view = lookup_owned_view(client, request);
+    GError *error = NULL;
+    GError *probe_error = NULL;
+    const guint8 *packet;
+    gsize packet_size;
+    gchar *origin;
+    gboolean handled;
+    MuxUiRecordType record_type;
+
+    if (!view)
+        return TRUE;
+    if (g_bytes_get_size(request->payload) == 0) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "empty engine extension packet");
+        return TRUE;
+    }
+
+    packet = g_bytes_get_data(request->payload, &packet_size);
+    if (view->ui_bridge &&
+        mux_ui_record_type(packet,
+                           packet_size,
+                           &record_type,
+                           &probe_error)) {
+        handled = mux_ui_engine_bridge_handle_payload(view->ui_bridge,
+                                                      packet,
+                                                      packet_size,
+                                                      &error);
+        if (handled && view->affordance_bridge)
+            handled = mux_browser_affordance_bridge_handle_payload(
+                view->affordance_bridge,
+                packet,
+                packet_size,
+                &error);
+        if (handled && view->notification_engine)
+            handled = mux_notification_engine_handle_payload(
+                view->notification_engine,
+                packet,
+                packet_size,
+                &error);
+        if (handled && view->navigation_policy)
+            handled = mux_navigation_policy_handle_payload(
+                view->navigation_policy,
+                packet,
+                packet_size,
+                &error);
+        if (handled && view->file_chooser_bridge)
+            handled = mux_file_chooser_bridge_handle_payload(
+                view->file_chooser_bridge,
+                packet,
+                packet_size,
+                &error);
+        if (handled && engine->download_manager)
+            handled = mux_download_manager_handle_payload(
+                engine->download_manager,
+                packet,
+                packet_size,
+                &error);
+        if (handled && engine->ephemeral_download_manager)
+            handled = mux_download_manager_handle_payload(
+                engine->ephemeral_download_manager,
+                packet,
+                packet_size,
+                &error);
+        if (!handled) {
+            client_send_error(client,
+                              request,
+                              MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                              error ? error->message :
+                                      "UI response was rejected");
+            g_clear_error(&error);
+        }
+        return !client->failed;
+    }
+    g_clear_error(&probe_error);
+
+    if (!engine->clipboard_link) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_STATE,
+                          "clipboard bridge is unavailable");
+        return TRUE;
+    }
+
+    origin = clipboard_origin(view);
+    if (!mux_clipboard_engine_link_set_active_source(engine->clipboard_link,
+                                                     view->id,
+                                                     origin,
+                                                     &error)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          error->message);
+        g_clear_error(&error);
+        g_free(origin);
+        return TRUE;
+    }
+    g_free(origin);
+    mux_clipboard_engine_link_set_ephemeral(engine->clipboard_link,
+                                            view->ephemeral);
+
+    engine->clipboard_reply_client = client;
+    engine->clipboard_reply_view_id = view->id;
+    handled = mux_clipboard_engine_link_handle_packet(engine->clipboard_link,
+                                                      packet,
+                                                      packet_size,
+                                                      &error);
+    engine->clipboard_reply_client = NULL;
+    engine->clipboard_reply_view_id = 0;
+
+    if (!handled) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          error ? error->message :
+                                  "clipboard packet was rejected");
+        g_clear_error(&error);
+    }
+    return !client->failed;
+}
+
+static gboolean
+handle_message(Client *client, const MuxEngineMessage *request)
+{
+    if (request->type == MUX_ENGINE_MESSAGE_PING)
+        return client_send(client,
+                           MUX_ENGINE_MESSAGE_PONG,
+                           request->flags,
+                           request->view_id,
+                           request->serial,
+                           request->payload);
+
+    if (!client->welcomed) {
+        if (request->type == MUX_ENGINE_MESSAGE_HELLO)
+            return handle_hello(client, request);
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_STATE,
+                          "HELLO is required before other messages");
+        return FALSE;
+    }
+
+    switch (request->type) {
+    case MUX_ENGINE_MESSAGE_HELLO:
+        return handle_hello(client, request);
+    case MUX_ENGINE_MESSAGE_CREATE_VIEW:
+        return handle_create_view(client, request);
+    case MUX_ENGINE_MESSAGE_DESTROY_VIEW:
+        return handle_destroy_view(client, request);
+    case MUX_ENGINE_MESSAGE_RESIZE:
+        return handle_resize(client, request);
+    case MUX_ENGINE_MESSAGE_NAVIGATE:
+        return handle_navigate(client, request);
+    case MUX_ENGINE_MESSAGE_INPUT_KEY:
+        return handle_input_key(client, request);
+    case MUX_ENGINE_MESSAGE_TEXT_COMMIT:
+        return handle_text_commit(client, request);
+    case MUX_ENGINE_MESSAGE_INPUT_POINTER:
+        return handle_input_pointer(client, request);
+    case MUX_ENGINE_MESSAGE_SET_FOCUS:
+        return handle_set_focus(client, request);
+    case MUX_ENGINE_MESSAGE_FRAME_ACK:
+        return handle_frame_ack(client, request);
+    case MUX_ENGINE_MESSAGE_EXTENSION:
+        return handle_extension(client, request);
+    default:
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "message type is not valid from an engine client");
+        return TRUE;
+    }
+}
+
+static void
+remove_client_views(Client *client)
+{
+    GHashTableIter iterator;
+    gpointer key;
+    gpointer value;
+
+    g_hash_table_iter_init(&iterator, client->engine->views);
+    while (g_hash_table_iter_next(&iterator, &key, &value)) {
+        EngineView *view = value;
+        if (view->owner == client)
+            g_hash_table_iter_remove(&iterator);
+    }
+}
+
+static void
+drop_client(Client *client)
+{
+    Engine *engine = client->engine;
+
+    client->watch_id = 0;
+    remove_client_views(client);
+    for (guint i = 0; i < engine->clients->len; i++) {
+        if (g_ptr_array_index(engine->clients, i) == client) {
+            g_ptr_array_remove_index_fast(engine->clients, i);
+            return;
+        }
+    }
+}
+
+static gboolean
+client_ready(gint fd, GIOCondition condition, gpointer data)
+{
+    Client *client = data;
+    MuxEngineMessage message = { 0 };
+    GError *error = NULL;
+    gboolean keep;
+
+    (void)fd;
+    if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
+        drop_client(client);
+        return G_SOURCE_REMOVE;
+    }
+    if (!(condition & G_IO_IN))
+        return G_SOURCE_CONTINUE;
+
+    if (!mux_engine_receive_message(client->fd, &message, &error)) {
+        if (!g_error_matches(error,
+                             MUX_ENGINE_ERROR,
+                             MUX_ENGINE_ERROR_CLOSED))
+            g_warning("engine client %ld receive failed: %s",
+                      (long)client->peer_pid,
+                      error->message);
+        g_clear_error(&error);
+        drop_client(client);
+        return G_SOURCE_REMOVE;
+    }
+
+    keep = handle_message(client, &message);
+    mux_engine_message_clear(&message);
+    if (!keep || client->failed) {
+        drop_client(client);
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+client_free(gpointer data)
+{
+    Client *client = data;
+
+    if (!client)
+        return;
+    if (client->watch_id)
+        g_source_remove(client->watch_id);
+    if (client->fd >= 0)
+        close(client->fd);
+    g_free(client->kitty_window);
+    g_free(client->layer);
+    g_free(client->initial_uri);
+    g_free(client);
+}
+
+static gboolean
+peer_is_allowed(int fd, struct ucred *credentials)
+{
+    socklen_t length = sizeof(*credentials);
+
+    if (getsockopt(fd,
+                   SOL_SOCKET,
+                   SO_PEERCRED,
+                   credentials,
+                   &length) < 0 ||
+        length != sizeof(*credentials))
+        return FALSE;
+    return credentials->uid == getuid();
+}
+
+static gboolean
+listener_ready(gint fd, GIOCondition condition, gpointer data)
+{
+    Engine *engine = data;
+
+    if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
+        g_main_loop_quit(engine->loop);
+        return G_SOURCE_REMOVE;
+    }
+
+    for (;;) {
+        struct ucred credentials;
+        int client_fd = accept4(fd,
+                                NULL,
+                                NULL,
+                                SOCK_CLOEXEC | SOCK_NONBLOCK);
+        if (client_fd < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                break;
+            g_warning("accept engine client: %s", g_strerror(errno));
+            break;
+        }
+        if (engine->clients->len >= MUX_ENGINE_MAX_CLIENTS ||
+            !peer_is_allowed(client_fd, &credentials)) {
+            close(client_fd);
+            continue;
+        }
+
+        Client *client = g_new0(Client, 1);
+        client->engine = engine;
+        client->fd = client_fd;
+        client->peer_pid = credentials.pid;
+        client->peer_uid = credentials.uid;
+        g_ptr_array_add(engine->clients, client);
+        client->watch_id = g_unix_fd_add_full(
+            G_PRIORITY_DEFAULT,
+            client_fd,
+            G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+            client_ready,
+            client,
+            NULL);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean
+start_listener(Engine *engine, GError **error)
+{
+    struct sockaddr_un address = { 0 };
+
+    engine->listen_fd = socket(AF_UNIX,
+                               SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                               0);
+    if (engine->listen_fd < 0) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    g_io_error_from_errno(errno),
+                    "create engine socket: %s",
+                    g_strerror(errno));
+        return FALSE;
+    }
+
+    address.sun_family = AF_UNIX;
+    g_strlcpy(address.sun_path,
+              engine->socket_path,
+              sizeof(address.sun_path));
+    if (unlink(engine->socket_path) < 0 && errno != ENOENT) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    g_io_error_from_errno(errno),
+                    "remove stale engine socket %s: %s",
+                    engine->socket_path,
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (bind(engine->listen_fd,
+             (const struct sockaddr *)&address,
+             offsetof(struct sockaddr_un, sun_path) +
+                 strlen(address.sun_path) + 1) < 0) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    g_io_error_from_errno(errno),
+                    "bind engine socket %s: %s",
+                    engine->socket_path,
+                    g_strerror(errno));
+        return FALSE;
+    }
+    engine->socket_bound = TRUE;
+    if (chmod(engine->socket_path, 0600) < 0) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    g_io_error_from_errno(errno),
+                    "restrict engine socket %s: %s",
+                    engine->socket_path,
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (listen(engine->listen_fd, 64) < 0) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    g_io_error_from_errno(errno),
+                    "listen on engine socket %s: %s",
+                    engine->socket_path,
+                    g_strerror(errno));
+        return FALSE;
+    }
+
+    engine->listen_watch_id = g_unix_fd_add_full(
+        G_PRIORITY_DEFAULT,
+        engine->listen_fd,
+        G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+        listener_ready,
+        engine,
+        NULL);
+    return TRUE;
+}
+
+static gboolean
+initialize_browser(Engine *engine, GError **error)
+{
+    WPEDisplay *display;
+    WPEDisplayClass *display_class;
+
+    if (!ensure_private_directory(engine->data_directory, error) ||
+        !ensure_private_directory(engine->cache_directory, error))
+        return FALSE;
+
+    engine->permission_store = mux_permission_store_new(
+        engine->data_directory,
+        TRUE,
+        error);
+    if (!engine->permission_store)
+        return FALSE;
+    engine->ephemeral_permission_store = mux_permission_store_new(
+        NULL,
+        FALSE,
+        error);
+    if (!engine->ephemeral_permission_store)
+        return FALSE;
+
+    if (!g_getenv("WPE_DISPLAY"))
+        g_setenv("WPE_DISPLAY", "wpe-display-headless", FALSE);
+    display = wpe_display_get_default();
+    if (!display) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_SUPPORTED,
+                            "WPE headless display is unavailable");
+        return FALSE;
+    }
+
+    engine->display = g_object_ref(display);
+    display_class = WPE_DISPLAY_GET_CLASS(display);
+    engine->original_create_view = display_class->create_view;
+    engine->original_get_clipboard = display_class->get_clipboard;
+    engine->clipboard_link = mux_clipboard_engine_link_new(
+        display,
+        engine->profile,
+        FALSE,
+        clipboard_output,
+        clipboard_paste,
+        clipboard_failure,
+        engine,
+        NULL);
+    if (!engine->clipboard_link) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "WPE clipboard bridge construction failed");
+        return FALSE;
+    }
+    display_engine = engine;
+    display_class->create_view = mux_display_create_view;
+    display_class->get_clipboard = mux_display_get_clipboard;
+    engine->web_context =
+        g_object_ref(webkit_web_context_get_default());
+    engine->persistent_session =
+        webkit_network_session_new(engine->data_directory,
+                                   engine->cache_directory);
+    engine->ephemeral_session = webkit_network_session_new_ephemeral();
+    if (!engine->persistent_session || !engine->ephemeral_session) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "WebKit network session construction failed");
+        return FALSE;
+    }
+    engine->download_manager = mux_download_manager_new(
+        engine->persistent_session,
+        download_output,
+        NULL,
+        engine,
+        NULL);
+    engine->ephemeral_download_manager = mux_download_manager_new(
+        engine->ephemeral_session,
+        download_output,
+        NULL,
+        engine,
+        NULL);
+    if (!engine->download_manager ||
+        !engine->ephemeral_download_manager) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "WebKit download manager construction failed");
+        return FALSE;
+    }
+
+    webkit_network_session_set_itp_enabled(engine->persistent_session, TRUE);
+    webkit_network_session_set_itp_enabled(engine->ephemeral_session, TRUE);
+    return TRUE;
+}
+
+static gboolean
+quit_signal(gpointer data)
+{
+    Engine *engine = data;
+
+    g_main_loop_quit(engine->loop);
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+engine_clear(Engine *engine)
+{
+    if (engine->listen_watch_id)
+        g_source_remove(engine->listen_watch_id);
+    if (engine->sigint_watch_id)
+        g_source_remove(engine->sigint_watch_id);
+    if (engine->sigterm_watch_id)
+        g_source_remove(engine->sigterm_watch_id);
+    if (engine->clipboard_tick_id)
+        g_source_remove(engine->clipboard_tick_id);
+
+    g_clear_pointer(&engine->ephemeral_download_manager,
+                    mux_download_manager_free);
+    g_clear_pointer(&engine->download_manager,
+                    mux_download_manager_free);
+
+    if (engine->views)
+        g_hash_table_destroy(engine->views);
+    if (engine->pending_popups) {
+        GHashTableIter iterator;
+        gpointer value;
+
+        g_hash_table_iter_init(&iterator, engine->pending_popups);
+        while (g_hash_table_iter_next(&iterator, NULL, &value))
+            engine_view_free(value);
+        g_hash_table_unref(engine->pending_popups);
+    }
+    if (engine->clients)
+        g_ptr_array_free(engine->clients, TRUE);
+    if (engine->listen_fd >= 0)
+        close(engine->listen_fd);
+    if (engine->socket_bound)
+        unlink(engine->socket_path);
+    if (engine->lock_fd >= 0)
+        close(engine->lock_fd);
+
+    if (engine->display &&
+        WPE_DISPLAY_GET_CLASS(engine->display)->create_view ==
+            mux_display_create_view)
+        WPE_DISPLAY_GET_CLASS(engine->display)->create_view =
+            engine->original_create_view;
+    if (engine->display &&
+        WPE_DISPLAY_GET_CLASS(engine->display)->get_clipboard ==
+            mux_display_get_clipboard)
+        WPE_DISPLAY_GET_CLASS(engine->display)->get_clipboard =
+            engine->original_get_clipboard;
+    if (display_engine == engine)
+        display_engine = NULL;
+    g_clear_pointer(&engine->clipboard_link,
+                    mux_clipboard_engine_link_free);
+    g_clear_pointer(&engine->ephemeral_permission_store,
+                    mux_permission_store_free);
+    g_clear_pointer(&engine->permission_store,
+                    mux_permission_store_free);
+    g_clear_object(&engine->ephemeral_session);
+    g_clear_object(&engine->persistent_session);
+    g_clear_object(&engine->web_context);
+    g_clear_object(&engine->display);
+    g_clear_pointer(&engine->loop, g_main_loop_unref);
+    g_free(engine->profile);
+    g_free(engine->socket_path);
+    g_free(engine->lock_path);
+    g_free(engine->data_directory);
+    g_free(engine->cache_directory);
+}
+
+int
+main(int argc, char **argv)
+{
+    gboolean ensure = FALSE;
+    gchar *profile_option = NULL;
+    gchar *socket_option = NULL;
+    GOptionEntry options[] = {
+        {
+            "ensure",
+            0,
+            0,
+            G_OPTION_ARG_NONE,
+            &ensure,
+            "Exit successfully if running; otherwise start in the background",
+            NULL,
+        },
+        {
+            "profile",
+            'p',
+            0,
+            G_OPTION_ARG_STRING,
+            &profile_option,
+            "Profile name",
+            "NAME",
+        },
+        {
+            "socket",
+            's',
+            0,
+            G_OPTION_ARG_FILENAME,
+            &socket_option,
+            "Engine socket path",
+            "PATH",
+        },
+        { 0 },
+    };
+    GOptionContext *option_context;
+    GError *error = NULL;
+    gboolean already_running = FALSE;
+    gint daemon_result;
+    int result = 1;
+    Engine engine = {
+        .listen_fd = -1,
+        .lock_fd = -1,
+        .next_view_id = 1,
+    };
+
+    g_set_prgname("mux-engine");
+    signal(SIGPIPE, SIG_IGN);
+
+    option_context = g_option_context_new(
+        "- central WPE engine for Mux Kitty panes");
+    g_option_context_add_main_entries(option_context, options, NULL);
+    if (!g_option_context_parse(option_context, &argc, &argv, &error)) {
+        g_printerr("mux-engine: %s\n", error->message);
+        g_clear_error(&error);
+        g_option_context_free(option_context);
+        return 2;
+    }
+    g_option_context_free(option_context);
+
+    engine.profile = g_strdup(
+        profile_option ? profile_option :
+        (g_getenv("MUX_PROFILE") ? g_getenv("MUX_PROFILE") : "default"));
+    g_free(profile_option);
+    if (!profile_is_valid(engine.profile)) {
+        g_printerr("mux-engine: invalid profile name\n");
+        g_free(socket_option);
+        engine_clear(&engine);
+        return 2;
+    }
+    if (!prepare_paths(&engine, socket_option, &error)) {
+        g_printerr("mux-engine: %s\n", error->message);
+        g_clear_error(&error);
+        g_free(socket_option);
+        engine_clear(&engine);
+        return 1;
+    }
+    g_free(socket_option);
+
+    if (!acquire_engine_lock(&engine, &already_running, &error)) {
+        g_printerr("mux-engine: %s\n", error->message);
+        g_clear_error(&error);
+        engine_clear(&engine);
+        return 1;
+    }
+    if (already_running) {
+        if (!ensure)
+            g_printerr("mux-engine: profile %s is already running\n",
+                       engine.profile);
+        engine_clear(&engine);
+        return ensure ? 0 : 1;
+    }
+
+    if (ensure) {
+        daemon_result = daemonize_engine(&error);
+        if (daemon_result < 0) {
+            g_printerr("mux-engine: %s\n", error->message);
+            g_clear_error(&error);
+            engine_clear(&engine);
+            return 1;
+        }
+        if (daemon_result > 0) {
+            engine_clear(&engine);
+            return 0;
+        }
+    }
+
+    if (!write_lock_pid(&engine, &error) ||
+        !initialize_browser(&engine, &error)) {
+        g_printerr("mux-engine: %s\n", error->message);
+        g_clear_error(&error);
+        engine_clear(&engine);
+        return 1;
+    }
+
+    engine.loop = g_main_loop_new(NULL, FALSE);
+    engine.clients = g_ptr_array_new_with_free_func(client_free);
+    engine.views = g_hash_table_new_full(g_int64_hash,
+                                         g_int64_equal,
+                                         g_free,
+                                         engine_view_free);
+    engine.pending_popups =
+        g_hash_table_new(g_direct_hash, g_direct_equal);
+    engine.clipboard_tick_id = g_timeout_add(250,
+                                             clipboard_tick,
+                                             &engine);
+    if (!start_listener(&engine, &error)) {
+        g_printerr("mux-engine: %s\n", error->message);
+        g_clear_error(&error);
+        engine_clear(&engine);
+        return 1;
+    }
+
+    engine.sigint_watch_id = g_unix_signal_add(SIGINT,
+                                                quit_signal,
+                                                &engine);
+    engine.sigterm_watch_id = g_unix_signal_add(SIGTERM,
+                                                 quit_signal,
+                                                 &engine);
+    g_main_loop_run(engine.loop);
+    result = 0;
+    engine_clear(&engine);
+    return result;
+}

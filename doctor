@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -u
+
+failures=0
+
+ok() {
+  printf 'ok    %s\n' "$1"
+}
+
+fail() {
+  printf 'FAIL  %s\n' "$1" >&2
+  failures=$((failures + 1))
+}
+
+check_command() {
+  if command -v "$1" >/dev/null 2>&1; then
+    ok "$1: $(command -v "$1")"
+  else
+    fail "$1 is missing"
+  fi
+}
+
+check_package() {
+  local package="$1"
+  local minimum="$2"
+  local version
+
+  if ! command -v pkg-config >/dev/null 2>&1; then
+    return
+  fi
+  if ! pkg-config --exists "$package"; then
+    fail "pkg-config package $package is missing"
+    return
+  fi
+  version="$(pkg-config --modversion "$package" 2>/dev/null || printf unknown)"
+  if pkg-config --atleast-version="$minimum" "$package"; then
+    ok "$package $version"
+  else
+    fail "$package $version is older than required $minimum"
+  fi
+}
+
+printf 'Mux environment doctor\n'
+printf '======================\n'
+
+if [[ "$(uname -s)" == Linux ]]; then
+  ok "operating system: Linux"
+else
+  fail "operating system must be Linux"
+fi
+
+for command in cc kitty kitten meson ninja pkg-config; do
+  check_command "$command"
+done
+
+check_package glib-2.0 2.74
+check_package gio-2.0 2.74
+check_package wpe-webkit-2.0 2.52
+check_package wpe-platform-2.0 2.52
+
+if [[ -d /dev/shm && -w /dev/shm ]]; then
+  ok "/dev/shm is writable for Kitty shared-memory frames"
+else
+  fail "/dev/shm is unavailable or not writable"
+fi
+
+if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" && -w "${XDG_RUNTIME_DIR}" ]]; then
+  ok "XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR}"
+else
+  ok "XDG_RUNTIME_DIR absent; Mux will use /tmp/mux-$(id -u)"
+fi
+
+if (( failures )); then
+  printf '\n%d requirement(s) failed. Run ./setup after updating to a distribution with WPE WebKit 2.52+.\n' "$failures" >&2
+  exit 1
+fi
+
+printf '\nEnvironment is ready. ./mux will build incrementally and launch Kitty.\n'

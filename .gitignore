@@ -1,0 +1,29 @@
+.DS_Store
+.codex/
+.direnv/
+.env
+.env.*
+
+# Meson and compiler output
+build/
+build-*/
+meson-logs/
+meson-private/
+meson-info/
+.ninja_deps
+.ninja_log
+build.ninja
+compile_commands.json
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+
+# Nix output links
+result
+result-*
+
+# Crash dumps
+core
+core.*
