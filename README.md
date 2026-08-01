@@ -128,8 +128,8 @@ Browser content does not execute inside `muxd`.
 - One dedicated Kitty OS window is supported; layers are tabs in that window.
 - A physical layer move requires a live destination pane in the same Kitty
   instance; otherwise it fails without changing logical state.
-- The first close request uses WebKit's before-unload flow. A second request or
-  the two-minute safety timeout forces teardown.
+- The first close request uses WebKit's before-unload flow. A second request
+  while it is pending forces teardown; the two-minute timeout cancels the close.
 - Browser shortcuts and trusted overlays still require interactive coverage.
 - Site compatibility, media codecs, downloads, uploads, permissions, popups,
   notifications, clipboard bridging, and renderer recovery are not yet

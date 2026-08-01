@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "mux-download-engine.h"
@@ -7,6 +8,7 @@
 #include <glib/gstdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -16,6 +18,10 @@
 
 #ifndef O_NOFOLLOW
 #define O_NOFOLLOW 0
+#endif
+
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1U << 1)
 #endif
 
 typedef enum {
@@ -35,10 +41,14 @@ typedef struct {
     gchar *suggested_filename;
     gchar *final_path;
     gchar *partial_path;
+    gchar *final_name;
+    gchar *partial_name;
     gchar *failure_message;
-    dev_t reservation_device;
-    ino_t reservation_inode;
+    gint directory_fd;
+    gint reservation_fd;
+    gint partial_fd;
     gboolean reservation_active;
+    gboolean identity_mismatch;
     gboolean pending_slot_held;
     gboolean active_slot_held;
     gint64 last_progress_us;
@@ -306,34 +316,247 @@ emit_event(PendingDownload *pending,
     manager->event_func(&event, manager->user_data);
 }
 
+static void
+close_owned_fd(gint *descriptor)
+{
+    if (*descriptor >= 0)
+        close(*descriptor);
+    *descriptor = -1;
+}
+
+static gboolean
+same_inode(const struct stat *left, const struct stat *right)
+{
+    return left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino;
+}
+
+static gboolean
+safe_destination_directory(const struct stat *status)
+{
+    return S_ISDIR(status->st_mode) && status->st_uid == geteuid() &&
+           !(status->st_mode & (S_IWGRP | S_IWOTH));
+}
+
+static gboolean
+directory_path_matches(PendingDownload *pending)
+{
+    g_autofree gchar *directory = NULL;
+    struct stat retained_status;
+    struct stat pathname_status;
+    gint pathname_fd;
+    gboolean matches;
+
+    if (pending->directory_fd < 0 || !pending->final_path)
+        return FALSE;
+    directory = g_path_get_dirname(pending->final_path);
+    pathname_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (pathname_fd < 0)
+        return FALSE;
+    matches = fstat(pending->directory_fd, &retained_status) == 0 &&
+              fstat(pathname_fd, &pathname_status) == 0 &&
+              safe_destination_directory(&retained_status) &&
+              safe_destination_directory(&pathname_status) &&
+              same_inode(&retained_status, &pathname_status);
+    close(pathname_fd);
+    return matches;
+}
+
+static gboolean
+safe_owned_regular(const struct stat *status)
+{
+    return S_ISREG(status->st_mode) && status->st_uid == geteuid() &&
+           status->st_nlink == 1;
+}
+
+static gboolean
+path_matches_descriptor(gint directory_fd,
+                        const gchar *name,
+                        gint descriptor)
+{
+    struct stat descriptor_status;
+    struct stat path_status;
+
+    if (directory_fd < 0 || descriptor < 0 || !name || !*name ||
+        fstat(descriptor, &descriptor_status) < 0 ||
+        fstatat(directory_fd,
+                name,
+                &path_status,
+                AT_SYMLINK_NOFOLLOW) < 0)
+        return FALSE;
+    return safe_owned_regular(&descriptor_status) &&
+           safe_owned_regular(&path_status) &&
+           same_inode(&descriptor_status, &path_status);
+}
+
 static gboolean
 reservation_matches(PendingDownload *pending)
 {
-    struct stat status;
+    return pending->reservation_active &&
+           path_matches_descriptor(pending->directory_fd,
+                                   pending->final_name,
+                                   pending->reservation_fd);
+}
 
-    if (!pending->reservation_active || !pending->final_path ||
-        g_lstat(pending->final_path, &status) < 0)
-        return FALSE;
-    return S_ISREG(status.st_mode) &&
-           status.st_uid == getuid() &&
-           status.st_dev == pending->reservation_device &&
-           status.st_ino == pending->reservation_inode;
+static gboolean
+partial_matches(PendingDownload *pending)
+{
+    return path_matches_descriptor(pending->directory_fd,
+                                   pending->partial_name,
+                                   pending->partial_fd);
+}
+
+static void
+remove_partial(PendingDownload *pending)
+{
+    if (!pending->identity_mismatch && partial_matches(pending))
+        unlinkat(pending->directory_fd, pending->partial_name, 0);
+    close_owned_fd(&pending->partial_fd);
 }
 
 static void
 remove_reservation(PendingDownload *pending)
 {
-    if (reservation_matches(pending))
-        g_unlink(pending->final_path);
+    if (!pending->identity_mismatch && reservation_matches(pending))
+        unlinkat(pending->directory_fd, pending->final_name, 0);
     pending->reservation_active = FALSE;
+    close_owned_fd(&pending->reservation_fd);
+}
+
+static void
+close_download_descriptors(PendingDownload *pending)
+{
+    close_owned_fd(&pending->partial_fd);
+    close_owned_fd(&pending->reservation_fd);
+    close_owned_fd(&pending->directory_fd);
 }
 
 static void
 cleanup_files(PendingDownload *pending)
 {
-    if (pending->partial_path)
-        g_unlink(pending->partial_path);
+    remove_partial(pending);
     remove_reservation(pending);
+    close_owned_fd(&pending->directory_fd);
+}
+
+static gint
+rename_exchange(gint directory_fd,
+                const gchar *first_name,
+                const gchar *second_name)
+{
+#if defined(__linux__) && defined(SYS_renameat2)
+    return (gint)syscall(SYS_renameat2,
+                         directory_fd,
+                         first_name,
+                         directory_fd,
+                         second_name,
+                         RENAME_EXCHANGE);
+#else
+    (void)directory_fd;
+    (void)first_name;
+    (void)second_name;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static gboolean
+exchange_unavailable(gint error_number)
+{
+    return error_number == ENOSYS || error_number == EINVAL ||
+           error_number == EOPNOTSUPP || error_number == ENOTSUP;
+}
+
+/* Rollback is permitted only for the exact post-exchange layout, and succeeds
+ * only if both original inode/name relationships are restored. */
+static gboolean
+rollback_exchange(PendingDownload *pending, gint *error_number)
+{
+    if (!path_matches_descriptor(pending->directory_fd,
+                                 pending->final_name,
+                                 pending->partial_fd) ||
+        !path_matches_descriptor(pending->directory_fd,
+                                 pending->partial_name,
+                                 pending->reservation_fd)) {
+        pending->identity_mismatch = TRUE;
+        *error_number = ESTALE;
+        return FALSE;
+    }
+    if (rename_exchange(pending->directory_fd,
+                        pending->partial_name,
+                        pending->final_name) < 0) {
+        pending->identity_mismatch = TRUE;
+        *error_number = errno;
+        return FALSE;
+    }
+    if (!reservation_matches(pending) || !partial_matches(pending)) {
+        pending->identity_mismatch = TRUE;
+        *error_number = ESTALE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+retain_partial_descriptor(PendingDownload *pending, GError **error)
+{
+    struct stat status;
+    gint descriptor;
+
+    if (pending->partial_fd >= 0) {
+        if (partial_matches(pending))
+            return TRUE;
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "partial download pathname changed");
+        return FALSE;
+    }
+    descriptor = openat(pending->directory_fd,
+                        pending->partial_name,
+                        O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        if (errno == ENOENT || errno == ELOOP)
+            pending->identity_mismatch = TRUE;
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "cannot open partial download: %s",
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (fstat(descriptor, &status) < 0) {
+        gint saved_errno = errno;
+
+        close(descriptor);
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "cannot inspect partial download: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (!safe_owned_regular(&status)) {
+        pending->identity_mismatch = TRUE;
+        close(descriptor);
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "partial download is not a private regular file");
+        return FALSE;
+    }
+    pending->partial_fd = descriptor;
+    if (!partial_matches(pending)) {
+        pending->identity_mismatch = TRUE;
+        close_owned_fd(&pending->partial_fd);
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "partial download pathname changed while opening");
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static void
@@ -370,11 +593,15 @@ pending_download_free(PendingDownload *pending)
     disconnect_download(pending);
     if (pending->state != DOWNLOAD_STATE_FINISHED)
         cleanup_files(pending);
+    else
+        close_download_descriptors(pending);
     g_clear_object(&pending->download);
     g_clear_object(&pending->source_view);
     g_free(pending->suggested_filename);
     g_free(pending->final_path);
     g_free(pending->partial_path);
+    g_free(pending->final_name);
+    g_free(pending->partial_name);
     g_free(pending->failure_message);
     g_free(pending);
 }
@@ -414,19 +641,59 @@ reserve_final_path(PendingDownload *pending,
                    const gchar *requested,
                    GError **error)
 {
+    g_autofree gchar *directory = g_path_get_dirname(requested);
+    struct stat directory_status;
+    gint directory_fd;
     guint number;
+
+    directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0) {
+        gint saved_errno = errno;
+
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "cannot open download directory: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (fstat(directory_fd, &directory_status) < 0) {
+        gint saved_errno = errno;
+
+        close(directory_fd);
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "cannot inspect download directory: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (!safe_destination_directory(&directory_status)) {
+        close(directory_fd);
+        g_set_error_literal(
+            error,
+            G_IO_ERROR,
+            G_IO_ERROR_PERMISSION_DENIED,
+            "download directory must be owned by the current user and not "
+            "group- or other-writable");
+        return FALSE;
+    }
 
     for (number = 0; number < 10000; number++) {
         g_autofree gchar *candidate = numbered_path(requested, number);
+        g_autofree gchar *candidate_name =
+            g_path_get_basename(candidate);
         struct stat status;
-        gint descriptor = open(candidate,
-                               O_WRONLY | O_CREAT | O_EXCL |
-                                   O_CLOEXEC | O_NOFOLLOW,
-                               0600);
+        gint descriptor = openat(directory_fd,
+                                 candidate_name,
+                                 O_WRONLY | O_CREAT | O_EXCL |
+                                     O_CLOEXEC | O_NOFOLLOW,
+                                 0600);
 
         if (descriptor < 0) {
             if (errno == EEXIST || errno == ELOOP)
                 continue;
+            close(directory_fd);
             g_set_error(error,
                         G_FILE_ERROR,
                         g_file_error_from_errno(errno),
@@ -437,8 +704,11 @@ reserve_final_path(PendingDownload *pending,
         if (fstat(descriptor, &status) < 0) {
             gint saved_errno = errno;
 
+            if (path_matches_descriptor(
+                    directory_fd, candidate_name, descriptor))
+                unlinkat(directory_fd, candidate_name, 0);
             close(descriptor);
-            g_unlink(candidate);
+            close(directory_fd);
             g_set_error(error,
                         G_FILE_ERROR,
                         g_file_error_from_errno(saved_errno),
@@ -446,24 +716,29 @@ reserve_final_path(PendingDownload *pending,
                         g_strerror(saved_errno));
             return FALSE;
         }
-        if (close(descriptor) < 0) {
-            gint saved_errno = errno;
-
-            g_unlink(candidate);
-            g_set_error(error,
-                        G_FILE_ERROR,
-                        g_file_error_from_errno(saved_errno),
-                        "cannot close download destination: %s",
-                        g_strerror(saved_errno));
+        if (!safe_owned_regular(&status) ||
+            !path_matches_descriptor(
+                directory_fd, candidate_name, descriptor)) {
+            if (path_matches_descriptor(
+                    directory_fd, candidate_name, descriptor))
+                unlinkat(directory_fd, candidate_name, 0);
+            close(descriptor);
+            close(directory_fd);
+            g_set_error_literal(error,
+                                G_FILE_ERROR,
+                                G_FILE_ERROR_FAILED,
+                                "download reservation pathname changed");
             return FALSE;
         }
         pending->final_path = g_steal_pointer(&candidate);
-        pending->reservation_device = status.st_dev;
-        pending->reservation_inode = status.st_ino;
+        pending->final_name = g_steal_pointer(&candidate_name);
+        pending->directory_fd = directory_fd;
+        pending->reservation_fd = descriptor;
         pending->reservation_active = TRUE;
         return TRUE;
     }
 
+    close(directory_fd);
     g_set_error_literal(error,
                         G_FILE_ERROR,
                         G_FILE_ERROR_EXIST,
@@ -486,13 +761,24 @@ choose_partial_path(PendingDownload *pending, GError **error)
             basename,
             pending->download_id,
             g_random_int());
-        g_autofree gchar *candidate =
-            g_build_filename(directory, name, NULL);
         struct stat status;
 
-        if (g_lstat(candidate, &status) < 0 && errno == ENOENT) {
-            pending->partial_path = g_steal_pointer(&candidate);
-            return TRUE;
+        if (fstatat(pending->directory_fd,
+                    name,
+                    &status,
+                    AT_SYMLINK_NOFOLLOW) < 0) {
+            if (errno == ENOENT) {
+                pending->partial_path =
+                    g_build_filename(directory, name, NULL);
+                pending->partial_name = g_steal_pointer(&name);
+                return TRUE;
+            }
+            g_set_error(error,
+                        G_FILE_ERROR,
+                        g_file_error_from_errno(errno),
+                        "cannot inspect partial download destination: %s",
+                        g_strerror(errno));
+            return FALSE;
         }
     }
     g_set_error_literal(error,
@@ -541,6 +827,16 @@ begin_destination(PendingDownload *pending,
         cleanup_files(pending);
         return FALSE;
     }
+    if (!directory_path_matches(pending)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "download directory pathname changed before "
+                            "handoff");
+        cleanup_files(pending);
+        return FALSE;
+    }
     webkit_download_set_allow_overwrite(pending->download, FALSE);
     pending->state = DOWNLOAD_STATE_TRANSFERRING;
     release_pending_slot(pending);
@@ -551,22 +847,141 @@ begin_destination(PendingDownload *pending,
 static gboolean
 finalize_download(PendingDownload *pending, GError **error)
 {
+    struct stat reservation_status;
+    gint exchange_errno;
+    gint rollback_errno = 0;
+
+    if (!directory_path_matches(pending)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "download directory pathname changed before "
+                            "finalization");
+        return FALSE;
+    }
+    if (!retain_partial_descriptor(pending, error))
+        return FALSE;
     if (!reservation_matches(pending)) {
+        pending->identity_mismatch = TRUE;
         g_set_error_literal(error,
                             G_FILE_ERROR,
                             G_FILE_ERROR_FAILED,
                             "download destination reservation changed");
         return FALSE;
     }
-    if (g_rename(pending->partial_path, pending->final_path) < 0) {
+    if (!partial_matches(pending)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "partial download pathname changed");
+        return FALSE;
+    }
+    if (fsync(pending->partial_fd) < 0) {
+        gint saved_errno = errno;
+
         g_set_error(error,
                     G_FILE_ERROR,
-                    g_file_error_from_errno(errno),
+                    g_file_error_from_errno(saved_errno),
+                    "cannot synchronize completed download: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (rename_exchange(pending->directory_fd,
+                        pending->partial_name,
+                        pending->final_name) < 0) {
+        exchange_errno = errno;
+        if (exchange_unavailable(exchange_errno)) {
+            g_set_error(error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_NOT_SUPPORTED,
+                        "atomic download finalization is unavailable: %s",
+                        g_strerror(exchange_errno));
+            return FALSE;
+        }
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(exchange_errno),
                     "cannot finalize download: %s",
-                    g_strerror(errno));
+                    g_strerror(exchange_errno));
+        return FALSE;
+    }
+
+    if (!path_matches_descriptor(pending->directory_fd,
+                                 pending->final_name,
+                                 pending->partial_fd) ||
+        !path_matches_descriptor(pending->directory_fd,
+                                 pending->partial_name,
+                                 pending->reservation_fd)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(
+            error,
+            G_FILE_ERROR,
+            G_FILE_ERROR_FAILED,
+            "download destination changed during atomic finalization; no "
+            "further pathname operation was attempted");
+        return FALSE;
+    }
+
+    if (unlinkat(pending->directory_fd, pending->partial_name, 0) < 0) {
+        exchange_errno = errno;
+        if (rollback_exchange(pending, &rollback_errno)) {
+            g_set_error(error,
+                        G_FILE_ERROR,
+                        g_file_error_from_errno(exchange_errno),
+                        "cannot remove download reservation; the exchange "
+                        "was rolled back: %s",
+                        g_strerror(exchange_errno));
+        } else {
+            g_set_error(error,
+                        G_FILE_ERROR,
+                        G_FILE_ERROR_FAILED,
+                        "cannot remove download reservation (%s) and safe "
+                        "rollback failed (%s)",
+                        g_strerror(exchange_errno),
+                        g_strerror(rollback_errno));
+        }
+        return FALSE;
+    }
+
+    if (fstat(pending->reservation_fd, &reservation_status) < 0 ||
+        reservation_status.st_nlink != 0 ||
+        !path_matches_descriptor(pending->directory_fd,
+                                 pending->final_name,
+                                 pending->partial_fd)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "atomic download finalization postcondition "
+                            "failed");
         return FALSE;
     }
     pending->reservation_active = FALSE;
+    if (fsync(pending->directory_fd) < 0) {
+        gint saved_errno = errno;
+
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "cannot synchronize finalized download directory: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (!directory_path_matches(pending) ||
+        !path_matches_descriptor(pending->directory_fd,
+                                 pending->final_name,
+                                 pending->partial_fd)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "download directory pathname changed while "
+                            "finalizing");
+        return FALSE;
+    }
+    close_download_descriptors(pending);
     return TRUE;
 }
 
@@ -617,8 +1032,16 @@ on_created_destination(WebKitDownload *download,
                        const gchar *destination,
                        PendingDownload *pending)
 {
+    g_autoptr(GError) error = NULL;
+
     (void)download;
     (void)destination;
+    if (!retain_partial_descriptor(pending, &error)) {
+        g_free(pending->failure_message);
+        pending->failure_message = g_strdup(error->message);
+        webkit_download_cancel(pending->download);
+        return;
+    }
     emit_event(pending, MUX_DOWNLOAD_EVENT_DESTINATION, NULL);
 }
 
@@ -646,16 +1069,18 @@ on_failed(WebKitDownload *download,
         g_error_matches(error,
                         WEBKIT_DOWNLOAD_ERROR,
                         WEBKIT_DOWNLOAD_ERROR_CANCELLED_BY_USER);
+    gboolean internal_failure = pending->failure_message != NULL;
 
     (void)download;
     pending->state = DOWNLOAD_STATE_FAILED;
     release_download_slots(pending);
-    g_free(pending->failure_message);
-    pending->failure_message = bounded_utf8(error->message, 8192);
+    if (!internal_failure)
+        pending->failure_message = bounded_utf8(error->message, 8192);
     cleanup_files(pending);
     emit_event(pending,
-               cancelled ? MUX_DOWNLOAD_EVENT_CANCELLED
-                         : MUX_DOWNLOAD_EVENT_FAILED,
+               cancelled && !internal_failure
+                   ? MUX_DOWNLOAD_EVENT_CANCELLED
+                   : MUX_DOWNLOAD_EVENT_FAILED,
                pending->failure_message);
 }
 
@@ -725,6 +1150,9 @@ on_download_started(WebKitNetworkSession *network_session,
         webkit_download_get_web_view(download);
 
     (void)network_session;
+    pending->directory_fd = -1;
+    pending->reservation_fd = -1;
+    pending->partial_fd = -1;
     pending->manager = manager;
     pending->download = g_object_ref(download);
     pending->source_view = source_view ? g_object_ref(source_view) : NULL;

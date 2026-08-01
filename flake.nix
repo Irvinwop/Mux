@@ -25,6 +25,121 @@
           ];
           gstPluginPath = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" gstPlugins;
 
+          # nixpkgs 2.52.5 only packages the GTK port. Reuse its shared
+          # WebKit compiler, patch, and native-tool policy, while replacing
+          # every port-specific input, flag, source, and package contract.
+          wpeWebKit =
+            (pkgs.webkitgtk_6_0.override {
+              enableGeoLocation = false;
+              withLibsecret = false;
+            }).overrideAttrs
+              (_finalAttrs: previousAttrs: {
+                pname = "wpewebkit";
+                version = "2.52.5";
+                name = "wpewebkit-2.52.5";
+
+                src = pkgs.fetchurl {
+                  url = "https://wpewebkit.org/releases/wpewebkit-2.52.5.tar.xz";
+                  hash = "sha256-vPxskdt2WdzyT2/3mtJ6werhvGHcoNv+4VRwaSZ0Czs=";
+                };
+
+                # These are the common WebKit dependencies from the pinned
+                # GTK derivation plus the WPEPlatform DRM/Wayland stack.
+                # GTK, X11, libsecret, and GTK geolocation dependencies are
+                # deliberately not inherited.
+                buildInputs = with pkgs; [
+                  at-spi2-core
+                  cairo
+                  enchant
+                  expat
+                  flite
+                  fontconfig
+                  freetype
+                  glib
+                  gnutls
+                  gst_all_1.gstreamer
+                  gst_all_1.gst-plugins-base
+                  gst_all_1.gst-plugins-bad
+                  harfbuzz
+                  hyphen
+                  icu
+                  lcms2
+                  libGL
+                  libGLU
+                  libavif
+                  libbacktrace
+                  libdrm
+                  libepoxy
+                  libgbm
+                  libgcrypt
+                  libgpg-error
+                  libidn
+                  libinput
+                  libintl
+                  libjpeg
+                  libjxl
+                  libmanette
+                  libpng
+                  libpthread-stubs
+                  libseccomp
+                  libsysprof-capture
+                  libtasn1
+                  libwebp
+                  libwpe
+                  libxkbcommon
+                  libxml2
+                  libxslt
+                  nettle
+                  openjpeg
+                  p11-kit
+                  sqlite
+                  systemdLibs
+                  wayland
+                  wayland-protocols
+                  woff2
+                  zlib
+                ];
+
+                # These modules occur in the public .pc files. The FDO
+                # backend is retained as the default implementation for
+                # consumers of the enabled legacy libwpe API.
+                propagatedBuildInputs = with pkgs; [
+                  glib
+                  libsoup_3
+                  libwpe
+                  pkgs."libwpe-fdo"
+                ];
+
+                cmakeFlags = [
+                  "-DPORT=WPE"
+                  "-DENABLE_INTROSPECTION=ON"
+                  "-DENABLE_DOCUMENTATION=ON"
+                  "-DENABLE_EXPERIMENTAL_FEATURES=OFF"
+                  "-DENABLE_MINIBROWSER=OFF"
+                  "-DENABLE_WPE_1_1_API=OFF"
+                  "-DENABLE_WPE_LEGACY_API=ON"
+                  "-DENABLE_WPE_PLATFORM=ON"
+                  "-DENABLE_WPE_PLATFORM_DRM=ON"
+                  "-DENABLE_WPE_PLATFORM_HEADLESS=ON"
+                  "-DENABLE_WPE_PLATFORM_WAYLAND=ON"
+                  "-DENABLE_WPE_QT_API=OFF"
+                  "-DBWRAP_EXECUTABLE=${pkgs.lib.getExe pkgs.bubblewrap}"
+                  "-DDBUS_PROXY_EXECUTABLE=${pkgs.lib.getExe pkgs.xdg-dbus-proxy}"
+                ];
+
+                meta = (builtins.removeAttrs previousAttrs.meta [ "mainProgram" ]) // {
+                  description = "Embeddable Web content engine, WPE port";
+                  homepage = "https://wpewebkit.org/";
+                  pkgConfigModules = [
+                    "wpe-webkit-2.0"
+                    "wpe-platform-2.0"
+                    "wpe-web-process-extension-2.0"
+                  ];
+                  platforms = pkgs.lib.platforms.linux;
+                  broken = false;
+                };
+              });
+
           runtime = pkgs.stdenv.mkDerivation {
             pname = "mux-wpe-kitty";
             version = "0.1.0";
@@ -38,7 +153,7 @@
             ];
             buildInputs = [
               pkgs.glib
-              pkgs.wpewebkit
+              wpeWebKit
             ];
 
             mesonBuildType = "release";
@@ -102,9 +217,11 @@
               uid="$(${pkgs.coreutils}/bin/id -u)"
               if [[ -n "''${XDG_RUNTIME_DIR:-}" ]]; then
                 runtime_parent="$XDG_RUNTIME_DIR"
+                runtime_mode="$(${pkgs.coreutils}/bin/stat -c %a -- "$runtime_parent")"
                 if [[ "$runtime_parent" != /* || ! -d "$runtime_parent" ||
                       -L "$runtime_parent" ||
-                      "$(${pkgs.coreutils}/bin/stat -c %u -- "$runtime_parent")" != "$uid" ]]; then
+                      "$(${pkgs.coreutils}/bin/stat -c %u -- "$runtime_parent")" != "$uid" ]] ||
+                   (( (8#$runtime_mode & 077) != 0 )); then
                   echo "XDG_RUNTIME_DIR must be an owner-controlled absolute directory." >&2
                   exit 1
                 fi
@@ -150,6 +267,7 @@
         {
           default = mux;
           inherit mux runtime;
+          wpewebkit = wpeWebKit;
         }
       );
 

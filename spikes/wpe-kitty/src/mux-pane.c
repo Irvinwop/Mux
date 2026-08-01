@@ -55,6 +55,27 @@
 #define ACTIVE_MAINTENANCE_MS 50
 #define IDLE_MAINTENANCE_MS 250
 #define CLOSE_TIMEOUT_MS 120000
+#define KITTY_FRAME_RESPONSE_CAPACITY 32u
+#define TERMINAL_OUTPUT_CAP_BYTES (4u * 1024u * 1024u)
+#define TERMINAL_OUTPUT_FRAME_RESERVE_BYTES (128u * 1024u)
+#define TERMINAL_OUTPUT_DRAIN_TIMEOUT_MS 250
+
+/*
+ * The PTY queue is capped at 4 MiB. Clipboard and UI output stop at the
+ * 128 KiB reserve so one complete Kitty graphics command can still enter the
+ * same ordered FIFO. Queue admission is all-or-nothing for every command.
+ */
+
+typedef struct {
+    GBytes *bytes;
+    gsize offset;
+} TerminalOutputChunk;
+
+typedef struct {
+    guint image_id;
+    guint64 frame_serial;
+    gboolean retired;
+} KittyFrameResponse;
 
 typedef struct {
     int engine_fd;
@@ -64,14 +85,19 @@ typedef struct {
     guint64 next_serial;
     guint64 pending_frame_serial;
     guint64 close_request_serial;
+    guint64 retired_close_serial;
     gint64 close_deadline_us;
     guint image_id;
+    guint next_image_id;
     guint width;
     guint height;
     guint scale_milli;
     guint pointer_modifiers;
     gboolean image_present;
     gboolean frame_waiting;
+    gboolean engine_visibility_known;
+    gboolean engine_visible;
+    gboolean engine_handshake_complete;
     gboolean terminal_active;
     gboolean visible;
     gboolean focused;
@@ -79,6 +105,14 @@ typedef struct {
     gboolean shutting_down;
     gboolean quit;
     struct termios saved_terminal;
+    int saved_terminal_output_flags;
+    GQueue terminal_output;
+    gsize terminal_output_bytes;
+    gboolean terminal_output_failed;
+    gboolean terminal_failure_reported;
+    GError *terminal_output_error;
+    gboolean clipboard_write_active;
+    gint64 clipboard_tick_due_us;
     GByteArray *input;
     GByteArray *control_input;
     GByteArray *events_input;
@@ -101,6 +135,9 @@ typedef struct {
     MuxKittyChooser *chooser;
     MuxUiPaneBridge *ui_bridge;
     MuxNotificationPane *notifications;
+    KittyFrameResponse frame_responses[KITTY_FRAME_RESPONSE_CAPACITY];
+    guint frame_response_head;
+    guint frame_response_count;
 } Pane;
 
 static volatile sig_atomic_t resize_requested;
@@ -111,7 +148,7 @@ static void send_navigation(Pane *pane,
                             const gchar *uri);
 static void delete_image(Pane *pane);
 static void send_resize(Pane *pane);
-static void ack_frame(Pane *pane);
+static void acknowledge_graphics_response(Pane *pane, guint image_id);
 static void redraw_clipboard_picker(Pane *pane);
 
 static void
@@ -146,31 +183,255 @@ write_all(int fd, const void *data, gsize length)
     return TRUE;
 }
 
+static void
+terminal_output_chunk_free(TerminalOutputChunk *chunk)
+{
+    if (chunk == NULL)
+        return;
+    g_bytes_unref(chunk->bytes);
+    g_free(chunk);
+}
+
+static void
+terminal_output_clear(Pane *pane)
+{
+    TerminalOutputChunk *chunk;
+
+    while ((chunk = g_queue_pop_head(&pane->terminal_output)) != NULL)
+        terminal_output_chunk_free(chunk);
+    pane->terminal_output_bytes = 0;
+}
+
+static void
+terminal_output_copy_error(Pane *pane, GError **error)
+{
+    if (error != NULL && *error == NULL && pane->terminal_output_error != NULL)
+        *error = g_error_copy(pane->terminal_output_error);
+}
+
+static void
+terminal_output_fail(Pane *pane, gint error_number, const gchar *operation)
+{
+    if (pane->terminal_output_failed)
+        return;
+    pane->terminal_output_failed = TRUE;
+    pane->terminal_output_error = g_error_new(
+        G_IO_ERROR,
+        g_io_error_from_errno(error_number),
+        "%s: %s",
+        operation,
+        g_strerror(error_number));
+    terminal_output_clear(pane);
+}
+
+static gboolean
+terminal_output_flush(Pane *pane, GError **error)
+{
+    if (pane->terminal_output_failed) {
+        terminal_output_copy_error(pane, error);
+        return FALSE;
+    }
+
+    while (!g_queue_is_empty(&pane->terminal_output)) {
+        TerminalOutputChunk *chunk = g_queue_peek_head(&pane->terminal_output);
+        gsize length = 0;
+        const guint8 *data = g_bytes_get_data(chunk->bytes, &length);
+        ssize_t written;
+
+        if (chunk->offset >= length) {
+            g_queue_pop_head(&pane->terminal_output);
+            terminal_output_chunk_free(chunk);
+            continue;
+        }
+        written = write(STDOUT_FILENO,
+                        data + chunk->offset,
+                        length - chunk->offset);
+        if (written > 0) {
+            chunk->offset += (gsize)written;
+            pane->terminal_output_bytes -= (gsize)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return TRUE;
+        terminal_output_fail(pane,
+                             written == 0 ? EIO : errno,
+                             "write pane terminal output");
+        terminal_output_copy_error(pane, error);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+terminal_output_enqueue_bytes(Pane *pane,
+                              GBytes *bytes,
+                              gsize reserve_bytes,
+                              GError **error)
+{
+    TerminalOutputChunk *chunk;
+    gsize length;
+    gsize limit;
+
+    g_return_val_if_fail(bytes != NULL, FALSE);
+    if (!terminal_output_flush(pane, error))
+        return FALSE;
+
+    length = g_bytes_get_size(bytes);
+    limit = TERMINAL_OUTPUT_CAP_BYTES - reserve_bytes;
+    if (length > limit || pane->terminal_output_bytes > limit - length) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    G_IO_ERROR_WOULD_BLOCK,
+                    "terminal output queue is full (%" G_GSIZE_FORMAT
+                    "/%u bytes)",
+                    pane->terminal_output_bytes,
+                    TERMINAL_OUTPUT_CAP_BYTES);
+        return FALSE;
+    }
+    if (length == 0)
+        return TRUE;
+
+    chunk = g_new0(TerminalOutputChunk, 1);
+    chunk->bytes = g_bytes_ref(bytes);
+    g_queue_push_tail(&pane->terminal_output, chunk);
+    pane->terminal_output_bytes += length;
+    return terminal_output_flush(pane, error);
+}
+
+static gboolean
+terminal_output_enqueue(Pane *pane,
+                        const void *data,
+                        gsize length,
+                        gsize reserve_bytes,
+                        GError **error)
+{
+    GBytes *bytes = g_bytes_new(data, length);
+    gboolean result = terminal_output_enqueue_bytes(pane,
+                                                    bytes,
+                                                    reserve_bytes,
+                                                    error);
+
+    g_bytes_unref(bytes);
+    return result;
+}
+
+static gboolean
+terminal_output_drain(Pane *pane, guint timeout_ms, GError **error)
+{
+    gint64 deadline_us = g_get_monotonic_time() +
+        (gint64)timeout_ms * 1000;
+
+    while (!g_queue_is_empty(&pane->terminal_output)) {
+        struct pollfd descriptor = {
+            .fd = STDOUT_FILENO,
+            .events = POLLOUT,
+        };
+        gint64 remaining_us;
+        gint wait_ms;
+        int ready;
+
+        if (!terminal_output_flush(pane, error))
+            return FALSE;
+        if (g_queue_is_empty(&pane->terminal_output))
+            return TRUE;
+        remaining_us = deadline_us - g_get_monotonic_time();
+        if (remaining_us <= 0) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_TIMED_OUT,
+                                "timed out draining pane terminal output");
+            return FALSE;
+        }
+        wait_ms = (gint)MIN((remaining_us + 999) / 1000,
+                            (gint64)G_MAXINT);
+        ready = poll(&descriptor, 1, wait_ms);
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready <= 0) {
+            if (ready == 0)
+                g_set_error_literal(error,
+                                    G_IO_ERROR,
+                                    G_IO_ERROR_TIMED_OUT,
+                                    "timed out draining pane terminal output");
+            else
+                g_set_error(error,
+                            G_IO_ERROR,
+                            g_io_error_from_errno(errno),
+                            "poll pane terminal output: %s",
+                            g_strerror(errno));
+            return FALSE;
+        }
+        if (descriptor.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            terminal_output_fail(pane,
+                                 EPIPE,
+                                 "poll pane terminal output");
+            terminal_output_copy_error(pane, error);
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static gboolean
+terminal_write(Pane *pane, const gchar *text)
+{
+    g_autoptr(GError) error = NULL;
+
+    if (terminal_output_enqueue(pane,
+                                text,
+                                strlen(text),
+                                TERMINAL_OUTPUT_FRAME_RESERVE_BYTES,
+                                &error))
+        return TRUE;
+    g_warning("pane terminal output rejected: %s",
+              error != NULL ? error->message : "unknown error");
+    return FALSE;
+}
+
+static gboolean
+terminal_write_critical(Pane *pane, const gchar *text)
+{
+    g_autoptr(GError) error = NULL;
+
+    if (terminal_output_enqueue(pane,
+                                text,
+                                strlen(text),
+                                0,
+                                &error))
+        return TRUE;
+    g_warning("critical pane terminal output rejected: %s",
+              error != NULL ? error->message : "unknown error");
+    return FALSE;
+}
+
 static gboolean
 clipboard_terminal_output(MuxPaneClipboard *clipboard,
                           GBytes *packet,
                           gpointer user_data,
                           GError **error)
 {
+    Pane *pane = user_data;
     gsize length;
     gconstpointer data = g_bytes_get_data(packet, &length);
+    gint64 now_us = g_get_monotonic_time();
 
     (void) clipboard;
-    (void) user_data;
-    if (write_all(STDOUT_FILENO, data, length))
-        return TRUE;
-    g_set_error(error,
-                G_IO_ERROR,
-                g_io_error_from_errno(errno),
-                "write Kitty clipboard sequence: %s",
-                g_strerror(errno));
-    return FALSE;
-}
+    if (g_strstr_len(data, length, "type=write") != NULL) {
+        gint64 active_due_us = now_us +
+            (gint64)ACTIVE_MAINTENANCE_MS * 1000;
 
-static void
-terminal_write(const gchar *text)
-{
-    write_all(STDOUT_FILENO, text, strlen(text));
+        pane->clipboard_write_active = TRUE;
+        if (!pane->clipboard_tick_due_us ||
+            pane->clipboard_tick_due_us > active_due_us)
+            pane->clipboard_tick_due_us = active_due_us;
+    }
+    return terminal_output_enqueue_bytes(
+        pane,
+        packet,
+        TERMINAL_OUTPUT_FRAME_RESERVE_BYTES,
+        error);
 }
 
 static guint32
@@ -206,7 +467,9 @@ engine_socket_path(const gchar *profile)
     if (override && *override)
         return g_strdup(override);
     directory = runtime_directory();
-    filename = g_strdup_printf("mux-engine-%s.sock", profile);
+    filename = g_strdup_printf("mux-engine-v%u-%s.sock",
+                               MUX_ENGINE_VERSION,
+                               profile);
     path = g_build_filename(directory, filename, NULL);
     g_free(filename);
     g_free(directory);
@@ -243,20 +506,41 @@ reset_retry(gint64 *retry_us, guint *backoff_ms)
 }
 
 static void
+retire_frame_responses(Pane *pane)
+{
+    for (guint offset = 0;
+         offset < pane->frame_response_count;
+         offset++) {
+        guint index = (pane->frame_response_head + offset) %
+            KITTY_FRAME_RESPONSE_CAPACITY;
+
+        pane->frame_responses[index].retired = TRUE;
+    }
+    pane->frame_waiting = FALSE;
+    pane->pending_frame_serial = 0;
+}
+
+static void
+retire_close_request(Pane *pane)
+{
+    if (pane->close_request_serial > pane->retired_close_serial)
+        pane->retired_close_serial = pane->close_request_serial;
+    pane->close_request_serial = 0;
+    pane->close_deadline_us = 0;
+}
+
+static void
 disconnect_engine(Pane *pane)
 {
     if (pane->engine_fd >= 0)
         close(pane->engine_fd);
     pane->engine_fd = -1;
     pane->view_id = 0;
-    pane->frame_waiting = FALSE;
-    pane->pending_frame_serial = 0;
+    pane->engine_visibility_known = FALSE;
+    pane->engine_handshake_complete = FALSE;
+    retire_frame_responses(pane);
     delete_image(pane);
-    if (pane->close_request_serial) {
-        pane->close_request_serial = 0;
-        pane->close_deadline_us = 0;
-        pane->quit = TRUE;
-    }
+    retire_close_request(pane);
     if (!pane->shutting_down)
         queue_retry(&pane->engine_retry_us,
                     &pane->engine_backoff_ms);
@@ -733,7 +1017,6 @@ request_close(Pane *pane)
         return;
     }
     if (pane->engine_fd < 0 || !pane->view_id) {
-        pane->quit = TRUE;
         return;
     }
 
@@ -744,12 +1027,36 @@ request_close(Pane *pane)
                     MUX_ENGINE_MESSAGE_REQUEST_CLOSE,
                     pane->view_id,
                     serial)) {
-        pane->quit = TRUE;
         return;
     }
     pane->close_request_serial = serial;
     pane->close_deadline_us = g_get_monotonic_time() +
         (gint64)CLOSE_TIMEOUT_MS * 1000;
+}
+
+static void
+cancel_close_request(Pane *pane)
+{
+    MuxEngineBuilder builder;
+    GBytes *payload;
+    guint64 close_serial = pane->close_request_serial;
+
+    if (!close_serial)
+        return;
+    retire_close_request(pane);
+    if (pane->engine_fd < 0 || !pane->view_id)
+        return;
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u64(&builder, close_serial);
+    payload = mux_engine_builder_finish(&builder);
+    send_message(pane,
+                 MUX_ENGINE_MESSAGE_CANCEL_CLOSE,
+                 MUX_ENGINE_FLAG_NONE,
+                 pane->view_id,
+                 ++pane->next_serial,
+                 payload);
+    g_bytes_unref(payload);
 }
 
 static gboolean
@@ -790,6 +1097,14 @@ receive_message(Pane *pane, MuxEngineMessage *message)
                                    message,
                                    &error))
         return TRUE;
+    if (!pane->engine_handshake_complete &&
+        g_error_matches(error,
+                        MUX_ENGINE_ERROR,
+                        MUX_ENGINE_ERROR_PROTOCOL)) {
+        g_printerr("mux-pane: incompatible mux-engine protocol; expected v%u\n",
+                   MUX_ENGINE_VERSION);
+        pane->quit = TRUE;
+    }
     g_printerr("mux-pane: engine connection lost: %s\n",
                error ? error->message : "disconnected");
     g_clear_error(&error);
@@ -827,6 +1142,7 @@ start_view(Pane *pane, const gchar *initial_uri)
                           MUX_ENGINE_MESSAGE_WELCOME,
                           &response))
         return FALSE;
+    pane->engine_handshake_complete = TRUE;
     mux_engine_message_clear(&response);
 
     if (pane->popup_token && *pane->popup_token) {
@@ -859,9 +1175,10 @@ start_view(Pane *pane, const gchar *initial_uri)
                           &response))
         return FALSE;
     pane->view_id = response.view_id;
-    pane->image_id = (guint)(pane->view_id & G_MAXUINT32);
-    if (!pane->image_id)
-        pane->image_id = 1;
+    pane->next_image_id++;
+    if (!pane->next_image_id)
+        pane->next_image_id++;
+    pane->image_id = pane->next_image_id;
     mux_engine_message_clear(&response);
     g_clear_pointer(&pane->popup_token, g_free);
     return TRUE;
@@ -871,6 +1188,7 @@ static gboolean
 terminal_enable(Pane *pane)
 {
     struct termios raw;
+    g_autoptr(GError) error = NULL;
     const gchar *enable =
         "\033[?1049h\033[2J\033[H\033[?25l"
         "\033[>31u"
@@ -880,12 +1198,42 @@ terminal_enable(Pane *pane)
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO) ||
         tcgetattr(STDIN_FILENO, &pane->saved_terminal) < 0)
         return FALSE;
+    pane->saved_terminal_output_flags = fcntl(STDOUT_FILENO, F_GETFL);
+    if (pane->saved_terminal_output_flags < 0 ||
+        fcntl(STDOUT_FILENO,
+              F_SETFL,
+              pane->saved_terminal_output_flags | O_NONBLOCK) < 0)
+        return FALSE;
     raw = pane->saved_terminal;
     cfmakeraw(&raw);
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) < 0)
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) < 0) {
+        fcntl(STDOUT_FILENO,
+              F_SETFL,
+              pane->saved_terminal_output_flags);
+        pane->saved_terminal_output_flags = -1;
         return FALSE;
+    }
+    terminal_output_clear(pane);
+    pane->terminal_output_failed = FALSE;
+    pane->terminal_failure_reported = FALSE;
+    g_clear_error(&pane->terminal_output_error);
     pane->terminal_active = TRUE;
-    terminal_write(enable);
+    if (!terminal_output_enqueue(pane,
+                                 enable,
+                                 strlen(enable),
+                                 0,
+                                 &error)) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &pane->saved_terminal);
+        fcntl(STDOUT_FILENO,
+              F_SETFL,
+              pane->saved_terminal_output_flags);
+        pane->saved_terminal_output_flags = -1;
+        pane->terminal_active = FALSE;
+        terminal_output_clear(pane);
+        g_warning("enable pane terminal: %s",
+                  error != NULL ? error->message : "unknown error");
+        return FALSE;
+    }
     return TRUE;
 }
 
@@ -899,25 +1247,78 @@ delete_image(Pane *pane)
     command = g_strdup_printf(
         "\033_Ga=d,d=I,i=%u,q=2\033\\",
         pane->image_id);
-    terminal_write(command);
+    if (!terminal_write_critical(pane, command)) {
+        g_free(command);
+        return;
+    }
     g_free(command);
     pane->image_present = FALSE;
 }
 
-static void
-terminal_disable(Pane *pane)
+static gboolean
+terminal_disable(Pane *pane, GError **error)
 {
+    g_autoptr(GError) local_error = NULL;
+    gboolean result = TRUE;
+
     if (!pane->terminal_active)
-        return;
-    delete_image(pane);
-    terminal_write(
-        "\033[?1004l\033[?1016l\033[?1006l"
-        "\033[?1003l\033[?1000l"
-        "\033[<u\033[?25h\033[?1049l");
-    tcsetattr(STDIN_FILENO,
-              TCSAFLUSH,
-              &pane->saved_terminal);
+        return TRUE;
+    if (!terminal_output_drain(pane,
+                               TERMINAL_OUTPUT_DRAIN_TIMEOUT_MS,
+                               &local_error)) {
+        result = FALSE;
+    } else {
+        delete_image(pane);
+        if (!pane->terminal_output_failed &&
+            terminal_write_critical(
+                pane,
+                "\033[?1004l\033[?1016l\033[?1006l"
+                "\033[?1003l\033[?1000l"
+                "\033[<u\033[?25h\033[?1049l")) {
+            if (!terminal_output_drain(pane,
+                                       TERMINAL_OUTPUT_DRAIN_TIMEOUT_MS,
+                                       &local_error))
+                result = FALSE;
+        } else {
+            result = FALSE;
+        }
+    }
+    if (tcsetattr(STDIN_FILENO,
+                  TCSAFLUSH,
+                  &pane->saved_terminal) < 0 && result) {
+        g_set_error(&local_error,
+                    G_IO_ERROR,
+                    g_io_error_from_errno(errno),
+                    "restore pane terminal input: %s",
+                    g_strerror(errno));
+        result = FALSE;
+    }
+    if (pane->saved_terminal_output_flags >= 0 &&
+        fcntl(STDOUT_FILENO,
+              F_SETFL,
+              pane->saved_terminal_output_flags) < 0 && result) {
+        g_set_error(&local_error,
+                    G_IO_ERROR,
+                    g_io_error_from_errno(errno),
+                    "restore pane terminal output: %s",
+                    g_strerror(errno));
+        result = FALSE;
+    }
+    pane->saved_terminal_output_flags = -1;
     pane->terminal_active = FALSE;
+    terminal_output_clear(pane);
+    if (!result && error != NULL && *error == NULL) {
+        if (local_error != NULL)
+            *error = g_steal_pointer(&local_error);
+        else if (pane->terminal_output_error != NULL)
+            *error = g_error_copy(pane->terminal_output_error);
+        else
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_FAILED,
+                                "pane terminal output could not be drained");
+    }
+    return result;
 }
 
 static guint
@@ -1127,11 +1528,50 @@ send_engine_focus(Pane *pane, gboolean focused)
     g_bytes_unref(payload);
 }
 
+static gboolean
+pane_page_is_visible(const Pane *pane)
+{
+    return pane->visible &&
+        (pane->clipboard == NULL ||
+         !mux_pane_clipboard_picker_is_open(pane->clipboard));
+}
+
+static void
+send_engine_visibility(Pane *pane)
+{
+    MuxEngineBuilder builder;
+    GBytes *payload;
+    gboolean visible;
+
+    if (pane->engine_fd < 0 || !pane->view_id)
+        return;
+    visible = pane_page_is_visible(pane);
+    if (pane->engine_visibility_known &&
+        pane->engine_visible == visible)
+        return;
+    if (!visible)
+        retire_frame_responses(pane);
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, visible);
+    payload = mux_engine_builder_finish(&builder);
+    if (send_message(pane,
+                     MUX_ENGINE_MESSAGE_SET_VISIBILITY,
+                     MUX_ENGINE_FLAG_NONE,
+                     pane->view_id,
+                     ++pane->next_serial,
+                     payload)) {
+        pane->engine_visibility_known = TRUE;
+        pane->engine_visible = visible;
+    }
+    g_bytes_unref(payload);
+}
+
 static void
 send_focus(Pane *pane, gboolean focused)
 {
     pane->focused = focused;
-    send_engine_focus(pane, focused && pane->visible);
+    send_engine_focus(pane,
+                      focused && pane_page_is_visible(pane));
     control_report_focus(pane, focused);
 }
 
@@ -1141,9 +1581,10 @@ send_resize(Pane *pane)
     MuxEngineBuilder builder;
     GBytes *payload;
 
-    if (!pane->visible || !pane->terminal_active ||
+    if (!pane_page_is_visible(pane) || !pane->terminal_active ||
         pane->engine_fd < 0 || !pane->view_id)
         return;
+    retire_frame_responses(pane);
     mux_engine_builder_init(&builder);
     mux_engine_builder_put_u32(&builder, pane->width);
     mux_engine_builder_put_u32(&builder, pane->height);
@@ -1185,9 +1626,9 @@ redraw_clipboard_picker(Pane *pane)
     panel = mux_pane_clipboard_render_picker(pane->clipboard,
                                             columns,
                                             rows);
-    terminal_write("\033[H\033[2J");
+    terminal_write(pane, "\033[H\033[2J");
     if (panel != NULL) {
-        terminal_write(panel);
+        terminal_write(pane, panel);
         g_free(panel);
     }
 }
@@ -1195,8 +1636,13 @@ redraw_clipboard_picker(Pane *pane)
 static void
 clipboard_changed(MuxPaneClipboard *clipboard, gpointer user_data)
 {
+    Pane *pane = user_data;
+
     (void) clipboard;
-    redraw_clipboard_picker(user_data);
+    send_engine_visibility(pane);
+    send_engine_focus(pane,
+                      pane->focused && pane_page_is_visible(pane));
+    redraw_clipboard_picker(pane);
 }
 
 static void
@@ -1205,10 +1651,13 @@ clipboard_closed(MuxPaneClipboard *clipboard, gpointer user_data)
     Pane *pane = user_data;
 
     (void) clipboard;
-    terminal_write("\033[H\033[2J");
-    ack_frame(pane);
+    terminal_write(pane, "\033[H\033[2J");
+    retire_frame_responses(pane);
+    send_engine_visibility(pane);
     delete_image(pane);
     send_resize(pane);
+    send_engine_focus(pane,
+                      pane->focused && pane_page_is_visible(pane));
 }
 
 static void
@@ -1217,25 +1666,60 @@ clipboard_failure(MuxPaneClipboard *clipboard,
                   const GError *error,
                   gpointer user_data)
 {
+    Pane *pane = user_data;
+
     (void) clipboard;
-    (void) user_data;
+    if (operation != NULL &&
+        strstr(operation, "clipboard-write") != NULL)
+        pane->clipboard_write_active = FALSE;
     g_printerr("mux-pane: clipboard %s: %s\n",
                operation != NULL ? operation : "operation",
                error != NULL ? error->message : "unspecified failure");
 }
 
-static void
-ack_frame(Pane *pane)
+static gboolean
+queue_frame_response(Pane *pane, guint64 frame_serial)
 {
-    if (!pane->frame_waiting || !pane->visible ||
-        !pane->terminal_active || pane->engine_fd < 0 ||
-        (pane->clipboard != NULL &&
-         mux_pane_clipboard_picker_is_open(pane->clipboard)))
+    guint index;
+
+    if (pane->frame_waiting ||
+        pane->frame_response_count >= KITTY_FRAME_RESPONSE_CAPACITY)
+        return FALSE;
+    index = (pane->frame_response_head + pane->frame_response_count) %
+        KITTY_FRAME_RESPONSE_CAPACITY;
+    pane->frame_responses[index].image_id = pane->image_id;
+    pane->frame_responses[index].frame_serial = frame_serial;
+    pane->frame_responses[index].retired = FALSE;
+    pane->frame_response_count++;
+    pane->frame_waiting = TRUE;
+    pane->pending_frame_serial = frame_serial;
+    return TRUE;
+}
+
+static void
+acknowledge_graphics_response(Pane *pane, guint image_id)
+{
+    KittyFrameResponse response;
+
+    if (!pane->frame_response_count)
         return;
-    send_empty(pane,
-               MUX_ENGINE_MESSAGE_FRAME_ACK,
-               pane->view_id,
-               pane->pending_frame_serial);
+    response = pane->frame_responses[pane->frame_response_head];
+    if (response.image_id != image_id)
+        return;
+    pane->frame_response_head = (pane->frame_response_head + 1) %
+        KITTY_FRAME_RESPONSE_CAPACITY;
+    pane->frame_response_count--;
+    if (response.retired)
+        return;
+    if (!pane->frame_waiting ||
+        pane->pending_frame_serial != response.frame_serial)
+        return;
+
+    if (pane->engine_fd >= 0 && pane->view_id)
+        send_empty(pane,
+                   MUX_ENGINE_MESSAGE_FRAME_ACK,
+                   pane->view_id,
+                   response.frame_serial);
     pane->frame_waiting = FALSE;
     pane->pending_frame_serial = 0;
 }
@@ -1283,17 +1767,26 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
         return FALSE;
     }
 
-    if (!pane->visible || !pane->terminal_active ||
-        (pane->clipboard != NULL &&
-         mux_pane_clipboard_picker_is_open(pane->clipboard))) {
+    if (!pane_page_is_visible(pane) || !pane->terminal_active) {
         pane->width = width;
         pane->height = height;
         send_empty(pane,
                    MUX_ENGINE_MESSAGE_FRAME_ACK,
                    pane->view_id,
                    message->serial);
-        pane->frame_waiting = FALSE;
-        pane->pending_frame_serial = 0;
+        g_free(shm_name);
+        return TRUE;
+    }
+
+    if (pane->frame_waiting) {
+        g_free(shm_name);
+        return FALSE;
+    }
+    if (pane->frame_response_count >= KITTY_FRAME_RESPONSE_CAPACITY) {
+        send_empty(pane,
+                   MUX_ENGINE_MESSAGE_FRAME_ACK,
+                   pane->view_id,
+                   message->serial);
         g_free(shm_name);
         return TRUE;
     }
@@ -1310,7 +1803,6 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
             shm_size,
             pane->image_id,
             encoded_name);
-        pane->image_present = TRUE;
     } else {
         command = g_strdup_printf(
             "\033_Ga=f,f=32,t=s,s=%u,v=%u,S=%" G_GUINT64_FORMAT
@@ -1323,9 +1815,35 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
             y,
             encoded_name);
     }
-    terminal_write(command);
-    pane->frame_waiting = TRUE;
-    pane->pending_frame_serial = message->serial;
+    {
+        g_autoptr(GError) output_error = NULL;
+        GBytes *command_bytes = g_bytes_new(command, strlen(command));
+        gboolean queued = terminal_output_enqueue_bytes(pane,
+                                                        command_bytes,
+                                                        0,
+                                                        &output_error);
+
+        g_bytes_unref(command_bytes);
+        if (!queued) {
+            g_printerr("mux-pane: frame output backpressure: %s\n",
+                       output_error != NULL
+                           ? output_error->message
+                           : "unknown error");
+            g_free(command);
+            g_free(encoded_name);
+            g_free(shm_name);
+            return FALSE;
+        }
+    }
+    if (!queue_frame_response(pane, message->serial)) {
+        g_free(command);
+        g_free(encoded_name);
+        g_free(shm_name);
+        return FALSE;
+    }
+    if (!pane->image_present ||
+        (message->flags & MUX_ENGINE_FLAG_FULL_DAMAGE))
+        pane->image_present = TRUE;
     pane->width = width;
     pane->height = height;
     g_free(command);
@@ -1335,7 +1853,7 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
 }
 
 static void
-set_title(const gchar *title)
+set_title(Pane *pane, const gchar *title)
 {
     gchar *safe = g_strdup(title && *title ? title : "Mux");
     gchar *command;
@@ -1345,7 +1863,7 @@ set_title(const gchar *title)
             *cursor = ' ';
     }
     command = g_strdup_printf("\033]2;%s\033\\", safe);
-    terminal_write(command);
+    terminal_write(pane, command);
     g_free(command);
     g_free(safe);
 }
@@ -1442,7 +1960,7 @@ handle_metadata(Pane *pane, const MuxEngineMessage *message)
     pane->uri = uri;
     pane->title = title;
     display_title = trusted_title(title, state_flags);
-    set_title(display_title);
+    set_title(pane, display_title);
     control_report_state(pane);
     g_free(layer);
     return TRUE;
@@ -1516,9 +2034,14 @@ handle_engine_message(Pane *pane)
         break;
     case MUX_ENGINE_MESSAGE_CLOSE_READY:
         if (message.flags != MUX_ENGINE_FLAG_NONE ||
-            g_bytes_get_size(message.payload) != 0 ||
-            !pane->close_request_serial ||
-            message.serial != pane->close_request_serial) {
+            g_bytes_get_size(message.payload) != 0) {
+            g_printerr("mux-pane: invalid or out-of-order CLOSE_READY\n");
+            disconnect_engine(pane);
+        } else if (message.serial &&
+                   message.serial <= pane->retired_close_serial) {
+            break;
+        } else if (!pane->close_request_serial ||
+                   message.serial != pane->close_request_serial) {
             g_printerr("mux-pane: invalid or out-of-order CLOSE_READY\n");
             disconnect_engine(pane);
         } else {
@@ -1615,15 +2138,13 @@ ui_terminal_output(const guint8 *data,
                    gpointer user_data,
                    GError **error)
 {
-    (void)user_data;
-    if (write_all(STDOUT_FILENO, data, length))
-        return TRUE;
-    g_set_error(error,
-                G_IO_ERROR,
-                g_io_error_from_errno(errno),
-                "write pane UI overlay: %s",
-                g_strerror(errno));
-    return FALSE;
+    Pane *pane = user_data;
+
+    return terminal_output_enqueue(pane,
+                                   data,
+                                   length,
+                                   TERMINAL_OUTPUT_FRAME_RESERVE_BYTES,
+                                   error);
 }
 
 static gboolean
@@ -1668,8 +2189,7 @@ chooser_suspend(gpointer user_data, GError **error)
         return FALSE;
     }
     g_byte_array_set_size(pane->input, 0);
-    terminal_disable(pane);
-    return TRUE;
+    return terminal_disable(pane, error);
 }
 
 static gboolean
@@ -1694,7 +2214,7 @@ chooser_resume(gpointer user_data, GError **error)
         pane->width = width;
         pane->height = height;
     }
-    ack_frame(pane);
+    retire_frame_responses(pane);
     delete_image(pane);
     send_resize(pane);
     if (!ui_update_size(pane, error))
@@ -1768,9 +2288,12 @@ handle_graphics_response(Pane *pane,
     gchar *response = g_strndup((const gchar *)sequence, length);
     gchar *image = strstr(response, "i=");
 
-    if (image && (guint)g_ascii_strtoull(image + 2, NULL, 10) ==
-                     pane->image_id)
-        ack_frame(pane);
+    if (image) {
+        guint64 image_id = g_ascii_strtoull(image + 2, NULL, 10);
+
+        if (image_id <= G_MAXUINT)
+            acknowledge_graphics_response(pane, (guint)image_id);
+    }
     g_free(response);
 }
 
@@ -1859,8 +2382,13 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
         (modifiers & (WPE_MODIFIER_CONTROL | WPE_MODIFIER_SHIFT)) ==
             (WPE_MODIFIER_CONTROL | WPE_MODIFIER_SHIFT) &&
         (key_number == 'v' || key_number == 'V')) {
-        if (event_type == 1)
+        if (event_type == 1) {
             mux_pane_clipboard_open_picker(pane->clipboard);
+            send_engine_visibility(pane);
+            send_engine_focus(pane,
+                              pane->focused &&
+                                  pane_page_is_visible(pane));
+        }
     } else if (pane->clipboard != NULL &&
                mux_pane_clipboard_picker_is_open(pane->clipboard)) {
         MuxClipboardPickerKey picker_key;
@@ -2266,15 +2794,21 @@ process_terminal_input(Pane *pane)
                     memcmp(data, "\033]5522;", 7) == 0) {
                     g_autoptr(GError) error = NULL;
 
-                    if (!mux_pane_clipboard_handle_osc(
-                            pane->clipboard,
-                            data,
-                            end,
-                            &error))
+                    gboolean handled = mux_pane_clipboard_handle_osc(
+                        pane->clipboard,
+                        data,
+                        end,
+                        &error);
+
+                    if (!handled)
                         clipboard_failure(pane->clipboard,
                                           "osc-response",
                                           error,
                                           pane);
+                    else if (g_strstr_len((const gchar *)data,
+                                          end,
+                                          "type=write") != NULL)
+                        pane->clipboard_write_active = FALSE;
                 }
                 consumed = end;
             } else {
@@ -2435,6 +2969,7 @@ set_visibility(Pane *pane, gboolean visible)
     if (pane->visible == visible)
         return;
     pane->visible = visible;
+    send_engine_visibility(pane);
     if (!visible) {
         send_engine_focus(pane, FALSE);
         delete_image(pane);
@@ -2448,10 +2983,11 @@ set_visibility(Pane *pane, gboolean visible)
     }
     if (pane->clipboard != NULL &&
         mux_pane_clipboard_picker_is_open(pane->clipboard)) {
+        send_engine_focus(pane, FALSE);
         redraw_clipboard_picker(pane);
         return;
     }
-    ack_frame(pane);
+    retire_frame_responses(pane);
     delete_image(pane);
     send_resize(pane);
     send_engine_focus(pane, pane->focused);
@@ -2566,7 +3102,9 @@ retry_engine(Pane *pane)
     }
     reset_retry(&pane->engine_retry_us,
                 &pane->engine_backoff_ms);
-    send_engine_focus(pane, pane->focused && pane->visible);
+    send_engine_visibility(pane);
+    send_engine_focus(pane,
+                      pane->focused && pane_page_is_visible(pane));
     send_resize(pane);
 }
 
@@ -2654,12 +3192,19 @@ next_poll_timeout(Pane *pane, gint64 now_us)
     tighten_timeout(&timeout_ms,
                     deadline_timeout_ms(pane->close_deadline_us,
                                         now_us));
+    if (pane->clipboard != NULL) {
+        if (!pane->clipboard_tick_due_us)
+            tighten_timeout(&timeout_ms, 0);
+        else
+            tighten_timeout(&timeout_ms,
+                            deadline_timeout_ms(
+                                pane->clipboard_tick_due_us,
+                                now_us));
+    }
     if (g_main_context_pending(pane->main_context))
         tighten_timeout(&timeout_ms, 0);
     else if (active_maintenance)
         tighten_timeout(&timeout_ms, ACTIVE_MAINTENANCE_MS);
-    else if (pane->clipboard != NULL)
-        tighten_timeout(&timeout_ms, IDLE_MAINTENANCE_MS);
     return timeout_ms;
 }
 
@@ -2668,15 +3213,19 @@ service_maintenance(Pane *pane, gint64 monotonic_us)
 {
     if (pane->close_request_serial && pane->close_deadline_us &&
         monotonic_us >= pane->close_deadline_us) {
-        pane->close_request_serial = 0;
-        pane->close_deadline_us = 0;
-        pane->quit = TRUE;
-        return;
+        cancel_close_request(pane);
     }
     while (g_main_context_iteration(pane->main_context, FALSE))
         ;
-    if (pane->clipboard != NULL)
+    if (pane->clipboard != NULL &&
+        (!pane->clipboard_tick_due_us ||
+         monotonic_us >= pane->clipboard_tick_due_us)) {
         mux_pane_clipboard_tick(pane->clipboard, monotonic_us);
+        pane->clipboard_tick_due_us = monotonic_us +
+            (gint64)(pane->clipboard_write_active
+                         ? ACTIVE_MAINTENANCE_MS
+                         : IDLE_MAINTENANCE_MS) * 1000;
+    }
     if (pane->chooser != NULL)
         mux_kitty_chooser_tick(pane->chooser, monotonic_us);
     if (pane->ui_bridge != NULL) {
@@ -2697,7 +3246,7 @@ service_maintenance(Pane *pane, gint64 monotonic_us)
 static void
 run_pane(Pane *pane)
 {
-    struct pollfd descriptors[4];
+    struct pollfd descriptors[5];
 
     send_focus(pane, TRUE);
     while (!pane->quit && !quit_requested) {
@@ -2734,6 +3283,12 @@ run_pane(Pane *pane)
         descriptors[3].fd = pane->events_fd;
         descriptors[3].events = pane->events_fd >= 0 ? POLLIN : 0;
         descriptors[3].revents = 0;
+        descriptors[4].fd = !pane->terminal_output_failed &&
+                pane->terminal_output_bytes > 0
+            ? STDOUT_FILENO
+            : -1;
+        descriptors[4].events = descriptors[4].fd >= 0 ? POLLOUT : 0;
+        descriptors[4].revents = 0;
         ready = poll(descriptors,
                      G_N_ELEMENTS(descriptors),
                      next_poll_timeout(pane, monotonic_us));
@@ -2743,6 +3298,19 @@ run_pane(Pane *pane)
             pane->quit = TRUE;
             break;
         }
+        if (descriptors[4].revents & POLLOUT) {
+            g_autoptr(GError) output_error = NULL;
+
+            if (!terminal_output_flush(pane, &output_error))
+                g_warning("pane terminal output failed: %s",
+                          output_error != NULL
+                              ? output_error->message
+                              : "unknown error");
+        }
+        if (descriptors[4].revents & (POLLHUP | POLLERR | POLLNVAL))
+            terminal_output_fail(pane,
+                                 EPIPE,
+                                 "poll pane terminal output");
         if (descriptors[0].revents & POLLIN)
             read_terminal(pane);
         if (pane->engine_fd >= 0 &&
@@ -2769,6 +3337,13 @@ run_pane(Pane *pane)
         if (descriptors[0].revents & (POLLHUP | POLLERR | POLLNVAL))
             pane->quit = TRUE;
         service_maintenance(pane, g_get_monotonic_time());
+        if (pane->terminal_output_failed &&
+            !pane->terminal_failure_reported) {
+            pane->terminal_failure_reported = TRUE;
+            if (pane->clipboard != NULL)
+                mux_pane_clipboard_tick(pane->clipboard, G_MAXINT64);
+            pane->quit = TRUE;
+        }
     }
 }
 
@@ -2786,13 +3361,19 @@ chooser_clear(Pane *pane)
 static void
 pane_clear(Pane *pane)
 {
+    g_autoptr(GError) terminal_error = NULL;
+
     pane->shutting_down = TRUE;
     chooser_clear(pane);
     g_clear_pointer(&pane->notifications,
                     mux_notification_pane_free);
     g_clear_pointer(&pane->ui_bridge, mux_ui_pane_bridge_free);
     g_clear_pointer(&pane->clipboard, mux_pane_clipboard_free);
-    terminal_disable(pane);
+    if (!terminal_disable(pane, &terminal_error))
+        g_warning("disable pane terminal: %s",
+                  terminal_error != NULL
+                      ? terminal_error->message
+                      : "unknown error");
     if (pane->control_fd >= 0) {
         control_write(pane, "BYE");
         if (pane->control_fd >= 0)
@@ -2815,6 +3396,8 @@ pane_clear(Pane *pane)
     g_clear_pointer(&pane->input, g_byte_array_unref);
     g_clear_pointer(&pane->control_input, g_byte_array_unref);
     g_clear_pointer(&pane->events_input, g_byte_array_unref);
+    terminal_output_clear(pane);
+    g_clear_error(&pane->terminal_output_error);
     g_free(pane->profile);
     g_free(pane->socket_path);
     g_free(pane->layer);
@@ -2840,6 +3423,7 @@ main(int argc, char **argv)
         .engine_fd = -1,
         .control_fd = -1,
         .events_fd = -1,
+        .saved_terminal_output_flags = -1,
         .scale_milli = 1000,
         .next_serial = 1,
         .visible = TRUE,
@@ -2880,6 +3464,7 @@ main(int argc, char **argv)
         pane_clear(&pane);
         return 1;
     }
+    send_engine_visibility(&pane);
     if (!connect_control(&pane, initial_uri))
         g_printerr("mux-pane: muxd unavailable; global controls disabled\n");
     if (pane.control_fd < 0)

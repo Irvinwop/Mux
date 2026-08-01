@@ -268,6 +268,118 @@ test_close_handshake_round_trip(void)
     }
 }
 
+static void
+test_visibility_round_trip(void)
+{
+    static const guint32 visibility_states[] = {0, 1};
+
+    for (gsize index = 0;
+         index < G_N_ELEMENTS(visibility_states);
+         index++) {
+        int sockets[2];
+        MuxEngineBuilder builder = {0};
+        g_autoptr(GBytes) payload = NULL;
+        MuxEngineMessage outgoing = {0};
+        MuxEngineMessage incoming = {0};
+        MuxEngineCursor cursor;
+        guint32 visible = G_MAXUINT32;
+        g_autoptr(GError) error = NULL;
+
+        mux_engine_builder_init(&builder);
+        mux_engine_builder_put_u32(&builder,
+                                   visibility_states[index]);
+        payload = mux_engine_builder_finish(&builder);
+        open_socket_pair(sockets);
+        mux_engine_message_init(&outgoing,
+                                MUX_ENGINE_MESSAGE_SET_VISIBILITY,
+                                MUX_ENGINE_FLAG_NONE,
+                                G_GUINT64_CONSTANT(0x1020304050607080),
+                                G_GUINT64_CONSTANT(0x8877665544332211),
+                                payload);
+
+        g_assert_true(mux_engine_send_message(sockets[0],
+                                              &outgoing,
+                                              &error));
+        g_assert_no_error(error);
+        g_assert_true(mux_engine_receive_message(sockets[1],
+                                                 &incoming,
+                                                 &error));
+        g_assert_no_error(error);
+        g_assert_cmpuint(incoming.type,
+                         ==,
+                         MUX_ENGINE_MESSAGE_SET_VISIBILITY);
+        g_assert_cmpuint(incoming.flags, ==, MUX_ENGINE_FLAG_NONE);
+        g_assert_cmpuint(incoming.view_id,
+                         ==,
+                         G_GUINT64_CONSTANT(0x1020304050607080));
+        g_assert_cmpuint(incoming.serial,
+                         ==,
+                         G_GUINT64_CONSTANT(0x8877665544332211));
+        mux_engine_cursor_init(&cursor, incoming.payload);
+        g_assert_true(mux_engine_cursor_get_u32(&cursor, &visible));
+        g_assert_cmpuint(visible, ==, visibility_states[index]);
+        g_assert_true(mux_engine_cursor_done(&cursor));
+
+        mux_engine_message_clear(&incoming);
+        mux_engine_message_clear(&outgoing);
+        close_socket_pair(sockets);
+    }
+}
+
+static void
+test_cancel_close_round_trip(void)
+{
+    int sockets[2];
+    MuxEngineBuilder builder = {0};
+    g_autoptr(GBytes) payload = NULL;
+    MuxEngineMessage outgoing = {0};
+    MuxEngineMessage incoming = {0};
+    MuxEngineCursor cursor;
+    guint64 close_serial = 0;
+    g_autoptr(GError) error = NULL;
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u64(&builder,
+                               G_GUINT64_CONSTANT(0x123456789abcdef0));
+    payload = mux_engine_builder_finish(&builder);
+    open_socket_pair(sockets);
+    mux_engine_message_init(&outgoing,
+                            MUX_ENGINE_MESSAGE_CANCEL_CLOSE,
+                            MUX_ENGINE_FLAG_NONE,
+                            G_GUINT64_CONSTANT(0x1020304050607080),
+                            G_GUINT64_CONSTANT(0x8877665544332211),
+                            payload);
+
+    g_assert_true(mux_engine_send_message(sockets[0], &outgoing, &error));
+    g_assert_no_error(error);
+    g_assert_true(mux_engine_receive_message(sockets[1],
+                                             &incoming,
+                                             &error));
+    g_assert_no_error(error);
+    g_assert_cmpuint(incoming.type, ==, MUX_ENGINE_MESSAGE_CANCEL_CLOSE);
+    mux_engine_cursor_init(&cursor, incoming.payload);
+    g_assert_true(mux_engine_cursor_get_u64(&cursor, &close_serial));
+    g_assert_cmpuint(close_serial,
+                     ==,
+                     G_GUINT64_CONSTANT(0x123456789abcdef0));
+    g_assert_true(mux_engine_cursor_done(&cursor));
+
+    mux_engine_message_clear(&incoming);
+    mux_engine_message_clear(&outgoing);
+    close_socket_pair(sockets);
+}
+
+static void
+test_legacy_protocol_version_rejected(void)
+{
+    guint8 packet[MUX_ENGINE_HEADER_SIZE];
+
+    g_assert_cmpuint(MUX_ENGINE_VERSION, ==, 2);
+    init_header(packet);
+    put_u16(packet + 4, 1);
+    assert_protocol_rejected(packet, sizeof(packet));
+}
+
 typedef enum {
     MALFORMED_WRONG_MAGIC,
     MALFORMED_WRONG_VERSION,
@@ -343,6 +455,12 @@ main(int argc, char **argv)
                     test_packet_round_trip);
     g_test_add_func("/engine-protocol/packet/close-handshake",
                     test_close_handshake_round_trip);
+    g_test_add_func("/engine-protocol/packet/visibility",
+                    test_visibility_round_trip);
+    g_test_add_func("/engine-protocol/packet/cancel-close",
+                    test_cancel_close_round_trip);
+    g_test_add_func("/engine-protocol/packet/reject-v1",
+                    test_legacy_protocol_version_rejected);
 
     for (index = 0; index < G_N_ELEMENTS(malformed_cases); index++) {
         g_test_add_data_func(malformed_cases[index].path,

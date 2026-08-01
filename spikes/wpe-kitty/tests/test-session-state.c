@@ -59,6 +59,45 @@ test_corrupt_input(void)
 }
 
 static void
+test_many_views_and_duplicate_ids(void)
+{
+    const guint view_count = 4096;
+    g_autoptr(MuxSessionState) state = mux_session_state_new();
+    g_autofree gchar *serialized = NULL;
+    g_autoptr(GError) error = NULL;
+    MuxSessionView *last_view;
+    gsize length = 0;
+
+    g_assert_true(mux_session_state_set_next_view_id(state,
+                                                     view_count + 1));
+    for (guint id = 1; id <= view_count; id++) {
+        g_assert_true(mux_session_state_upsert_view(state,
+                                                   id,
+                                                   "main",
+                                                   "about:blank",
+                                                   ""));
+    }
+
+    serialized = mux_session_state_serialize(state, &length, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(serialized);
+    g_assert_cmpuint(length, >, 0);
+
+    last_view = (MuxSessionView *)mux_session_state_get_view(state,
+                                                            view_count - 1);
+    g_assert_nonnull(last_view);
+    last_view->id = 1;
+    g_clear_pointer(&serialized, g_free);
+
+    serialized = mux_session_state_serialize(state, &length, &error);
+    g_assert_null(serialized);
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
+    g_assert_cmpstr(error->message,
+                    ==,
+                    "session contains duplicate view IDs");
+}
+
+static void
 test_atomic_file_permissions(void)
 {
     g_autoptr(MuxSessionState) source = mux_session_state_new();
@@ -96,6 +135,8 @@ main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/session/round-trip", test_round_trip);
     g_test_add_func("/session/corrupt-input", test_corrupt_input);
+    g_test_add_func("/session/many-views-and-duplicate-ids",
+                    test_many_views_and_duplicate_ids);
     g_test_add_func("/session/atomic-file-permissions",
                     test_atomic_file_permissions);
     return g_test_run();

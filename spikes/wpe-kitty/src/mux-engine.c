@@ -37,6 +37,8 @@
 #define MUX_ENGINE_MAX_CLIENT_VIEWS 32u
 #define MUX_ENGINE_MAX_DIMENSION 8192u
 #define MUX_ENGINE_MAX_PIXELS (9u * 1024u * 1024u)
+#define MUX_ENGINE_FRAME_BUDGET_BYTES \
+    ((gsize)256u * 1024u * 1024u)
 #define MUX_ENGINE_MIN_SCALE 250u
 #define MUX_ENGINE_MAX_SCALE 8000u
 #define MUX_ENGINE_MAX_LAYER_BYTES 128u
@@ -121,6 +123,7 @@ struct _EngineView {
     guint scale_milli;
     gboolean ephemeral;
     gboolean focused;
+    gboolean hidden;
     WPEView *platform_view;
     guint8 *pixels;
     gsize pixels_size;
@@ -132,7 +135,9 @@ struct _EngineView {
     gboolean root_frame_sent;
     gboolean frame_pending;
     guint64 pending_frame_serial;
+    guint64 retired_frame_serial;
     gchar *pending_shm_name;
+    gsize pending_shm_size;
     guint frame_timeout_id;
     gboolean close_pending;
     gboolean close_ready;
@@ -164,6 +169,7 @@ struct _Engine {
     guint64 clipboard_reply_view_id;
     Client *clipboard_reply_client;
     guint clipboard_tick_id;
+    gsize frame_bytes;
     EngineView *pending_view;
     WPEView *(*original_create_view)(WPEDisplay *display);
     WPEClipboard *(*original_get_clipboard)(WPEDisplay *display);
@@ -350,7 +356,9 @@ static gchar *
 default_socket_path(const gchar *profile)
 {
     gchar *directory = runtime_directory();
-    gchar *filename = g_strdup_printf("mux-engine-%s.sock", profile);
+    gchar *filename = g_strdup_printf("mux-engine-v%u-%s.sock",
+                                      MUX_ENGINE_VERSION,
+                                      profile);
     gchar *path = g_build_filename(directory, filename, NULL);
 
     g_free(filename);
@@ -1132,8 +1140,30 @@ coalesce_damage(const WPERectangle *rectangles,
 }
 
 static void
+engine_frame_bytes_release(Engine *engine, gsize bytes)
+{
+    if (!bytes)
+        return;
+    g_return_if_fail(bytes <= engine->frame_bytes);
+    engine->frame_bytes -= bytes;
+}
+
+static gboolean
+engine_frame_bytes_reserve(Engine *engine, gsize bytes)
+{
+    if (engine->frame_bytes > MUX_ENGINE_FRAME_BUDGET_BYTES ||
+        bytes > MUX_ENGINE_FRAME_BUDGET_BYTES - engine->frame_bytes)
+        return FALSE;
+    engine->frame_bytes += bytes;
+    return TRUE;
+}
+
+static void
 engine_view_clear_pending_frame(EngineView *view)
 {
+    if (view->frame_pending &&
+        view->pending_frame_serial > view->retired_frame_serial)
+        view->retired_frame_serial = view->pending_frame_serial;
     if (view->frame_timeout_id) {
         g_source_remove(view->frame_timeout_id);
         view->frame_timeout_id = 0;
@@ -1141,6 +1171,11 @@ engine_view_clear_pending_frame(EngineView *view)
     if (view->pending_shm_name) {
         shm_unlink(view->pending_shm_name);
         g_clear_pointer(&view->pending_shm_name, g_free);
+    }
+    if (view->pending_shm_size) {
+        engine_frame_bytes_release(view->engine,
+                                   view->pending_shm_size);
+        view->pending_shm_size = 0;
     }
     view->frame_pending = FALSE;
     view->pending_frame_serial = 0;
@@ -1153,12 +1188,7 @@ frame_timeout(gpointer data)
     guint64 serial = view->pending_frame_serial;
 
     view->frame_timeout_id = 0;
-    if (view->pending_shm_name) {
-        shm_unlink(view->pending_shm_name);
-        g_clear_pointer(&view->pending_shm_name, g_free);
-    }
-    view->frame_pending = FALSE;
-    view->pending_frame_serial = 0;
+    engine_view_clear_pending_frame(view);
     if (view->owner && !view->owner->failed) {
         g_warning("Kitty did not acknowledge frame %" G_GUINT64_FORMAT
                   " for view %" G_GUINT64_FORMAT,
@@ -1171,7 +1201,7 @@ frame_timeout(gpointer data)
 }
 
 static gchar *
-create_frame_shm(const EngineView *view,
+create_frame_shm(EngineView *view,
                  const DamageRect *rectangle,
                  gsize *size_out)
 {
@@ -1181,6 +1211,8 @@ create_frame_shm(const EngineView *view,
     int fd = -1;
     guint8 *mapping;
 
+    if (!engine_frame_bytes_reserve(view->engine, size))
+        return NULL;
     for (guint attempt = 0; attempt < 16; attempt++) {
         g_free(name);
         name = g_strdup_printf(
@@ -1200,6 +1232,7 @@ create_frame_shm(const EngineView *view,
     if (fd < 0) {
         g_warning("create Kitty frame shared memory: %s",
                   g_strerror(errno));
+        engine_frame_bytes_release(view->engine, size);
         g_free(name);
         return NULL;
     }
@@ -1208,6 +1241,7 @@ create_frame_shm(const EngineView *view,
                   g_strerror(errno));
         close(fd);
         shm_unlink(name);
+        engine_frame_bytes_release(view->engine, size);
         g_free(name);
         return NULL;
     }
@@ -1223,6 +1257,7 @@ create_frame_shm(const EngineView *view,
         g_warning("map Kitty frame shared memory: %s",
                   g_strerror(errno));
         shm_unlink(name);
+        engine_frame_bytes_release(view->engine, size);
         g_free(name);
         return NULL;
     }
@@ -1250,7 +1285,7 @@ engine_view_send_frame(EngineView *view)
     MuxEngineBuilder builder;
     GBytes *payload;
 
-    if (view->frame_pending || !view->dirty_valid ||
+    if (view->hidden || view->frame_pending || !view->dirty_valid ||
         !view->pixels || !view->owner || view->owner->failed)
         return;
 
@@ -1292,6 +1327,7 @@ engine_view_send_frame(EngineView *view)
                      payload)) {
         g_bytes_unref(payload);
         shm_unlink(shm_name);
+        engine_frame_bytes_release(view->engine, shm_size);
         g_free(shm_name);
         return;
     }
@@ -1300,6 +1336,7 @@ engine_view_send_frame(EngineView *view)
     view->frame_pending = TRUE;
     view->pending_frame_serial = serial;
     view->pending_shm_name = shm_name;
+    view->pending_shm_size = shm_size;
     view->frame_timeout_id = g_timeout_add_seconds(30,
                                                    frame_timeout,
                                                    view);
@@ -1309,13 +1346,37 @@ engine_view_send_frame(EngineView *view)
 }
 
 static gboolean
+engine_view_resize_pixels(EngineView *view, gsize new_size)
+{
+    gsize old_size = view->pixels_size;
+    gsize reserved = 0;
+    guint8 *pixels;
+
+    if (new_size > old_size) {
+        reserved = new_size - old_size;
+        if (!engine_frame_bytes_reserve(view->engine, reserved))
+            return FALSE;
+    }
+    pixels = g_try_realloc(view->pixels, new_size);
+    if (!pixels) {
+        engine_frame_bytes_release(view->engine, reserved);
+        return FALSE;
+    }
+    if (new_size < old_size)
+        engine_frame_bytes_release(view->engine, old_size - new_size);
+    view->pixels = pixels;
+    view->pixels_size = new_size;
+    return TRUE;
+}
+
+static gboolean
 engine_view_update_pixels(EngineView *view,
                           WPEBuffer *buffer,
                           const WPERectangle *damage_rects,
                           guint damage_count)
 {
     GError *error = NULL;
-    GBytes *bytes;
+    g_autoptr(GBytes) bytes = NULL;
     const guint8 *source;
     gsize source_size;
     guint source_stride;
@@ -1359,8 +1420,8 @@ engine_view_update_pixels(EngineView *view,
     if (resized) {
         gsize pixels_size = (gsize)width * height * 4;
 
-        view->pixels = g_realloc(view->pixels, pixels_size);
-        view->pixels_size = pixels_size;
+        if (!engine_view_resize_pixels(view, pixels_size))
+            return FALSE;
         view->surface_width = width;
         view->surface_height = height;
         view->root_frame_sent = FALSE;
@@ -1422,7 +1483,7 @@ mux_platform_render_buffer(WPEView *platform_view,
     MuxPlatformView *mux_view = (MuxPlatformView *)platform_view;
 
     (void)error;
-    if (mux_view->engine_view)
+    if (mux_view->engine_view && !mux_view->engine_view->hidden)
         engine_view_update_pixels(mux_view->engine_view,
                                   buffer,
                                   damage_rects,
@@ -1436,6 +1497,8 @@ static void
 engine_view_reset_surface(EngineView *view)
 {
     engine_view_clear_pending_frame(view);
+    if (view->pixels_size)
+        engine_frame_bytes_release(view->engine, view->pixels_size);
     g_clear_pointer(&view->pixels, g_free);
     view->pixels_size = 0;
     view->surface_width = 0;
@@ -1609,12 +1672,14 @@ view_close(WebKitWebView *web_view, gpointer data)
 
     serial = view->pending_close_serial;
     view->close_pending = FALSE;
-    view->pending_close_serial = 0;
-    if (client_send_empty(view->owner,
-                          MUX_ENGINE_MESSAGE_CLOSE_READY,
-                          view->id,
-                          serial))
-        view->close_ready = TRUE;
+    view->close_ready = TRUE;
+    if (!client_send_empty(view->owner,
+                           MUX_ENGINE_MESSAGE_CLOSE_READY,
+                           view->id,
+                           serial)) {
+        view->close_ready = FALSE;
+        view->pending_close_serial = 0;
+    }
 }
 
 static void
@@ -2198,6 +2263,43 @@ handle_request_close(Client *client, const MuxEngineMessage *request)
     view->close_pending = TRUE;
     view->pending_close_serial = request->serial;
     webkit_web_view_try_close(view->web_view);
+    return !client->failed;
+}
+
+static gboolean
+handle_cancel_close(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+    MuxEngineCursor cursor;
+    guint64 close_serial;
+
+    if (!view)
+        return TRUE;
+    mux_engine_cursor_init(&cursor, request->payload);
+    if (request->flags != MUX_ENGINE_FLAG_NONE ||
+        !request->serial ||
+        !mux_engine_cursor_get_u64(&cursor, &close_serial) ||
+        !close_serial ||
+        !mux_engine_cursor_done(&cursor)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "invalid CANCEL_CLOSE record");
+        return TRUE;
+    }
+    if ((!view->close_pending && !view->close_ready) ||
+        close_serial != view->pending_close_serial) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_STATE,
+                          "CANCEL_CLOSE does not match the pending close");
+        return TRUE;
+    }
+
+    view->close_pending = FALSE;
+    view->close_ready = FALSE;
+    view->pending_close_serial = 0;
+    client_send_ack(client, request);
     return !client->failed;
 }
 
@@ -2941,8 +3043,17 @@ handle_frame_ack(Client *client, const MuxEngineMessage *request)
 
     if (!view)
         return TRUE;
-    if (g_bytes_get_size(request->payload) ||
-        !view->frame_pending ||
+    if (g_bytes_get_size(request->payload)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "FRAME_ACK must have an empty payload");
+        return TRUE;
+    }
+    if (request->serial &&
+        request->serial <= view->retired_frame_serial)
+        return TRUE;
+    if (!view->frame_pending ||
         request->serial != view->pending_frame_serial) {
         client_send_error(client,
                           request,
@@ -3000,6 +3111,44 @@ handle_set_focus(Client *client, const MuxEngineMessage *request)
         wpe_view_focus_in(view->platform_view);
     } else {
         wpe_view_focus_out(view->platform_view);
+    }
+    client_send_ack(client, request);
+    return !client->failed;
+}
+
+static gboolean
+handle_set_visibility(Client *client, const MuxEngineMessage *request)
+{
+    EngineView *view = lookup_owned_view(client, request);
+    MuxEngineCursor cursor;
+    guint32 visible;
+    WPEView *wpe_view;
+    WPEToplevel *toplevel;
+
+    if (!view)
+        return TRUE;
+    mux_engine_cursor_init(&cursor, request->payload);
+    if (!mux_engine_cursor_get_u32(&cursor, &visible) ||
+        !mux_engine_cursor_done(&cursor) ||
+        visible > 1) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
+                          "invalid SET_VISIBILITY payload");
+        return TRUE;
+    }
+    if (view->hidden == (visible == 0)) {
+        client_send_ack(client, request);
+        return !client->failed;
+    }
+
+    view->hidden = visible == 0;
+    engine_view_reset_surface(view);
+    if (!view->hidden) {
+        wpe_view = webkit_web_view_get_wpe_view(view->web_view);
+        toplevel = wpe_view ? wpe_view_get_toplevel(wpe_view) : NULL;
+        if (toplevel)
+            wpe_toplevel_resize(toplevel, view->width, view->height);
     }
     client_send_ack(client, request);
     return !client->failed;
@@ -3161,6 +3310,8 @@ handle_message(Client *client, const MuxEngineMessage *request)
         return handle_destroy_view(client, request);
     case MUX_ENGINE_MESSAGE_REQUEST_CLOSE:
         return handle_request_close(client, request);
+    case MUX_ENGINE_MESSAGE_CANCEL_CLOSE:
+        return handle_cancel_close(client, request);
     case MUX_ENGINE_MESSAGE_RESIZE:
         return handle_resize(client, request);
     case MUX_ENGINE_MESSAGE_NAVIGATE:
@@ -3175,6 +3326,8 @@ handle_message(Client *client, const MuxEngineMessage *request)
         return handle_set_focus(client, request);
     case MUX_ENGINE_MESSAGE_FRAME_ACK:
         return handle_frame_ack(client, request);
+    case MUX_ENGINE_MESSAGE_SET_VISIBILITY:
+        return handle_set_visibility(client, request);
     case MUX_ENGINE_MESSAGE_EXTENSION:
         return handle_extension(client, request);
     default:

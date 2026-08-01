@@ -402,16 +402,19 @@ static gboolean persistent_view_id_is_valid(const gchar *id)
     return errno == 0 && end != number && *end == '\0';
 }
 
-static gboolean register_view(int fd,
-                              const gchar *proposed_id,
-                              gchar **assigned_id,
-                              GError **error)
+static gboolean register_view_with_identity(int fd,
+                                            const gchar *proposed_id,
+                                            const gchar *window_id,
+                                            const gchar *kitty_socket,
+                                            const gchar *layer,
+                                            gchar **assigned_id,
+                                            GError **error)
 {
     g_autofree gchar *encoded_id =
         mux_encode(proposed_id != NULL ? proposed_id : "");
-    g_autofree gchar *encoded_window = mux_encode("integration-window");
-    g_autofree gchar *encoded_socket = mux_encode("integration-kitty");
-    g_autofree gchar *encoded_layer = mux_encode("main");
+    g_autofree gchar *encoded_window = mux_encode(window_id);
+    g_autofree gchar *encoded_socket = mux_encode(kitty_socket);
+    g_autofree gchar *encoded_layer = mux_encode(layer);
     g_autofree gchar *encoded_uri =
         mux_encode("https://example.invalid/muxd-integration");
     g_autofree gchar *line = NULL;
@@ -453,6 +456,20 @@ static gboolean register_view(int fd,
     if (field_count >= 3 && fields[2][0] != '\0')
         *assigned_id = mux_decode(fields[2]);
     return TRUE;
+}
+
+static gboolean register_view(int fd,
+                              const gchar *proposed_id,
+                              gchar **assigned_id,
+                              GError **error)
+{
+    return register_view_with_identity(fd,
+                                       proposed_id,
+                                       "integration-window",
+                                       "integration-kitty",
+                                       "main",
+                                       assigned_id,
+                                       error);
 }
 
 static gboolean query_view_count(const gchar *socket_path,
@@ -509,6 +526,99 @@ static gboolean query_view_count(const gchar *socket_path,
     }
     *view_count = (guint)parsed_count;
     return TRUE;
+}
+
+static gchar *query_view_layer(const gchar *socket_path,
+                               const gchar *view_id,
+                               GError **error)
+{
+    int fd = connect_unix_socket(socket_path,
+                                 RESPONSE_TIMEOUT_MS,
+                                 error);
+    gchar *layer = NULL;
+
+    if (fd < 0)
+        return NULL;
+    if (!mux_send_line(fd, "CTL\tLIST")) {
+        int saved_errno = errno;
+
+        close(fd);
+        set_errno_error(error, "send LIST", saved_errno);
+        return NULL;
+    }
+
+    for (guint i = 0; i < 256; i++) {
+        g_autofree gchar *line = mux_read_line(fd, RESPONSE_TIMEOUT_MS);
+        g_auto(GStrv) fields = NULL;
+
+        if (line == NULL) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_TIMED_OUT,
+                                "timed out reading LIST response");
+            break;
+        }
+        if (g_strcmp0(line, "END") == 0)
+            break;
+        fields = g_strsplit(line, "\t", -1);
+        if (g_strv_length(fields) >= 3 &&
+            g_strcmp0(fields[0], "VIEW") == 0) {
+            g_autofree gchar *candidate_id = mux_decode(fields[1]);
+
+            if (g_strcmp0(candidate_id, view_id) == 0) {
+                g_free(layer);
+                layer = mux_decode(fields[2]);
+            }
+        }
+    }
+    close(fd);
+    if (layer == NULL && error != NULL && *error == NULL) {
+        g_set_error(error,
+                    G_IO_ERROR,
+                    G_IO_ERROR_NOT_FOUND,
+                    "view %s was absent from LIST response",
+                    view_id);
+    }
+    return layer;
+}
+
+static int request_move(const gchar *socket_path,
+                        const gchar *view_id,
+                        const gchar *layer,
+                        GError **error)
+{
+    int fd = connect_unix_socket(socket_path,
+                                 RESPONSE_TIMEOUT_MS,
+                                 error);
+    g_autofree gchar *encoded_id = mux_encode(view_id);
+    g_autofree gchar *encoded_layer = mux_encode(layer);
+
+    if (fd < 0)
+        return -1;
+    if (!mux_send_line(fd,
+                       "CTL\tMOVE\t%s\t%s",
+                       encoded_id,
+                       encoded_layer)) {
+        int saved_errno = errno;
+
+        close(fd);
+        set_errno_error(error, "send MOVE", saved_errno);
+        return -1;
+    }
+    return fd;
+}
+
+static gboolean wait_for_path(const gchar *path, guint timeout_ms)
+{
+    gint64 deadline_us =
+        g_get_monotonic_time() + ((gint64)timeout_ms * 1000);
+
+    while (remaining_ms(deadline_us) > 0) {
+        if (g_file_test(path, G_FILE_TEST_EXISTS))
+            return TRUE;
+        (void)poll(NULL, 0, MIN(remaining_ms(deadline_us), 10));
+    }
+    return g_file_test(path, G_FILE_TEST_EXISTS);
 }
 
 static gboolean wait_for_view_count(const gchar *socket_path,
@@ -859,6 +969,259 @@ cleanup:
     g_free(old_runtime);
 }
 
+static void test_muxd_async_move_and_queued_replies(void)
+{
+    static const gchar kitten_script[] =
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *\"--use-password=always\"*\"detach-window\"*\"--match id:301\"*\"--target-tab window_id:401\"*)\n"
+        "    : > \"$MUX_TEST_KITTEN_MARKER\"\n"
+        "    sleep 1\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  *\"--use-password=always\"*\"detach-window\"*\"--match id:302\"*\"--target-tab window_id:401\"*)\n"
+        "    : > \"$MUX_TEST_KITTEN_MARKER\"\n"
+        "    exec sleep 10\n"
+        "    ;;\n"
+        "esac\n"
+        "exit 64\n";
+    gchar *root = NULL;
+    gchar *runtime_dir = NULL;
+    gchar *state_dir = NULL;
+    gchar *bin_dir = NULL;
+    gchar *kitten_path = NULL;
+    gchar *marker_path = NULL;
+    gchar *socket_path = NULL;
+    gchar *path_value = NULL;
+    gchar *target_id = NULL;
+    gchar *source_id = NULL;
+    gchar *timeout_source_id = NULL;
+    gchar *move_response = NULL;
+    gchar *observed_layer = NULL;
+    gchar *error_message = NULL;
+    gchar *old_runtime = g_strdup(g_getenv("XDG_RUNTIME_DIR"));
+    gchar *old_state = g_strdup(g_getenv("XDG_STATE_HOME"));
+    gchar *old_ephemeral = g_strdup(g_getenv("MUX_EPHEMERAL"));
+    gchar *old_path = g_strdup(g_getenv("PATH"));
+    gchar *old_marker = g_strdup(g_getenv("MUX_TEST_KITTEN_MARKER"));
+    GError *error = NULL;
+    struct ucred daemon_credentials;
+    int guard_fd = -1;
+    int target_fd = -1;
+    int source_fd = -1;
+    int timeout_source_fd = -1;
+    int move_fd = -1;
+    pid_t daemon_pid = -1;
+    mode_t old_umask = umask(0077);
+
+    root = g_dir_make_tmp("muxd-move-integration-XXXXXX", &error);
+    REQUIRE_CALL(root != NULL, "create temporary root");
+    runtime_dir = g_build_filename(root, "runtime", NULL);
+    state_dir = g_build_filename(root, "state", NULL);
+    bin_dir = g_build_filename(root, "bin", NULL);
+    marker_path = g_build_filename(root, "kitty-started", NULL);
+    kitten_path = g_build_filename(bin_dir, "kitten", NULL);
+    REQUIRE(g_mkdir(runtime_dir, 0700) == 0,
+            "create runtime directory: %s",
+            g_strerror(errno));
+    REQUIRE(g_mkdir(state_dir, 0700) == 0,
+            "create state directory: %s",
+            g_strerror(errno));
+    REQUIRE(g_mkdir(bin_dir, 0700) == 0,
+            "create bin directory: %s",
+            g_strerror(errno));
+    REQUIRE_CALL(g_file_set_contents(kitten_path,
+                                     kitten_script,
+                                     -1,
+                                     &error),
+                 "write fake kitten");
+    REQUIRE(g_chmod(kitten_path, 0700) == 0,
+            "chmod fake kitten: %s",
+            g_strerror(errno));
+
+    path_value = g_strdup_printf("%s:%s",
+                                 bin_dir,
+                                 old_path != NULL ? old_path : "");
+    REQUIRE(g_setenv("XDG_RUNTIME_DIR", runtime_dir, TRUE),
+            "set XDG_RUNTIME_DIR");
+    REQUIRE(g_setenv("XDG_STATE_HOME", state_dir, TRUE),
+            "set XDG_STATE_HOME");
+    REQUIRE(g_setenv("MUX_EPHEMERAL", "0", TRUE),
+            "set persistent peer identity");
+    REQUIRE(g_setenv("PATH", path_value, TRUE), "set PATH");
+    REQUIRE(g_setenv("MUX_TEST_KITTEN_MARKER", marker_path, TRUE),
+            "set fake kitten marker");
+    socket_path =
+        g_build_filename(runtime_dir, "mux", "muxd.sock", NULL);
+
+    REQUIRE_CALL(run_command(muxd_executable,
+                             "--ensure",
+                             CHILD_TIMEOUT_MS,
+                             &error),
+                 "start muxd");
+    guard_fd = connect_unix_socket(socket_path,
+                                   CONNECT_TIMEOUT_MS,
+                                   &error);
+    REQUIRE_CALL(guard_fd >= 0, "connect to muxd");
+    REQUIRE_CALL(get_peer_credentials(guard_fd,
+                                      &daemon_credentials,
+                                      &error),
+                 "identify muxd peer");
+    daemon_pid = daemon_credentials.pid;
+
+    target_fd = connect_unix_socket(socket_path,
+                                    RESPONSE_TIMEOUT_MS,
+                                    &error);
+    REQUIRE_CALL(target_fd >= 0, "connect target view");
+    REQUIRE_CALL(register_view_with_identity(target_fd,
+                                             "",
+                                             "401",
+                                             "integration-kitty",
+                                             "target",
+                                             &target_id,
+                                             &error),
+                 "register target view");
+    source_fd = connect_unix_socket(socket_path,
+                                    RESPONSE_TIMEOUT_MS,
+                                    &error);
+    REQUIRE_CALL(source_fd >= 0, "connect successful source view");
+    REQUIRE_CALL(register_view_with_identity(source_fd,
+                                             "",
+                                             "301",
+                                             "integration-kitty",
+                                             "main",
+                                             &source_id,
+                                             &error),
+                 "register successful source view");
+    timeout_source_fd = connect_unix_socket(socket_path,
+                                            RESPONSE_TIMEOUT_MS,
+                                            &error);
+    REQUIRE_CALL(timeout_source_fd >= 0, "connect timeout source view");
+    REQUIRE_CALL(register_view_with_identity(timeout_source_fd,
+                                             "",
+                                             "302",
+                                             "integration-kitty",
+                                             "main",
+                                             &timeout_source_id,
+                                             &error),
+                 "register timeout source view");
+
+    move_fd = request_move(socket_path, source_id, "target", &error);
+    REQUIRE_CALL(move_fd >= 0, "request successful move");
+    REQUIRE(wait_for_path(marker_path, 1000),
+            "fake kitten did not start successful move");
+    {
+        guint count = 0;
+        gint64 started_us = g_get_monotonic_time();
+
+        REQUIRE_CALL(query_view_count(socket_path, &count, &error),
+                     "query status while move is pending");
+        REQUIRE(count == 3, "pending move changed view count to %u", count);
+        REQUIRE(g_get_monotonic_time() - started_us < 500 * 1000,
+                "pending move blocked daemon control traffic");
+    }
+    move_response = mux_read_line(move_fd, 3000);
+    REQUIRE(move_response != NULL && g_strcmp0(move_response, "OK") == 0,
+            "unexpected successful MOVE response: %s",
+            move_response != NULL ? move_response : "(none)");
+    close(move_fd);
+    move_fd = -1;
+    g_clear_pointer(&move_response, g_free);
+    observed_layer = query_view_layer(socket_path, source_id, &error);
+    REQUIRE_CALL(observed_layer != NULL, "query successful moved layer");
+    REQUIRE(g_strcmp0(observed_layer, "target") == 0,
+            "successful move recorded layer %s",
+            observed_layer);
+    g_clear_pointer(&observed_layer, g_free);
+
+    (void)g_unlink(marker_path);
+    move_fd = request_move(socket_path,
+                           timeout_source_id,
+                           "target",
+                           &error);
+    REQUIRE_CALL(move_fd >= 0, "request timing-out move");
+    REQUIRE(wait_for_path(marker_path, 1000),
+            "fake kitten did not start timing-out move");
+    move_response = mux_read_line(move_fd, 3500);
+    REQUIRE(move_response != NULL,
+            "timing-out MOVE returned no response");
+    {
+        gchar **fields = g_strsplit(move_response, "\t", -1);
+
+        if (g_strv_length(fields) >= 2 &&
+            g_strcmp0(fields[0], "ERR") == 0)
+            error_message = mux_decode(fields[1]);
+        g_strfreev(fields);
+    }
+    REQUIRE(g_strcmp0(error_message, "Kitty layer move timed out") == 0,
+            "unexpected timeout response: %s",
+            error_message != NULL ? error_message : move_response);
+    close(move_fd);
+    move_fd = -1;
+    g_clear_pointer(&move_response, g_free);
+    g_clear_pointer(&error_message, g_free);
+    observed_layer = query_view_layer(socket_path,
+                                      timeout_source_id,
+                                      &error);
+    REQUIRE_CALL(observed_layer != NULL, "query timed-out moved layer");
+    REQUIRE(g_strcmp0(observed_layer, "main") == 0,
+            "timed-out move changed metadata to layer %s",
+            observed_layer);
+
+cleanup:
+    if (move_fd >= 0)
+        close(move_fd);
+    if (timeout_source_fd >= 0)
+        close(timeout_source_fd);
+    if (source_fd >= 0)
+        close(source_fd);
+    if (target_fd >= 0)
+        close(target_fd);
+    if (daemon_pid > 1 && socket_path != NULL) {
+        GError *stop_error = NULL;
+
+        if (!stop_identified_daemon(socket_path,
+                                    daemon_pid,
+                                    &stop_error)) {
+            g_test_message("stop identified muxd: %s",
+                           stop_error != NULL
+                               ? stop_error->message
+                               : "unknown error");
+            g_test_fail();
+        }
+        g_clear_error(&stop_error);
+    }
+    if (guard_fd >= 0)
+        close(guard_fd);
+    g_clear_error(&error);
+    remove_tree(root);
+    restore_environment("XDG_RUNTIME_DIR", old_runtime);
+    restore_environment("XDG_STATE_HOME", old_state);
+    restore_environment("MUX_EPHEMERAL", old_ephemeral);
+    restore_environment("PATH", old_path);
+    restore_environment("MUX_TEST_KITTEN_MARKER", old_marker);
+    (void)umask(old_umask);
+    g_free(error_message);
+    g_free(observed_layer);
+    g_free(move_response);
+    g_free(timeout_source_id);
+    g_free(source_id);
+    g_free(target_id);
+    g_free(path_value);
+    g_free(socket_path);
+    g_free(marker_path);
+    g_free(kitten_path);
+    g_free(bin_dir);
+    g_free(state_dir);
+    g_free(runtime_dir);
+    g_free(root);
+    g_free(old_marker);
+    g_free(old_path);
+    g_free(old_ephemeral);
+    g_free(old_state);
+    g_free(old_runtime);
+}
+
 int main(int argc, char **argv)
 {
     int result;
@@ -877,6 +1240,8 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/muxd/integration/identity-lifecycle",
                     test_muxd_identity_lifecycle);
+    g_test_add_func("/muxd/integration/async-move-and-queued-replies",
+                    test_muxd_async_move_and_queued_replies);
     result = g_test_run();
 
     g_free(muxctl_executable);

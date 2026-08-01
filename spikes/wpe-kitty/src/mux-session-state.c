@@ -291,6 +291,7 @@ mux_session_state_serialize(const MuxSessionState *state,
                             GError **error)
 {
     g_autoptr(GKeyFile) key_file = NULL;
+    g_autoptr(GHashTable) view_ids = NULL;
     guint64 greatest_view_id = 0;
 
     g_return_val_if_fail(state != NULL, NULL);
@@ -303,6 +304,7 @@ mux_session_state_serialize(const MuxSessionState *state,
     }
 
     key_file = g_key_file_new();
+    view_ids = g_hash_table_new(g_int64_hash, g_int64_equal);
     g_key_file_set_integer(key_file, "session", "version", SESSION_VERSION);
     g_key_file_set_uint64(key_file,
                           "session",
@@ -342,7 +344,7 @@ mux_session_state_serialize(const MuxSessionState *state,
             set_invalid_data(error, "session contains an invalid view");
             return NULL;
         }
-        if (state_find_view(state, view->id) != view) {
+        if (!g_hash_table_add(view_ids, (gpointer)&view->id)) {
             set_invalid_data(error, "session contains duplicate view IDs");
             return NULL;
         }

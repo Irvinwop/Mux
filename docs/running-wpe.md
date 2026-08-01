@@ -113,8 +113,8 @@ isolation still require interactive validation.
 - In-flight trusted UI requests are cancelled when an engine is replaced.
 - One dedicated Kitty OS window is supported. A physical layer move requires a
   live destination pane in the same Kitty instance.
-- The first close request runs WebKit's before-unload flow; a second request or
-  the two-minute safety timeout forces teardown.
+- The first close request runs WebKit's before-unload flow. A second request
+  while it is pending forces teardown; the two-minute timeout cancels the close.
 - Browser UI paths such as uploads, downloads, popups, notifications, and
   permission prompts need live-site testing.
 - Shortcut routing has not been validated against a broad set of Kitty user

@@ -65,8 +65,10 @@ if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
             exit 1
             ;;
     esac
+    runtime_mode=$(stat -c %a -- "$runtime_parent")
     if [ ! -d "$runtime_parent" ] || [ -L "$runtime_parent" ] ||
-       [ "$(stat -c %u -- "$runtime_parent")" != "$uid" ]; then
+       [ "$(stat -c %u -- "$runtime_parent")" != "$uid" ] ||
+       [ $((0$runtime_mode & 077)) -ne 0 ]; then
         printf '%s\n' "XDG_RUNTIME_DIR must be an owner-controlled directory." >&2
         exit 1
     fi

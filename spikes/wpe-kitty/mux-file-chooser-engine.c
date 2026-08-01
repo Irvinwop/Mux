@@ -1,12 +1,21 @@
-#define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
 
 #include "mux-file-chooser-engine.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#define MUX_UPLOAD_MAX_FILES_PER_REQUEST 32u
+#define MUX_UPLOAD_MAX_STAGED_FILES 64u
+#define MUX_UPLOAD_MAX_STAGED_SELECTIONS 16u
+#define MUX_UPLOAD_MAX_FILE_BYTES ((guint64)256 * 1024 * 1024)
+#define MUX_UPLOAD_MAX_STAGED_BYTES ((guint64)512 * 1024 * 1024)
+#define MUX_UPLOAD_COPY_BUFFER_BYTES (128u * 1024u)
+#define MUX_UPLOAD_COPY_DEADLINE_US (15 * G_USEC_PER_SEC)
 
 typedef struct {
     guint64 request_id;
@@ -14,15 +23,72 @@ typedef struct {
     gboolean select_multiple;
 } PendingChooser;
 
+typedef struct {
+    gchar *directory;
+    GPtrArray *file_paths;
+    GPtrArray *item_directories;
+    guint64 bytes;
+} StagedSelection;
+
+typedef struct {
+    dev_t device;
+    ino_t inode;
+} SourceIdentity;
+
 struct _MuxFileChooserBridge {
     WebKitWebView *web_view;
     GHashTable *pending;
+    GPtrArray *staged_selections;
+    guint staged_file_count;
+    guint64 staged_bytes;
     MuxFileChooserSendFunc send_func;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     gulong run_file_chooser_handler;
-    gulong load_changed_handler;
 };
+
+static void
+staged_selection_free(StagedSelection *staged)
+{
+    guint i;
+
+    if (!staged)
+        return;
+    if (staged->file_paths) {
+        for (i = 0; i < staged->file_paths->len; i++) {
+            const gchar *path =
+                g_ptr_array_index(staged->file_paths, i);
+
+            if (path)
+                unlink(path);
+        }
+    }
+    if (staged->item_directories) {
+        for (i = staged->item_directories->len; i > 0; i--) {
+            const gchar *path =
+                g_ptr_array_index(staged->item_directories, i - 1);
+
+            if (path)
+                rmdir(path);
+        }
+    }
+    if (staged->directory)
+        rmdir(staged->directory);
+    g_clear_pointer(&staged->file_paths, g_ptr_array_unref);
+    g_clear_pointer(&staged->item_directories, g_ptr_array_unref);
+    g_free(staged->directory);
+    g_free(staged);
+}
+
+static void
+clear_staged_selections(MuxFileChooserBridge *bridge)
+{
+    if (!bridge->staged_selections)
+        return;
+    g_ptr_array_set_size(bridge->staged_selections, 0);
+    bridge->staged_file_count = 0;
+    bridge->staged_bytes = 0;
+}
 
 static void
 pending_chooser_free(PendingChooser *pending)
@@ -196,17 +262,6 @@ on_run_file_chooser(WebKitWebView *web_view,
     return TRUE;
 }
 
-static void
-on_load_changed(WebKitWebView *web_view,
-                WebKitLoadEvent event,
-                MuxFileChooserBridge *bridge)
-{
-    (void)web_view;
-    if (event == WEBKIT_LOAD_COMMITTED)
-        mux_file_chooser_bridge_cancel_all(
-            bridge, MUX_UI_CANCEL_NAVIGATION, TRUE);
-}
-
 MuxFileChooserBridge *
 mux_file_chooser_bridge_new(WebKitWebView *web_view,
                             MuxFileChooserSendFunc send_func,
@@ -224,6 +279,8 @@ mux_file_chooser_bridge_new(WebKitWebView *web_view,
         g_int64_equal,
         g_free,
         (GDestroyNotify)pending_chooser_free);
+    bridge->staged_selections = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)staged_selection_free);
     bridge->send_func = send_func;
     bridge->user_data = user_data;
     bridge->user_data_destroy = user_data_destroy;
@@ -231,11 +288,6 @@ mux_file_chooser_bridge_new(WebKitWebView *web_view,
         g_signal_connect(web_view,
                          "run-file-chooser",
                          G_CALLBACK(on_run_file_chooser),
-                         bridge);
-    bridge->load_changed_handler =
-        g_signal_connect(web_view,
-                         "load-changed",
-                         G_CALLBACK(on_load_changed),
                          bridge);
     return bridge;
 }
@@ -248,12 +300,11 @@ mux_file_chooser_bridge_free(MuxFileChooserBridge *bridge)
     if (bridge->run_file_chooser_handler)
         g_signal_handler_disconnect(
             bridge->web_view, bridge->run_file_chooser_handler);
-    if (bridge->load_changed_handler)
-        g_signal_handler_disconnect(
-            bridge->web_view, bridge->load_changed_handler);
     mux_file_chooser_bridge_cancel_all(
         bridge, MUX_UI_CANCEL_VIEW_DESTROYED, TRUE);
     g_clear_pointer(&bridge->pending, g_hash_table_unref);
+    clear_staged_selections(bridge);
+    g_clear_pointer(&bridge->staged_selections, g_ptr_array_unref);
     if (bridge->user_data_destroy)
         bridge->user_data_destroy(bridge->user_data);
     g_clear_object(&bridge->web_view);
@@ -261,77 +312,441 @@ mux_file_chooser_bridge_free(MuxFileChooserBridge *bridge)
 }
 
 static gboolean
-validate_paths(const PendingChooser *pending,
-               const GPtrArray *paths,
-               gchar ***validated_out,
-               GError **error)
+set_errno_error(GError **error, const gchar *operation)
 {
-    g_autoptr(GPtrArray) validated =
-        g_ptr_array_new_with_free_func(g_free);
-    g_autoptr(GHashTable) seen =
-        g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    int saved_errno = errno;
+
+    g_set_error(error,
+                G_FILE_ERROR,
+                g_file_error_from_errno(saved_errno),
+                "%s: %s",
+                operation,
+                g_strerror(saved_errno));
+    return FALSE;
+}
+
+static gboolean
+source_identity_seen(const GArray *identities,
+                     const struct stat *status)
+{
+    guint i;
+
+    for (i = 0; i < identities->len; i++) {
+        const SourceIdentity *identity =
+            &g_array_index(identities, SourceIdentity, i);
+
+        if (identity->device == status->st_dev &&
+            identity->inode == status->st_ino)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean
+source_snapshot_unchanged(const struct stat *before,
+                          const struct stat *after)
+{
+    return S_ISREG(after->st_mode) &&
+           before->st_dev == after->st_dev &&
+           before->st_ino == after->st_ino &&
+           before->st_size == after->st_size &&
+           before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+           before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+           before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+}
+
+static gboolean
+write_all(int fd,
+          const guint8 *data,
+          gsize length,
+          gint64 deadline_us,
+          GError **error)
+{
+    gsize offset = 0;
+
+    while (offset < length) {
+        ssize_t written;
+
+        if (g_get_monotonic_time() > deadline_us) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_TIMED_OUT,
+                                "staging selected files exceeded its time budget");
+            return FALSE;
+        }
+        written = write(fd, data + offset, length - offset);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            return set_errno_error(error, "cannot write staged upload");
+        }
+        if (!written) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_FAILED,
+                                "staged upload write made no progress");
+            return FALSE;
+        }
+        offset += (gsize)written;
+    }
+    return TRUE;
+}
+
+static gboolean
+copy_stable_snapshot(int source_fd,
+                     int destination_fd,
+                     const struct stat *before,
+                     gint64 deadline_us,
+                     GError **error)
+{
+    g_autofree guint8 *buffer =
+        g_malloc(MUX_UPLOAD_COPY_BUFFER_BYTES);
+    guint64 remaining = (guint64)before->st_size;
+    struct stat after;
+    struct stat destination;
+    guint8 extra_byte;
+    ssize_t extra;
+
+    while (remaining) {
+        gsize requested = (gsize)MIN(
+            remaining, (guint64)MUX_UPLOAD_COPY_BUFFER_BYTES);
+        ssize_t received;
+
+        if (g_get_monotonic_time() > deadline_us) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_TIMED_OUT,
+                                "staging selected files exceeded its time budget");
+            return FALSE;
+        }
+        received = read(source_fd, buffer, requested);
+        if (received < 0) {
+            if (errno == EINTR)
+                continue;
+            return set_errno_error(error, "cannot read selected file");
+        }
+        if (!received) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_BUSY,
+                                "selected file changed while it was being staged");
+            return FALSE;
+        }
+        if (!write_all(destination_fd,
+                       buffer,
+                       (gsize)received,
+                       deadline_us,
+                       error))
+            return FALSE;
+        remaining -= (guint64)received;
+    }
+
+    do {
+        extra = read(source_fd, &extra_byte, 1);
+    } while (extra < 0 && errno == EINTR);
+    if (extra < 0)
+        return set_errno_error(error, "cannot finish reading selected file");
+    if (extra > 0) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_BUSY,
+                            "selected file grew while it was being staged");
+        return FALSE;
+    }
+    if (fstat(source_fd, &after) < 0)
+        return set_errno_error(error, "cannot revalidate selected file");
+    if (!source_snapshot_unchanged(before, &after)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_BUSY,
+                            "selected file changed while it was being staged");
+        return FALSE;
+    }
+    if (fstat(destination_fd, &destination) < 0)
+        return set_errno_error(error, "cannot validate staged upload");
+    if (!S_ISREG(destination.st_mode) ||
+        destination.st_size != before->st_size) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "staged upload has an unexpected size or type");
+        return FALSE;
+    }
+    if (fchmod(destination_fd, S_IRUSR) < 0)
+        return set_errno_error(error, "cannot make staged upload read-only");
+    return TRUE;
+}
+
+static gboolean
+stage_source_path(MuxFileChooserBridge *bridge,
+                  StagedSelection *staged,
+                  GArray *identities,
+                  int staging_fd,
+                  const gchar *path,
+                  gint64 deadline_us,
+                  GError **error)
+{
+    g_autofree gchar *basename = NULL;
+    g_autofree gchar *item_directory = NULL;
+    g_autofree gchar *staged_path = NULL;
+    gchar item_name[32];
+    struct stat status;
+    SourceIdentity identity;
+    guint64 source_bytes;
+    int source_fd = -1;
+    int item_fd = -1;
+    int destination_fd = -1;
+    gboolean success = FALSE;
+
+    if (!path || !g_utf8_validate(path, -1, NULL) ||
+        !g_path_is_absolute(path) || strlen(path) > MUX_UI_MAX_PATH) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "selected file path must be a bounded absolute UTF-8 path");
+        return FALSE;
+    }
+    source_fd = open(path,
+                     O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (source_fd < 0) {
+        if (errno == ELOOP) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_ARGUMENT,
+                                "symbolic links are not accepted for file uploads");
+            return FALSE;
+        }
+        return set_errno_error(error, "cannot open selected file");
+    }
+    if (fstat(source_fd, &status) < 0) {
+        set_errno_error(error, "cannot inspect selected file");
+        goto out;
+    }
+    if (S_ISDIR(status.st_mode)) {
+        g_set_error_literal(
+            error,
+            G_IO_ERROR,
+            G_IO_ERROR_NOT_SUPPORTED,
+            "directory uploads are rejected because an immutable bounded directory snapshot cannot be guaranteed");
+        goto out;
+    }
+    if (!S_ISREG(status.st_mode)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "selected path is not a regular file");
+        goto out;
+    }
+    if (status.st_size < 0 ||
+        (guint64)status.st_size > MUX_UPLOAD_MAX_FILE_BYTES) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_MESSAGE_TOO_LARGE,
+                            "selected file exceeds the 256 MiB per-file staging limit");
+        goto out;
+    }
+    if (source_identity_seen(identities, &status)) {
+        success = TRUE;
+        goto out;
+    }
+    if (bridge->staged_file_count + staged->file_paths->len >=
+        MUX_UPLOAD_MAX_STAGED_FILES) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "too many upload files are retained by this chooser manager");
+        goto out;
+    }
+    if (bridge->staged_bytes > MUX_UPLOAD_MAX_STAGED_BYTES ||
+        staged->bytes >
+            MUX_UPLOAD_MAX_STAGED_BYTES - bridge->staged_bytes) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "upload snapshot budget is exhausted");
+        goto out;
+    }
+    source_bytes = (guint64)status.st_size;
+    if (source_bytes > MUX_UPLOAD_MAX_STAGED_BYTES -
+                           bridge->staged_bytes - staged->bytes) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "selected files exceed the 512 MiB chooser manager staging limit");
+        goto out;
+    }
+
+    basename = g_path_get_basename(path);
+    if (!basename || !*basename ||
+        g_str_equal(basename, ".") || g_str_equal(basename, "..") ||
+        !g_utf8_validate(basename, -1, NULL)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "selected file has an unsafe basename");
+        goto out;
+    }
+    g_snprintf(item_name,
+               sizeof(item_name),
+               "item-%u",
+               staged->file_paths->len);
+    if (mkdirat(staging_fd, item_name, S_IRWXU) < 0) {
+        set_errno_error(error, "cannot create private upload item directory");
+        goto out;
+    }
+    item_directory = g_build_filename(
+        staged->directory, item_name, NULL);
+    g_ptr_array_add(staged->item_directories,
+                    g_steal_pointer(&item_directory));
+    item_fd = openat(staging_fd,
+                     item_name,
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (item_fd < 0) {
+        set_errno_error(error, "cannot open private upload item directory");
+        goto out;
+    }
+    destination_fd = openat(item_fd,
+                            basename,
+                            O_WRONLY | O_CREAT | O_EXCL |
+                                O_CLOEXEC | O_NOFOLLOW,
+                            S_IRUSR | S_IWUSR);
+    if (destination_fd < 0) {
+        set_errno_error(error, "cannot create staged upload");
+        goto out;
+    }
+    staged_path = g_build_filename(
+        staged->directory, item_name, basename, NULL);
+    g_ptr_array_add(staged->file_paths,
+                    g_steal_pointer(&staged_path));
+    if (!copy_stable_snapshot(source_fd,
+                              destination_fd,
+                              &status,
+                              deadline_us,
+                              error))
+        goto out;
+    if (close(destination_fd) < 0) {
+        destination_fd = -1;
+        set_errno_error(error, "cannot finalize staged upload");
+        goto out;
+    }
+    destination_fd = -1;
+    identity.device = status.st_dev;
+    identity.inode = status.st_ino;
+    g_array_append_val(identities, identity);
+    staged->bytes += source_bytes;
+    success = TRUE;
+
+out:
+    if (destination_fd >= 0)
+        close(destination_fd);
+    if (item_fd >= 0)
+        close(item_fd);
+    if (source_fd >= 0)
+        close(source_fd);
+    return success;
+}
+
+static StagedSelection *
+stage_paths(MuxFileChooserBridge *bridge,
+            const PendingChooser *pending,
+            const GPtrArray *paths,
+            GError **error)
+{
+    StagedSelection *staged = NULL;
+    GArray *identities = NULL;
+    struct stat directory_status;
+    gint64 deadline_us;
+    int staging_fd = -1;
     guint i;
 
     if (!paths || !paths->len ||
         (!pending->select_multiple && paths->len != 1) ||
-        paths->len > MUX_UI_MAX_PATHS) {
+        paths->len > MUX_UI_MAX_PATHS ||
+        paths->len > MUX_UPLOAD_MAX_FILES_PER_REQUEST) {
         g_set_error_literal(error,
                             G_IO_ERROR,
                             G_IO_ERROR_INVALID_ARGUMENT,
                             "invalid number of selected files");
-        return FALSE;
+        return NULL;
+    }
+    if (bridge->staged_selections->len >=
+        MUX_UPLOAD_MAX_STAGED_SELECTIONS) {
+        g_set_error_literal(
+            error,
+            G_IO_ERROR,
+            G_IO_ERROR_NO_SPACE,
+            "the chooser manager already retains 16 upload snapshots");
+        return NULL;
     }
 
+    staged = g_new0(StagedSelection, 1);
+    staged->file_paths = g_ptr_array_new_with_free_func(g_free);
+    staged->item_directories = g_ptr_array_new_with_free_func(g_free);
+    staged->directory = g_dir_make_tmp("mux-upload-XXXXXX", error);
+    if (!staged->directory)
+        goto fail;
+    if (!g_utf8_validate(staged->directory, -1, NULL)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_FILENAME,
+                            "private upload directory is not valid UTF-8");
+        goto fail;
+    }
+    staging_fd = open(staged->directory,
+                      O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (staging_fd < 0) {
+        set_errno_error(error, "cannot open private upload directory");
+        goto fail;
+    }
+    if (fstat(staging_fd, &directory_status) < 0) {
+        set_errno_error(error, "cannot inspect private upload directory");
+        goto fail;
+    }
+    if (!S_ISDIR(directory_status.st_mode) ||
+        directory_status.st_uid != geteuid() ||
+        (directory_status.st_mode & (S_IRWXG | S_IRWXO))) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_PERMISSION_DENIED,
+                            "private upload directory is not owner-only");
+        goto fail;
+    }
+
+    identities = g_array_new(FALSE, FALSE, sizeof(SourceIdentity));
+    deadline_us = g_get_monotonic_time() +
+                  MUX_UPLOAD_COPY_DEADLINE_US;
     for (i = 0; i < paths->len; i++) {
-        const gchar *path = g_ptr_array_index((GPtrArray *)paths, i);
-        gchar *resolved;
-        struct stat status;
+        const gchar *path =
+            g_ptr_array_index((GPtrArray *)paths, i);
 
-        if (!path || !g_path_is_absolute(path)) {
-            g_set_error_literal(error,
-                                G_IO_ERROR,
-                                G_IO_ERROR_INVALID_ARGUMENT,
-                                "selected file path must be absolute");
-            return FALSE;
-        }
-        resolved = realpath(path, NULL);
-        if (!resolved) {
-            g_set_error(error,
-                        G_FILE_ERROR,
-                        g_file_error_from_errno(errno),
-                        "cannot resolve selected file: %s",
-                        g_strerror(errno));
-            return FALSE;
-        }
-        if (!g_utf8_validate(resolved, -1, NULL) ||
-            stat(resolved, &status) < 0 ||
-            !S_ISREG(status.st_mode) ||
-            access(resolved, R_OK) < 0) {
-            g_free(resolved);
-            g_set_error_literal(error,
-                                G_IO_ERROR,
-                                G_IO_ERROR_INVALID_ARGUMENT,
-                                "selected path is not a readable regular file");
-            return FALSE;
-        }
-        if (g_hash_table_contains(seen, resolved)) {
-            g_free(resolved);
-            continue;
-        }
-        g_hash_table_add(seen, g_strdup(resolved));
-        g_ptr_array_add(validated, resolved);
+        if (!stage_source_path(bridge,
+                               staged,
+                               identities,
+                               staging_fd,
+                               path,
+                               deadline_us,
+                               error))
+            goto fail;
     }
-    if (!validated->len) {
+    if (!staged->file_paths->len) {
         g_set_error_literal(error,
                             G_IO_ERROR,
                             G_IO_ERROR_INVALID_ARGUMENT,
                             "no distinct files were selected");
-        return FALSE;
+        goto fail;
     }
-    g_ptr_array_add(validated, NULL);
-    *validated_out = (gchar **)g_ptr_array_free(
-        g_steal_pointer(&validated), FALSE);
-    return TRUE;
+    close(staging_fd);
+    g_array_unref(identities);
+    return staged;
+
+fail:
+    if (staging_fd >= 0)
+        close(staging_fd);
+    if (identities)
+        g_array_unref(identities);
+    staged_selection_free(staged);
+    return NULL;
 }
 
 gboolean
@@ -356,14 +771,24 @@ mux_file_chooser_bridge_handle_payload(MuxFileChooserBridge *bridge,
         if (!pending)
             return TRUE;
         if (response->action == MUX_UI_ACTION_SUBMIT) {
+            StagedSelection *staged;
             g_auto(GStrv) files = NULL;
+            guint i;
 
-            if (!validate_paths(
-                    pending, response->paths, &files, error)) {
+            staged = stage_paths(
+                bridge, pending, response->paths, error);
+            if (!staged) {
                 webkit_file_chooser_request_cancel(pending->request);
                 pending_chooser_free(pending);
                 return FALSE;
             }
+            files = g_new0(gchar *, staged->file_paths->len + 1);
+            for (i = 0; i < staged->file_paths->len; i++)
+                files[i] = g_strdup(
+                    g_ptr_array_index(staged->file_paths, i));
+            bridge->staged_file_count += staged->file_paths->len;
+            bridge->staged_bytes += staged->bytes;
+            g_ptr_array_add(bridge->staged_selections, staged);
             webkit_file_chooser_request_select_files(
                 pending->request, (const gchar *const *)files);
         } else {

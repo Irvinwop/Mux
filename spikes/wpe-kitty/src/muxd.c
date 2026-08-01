@@ -9,6 +9,7 @@
 #include <glib.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -16,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 typedef enum {
@@ -29,9 +31,14 @@ typedef struct {
     int fd;
     ClientKind kind;
     gboolean closing;
+    gboolean close_after_flush;
+    gboolean request_pending;
     gboolean graceful_bye;
     gboolean persistable;
     GString *input;
+    GQueue *output;
+    gsize output_bytes;
+    gsize output_offset;
 
     gchar *id;
     gchar *kitty_window;
@@ -60,10 +67,25 @@ typedef struct {
     gboolean session_dirty;
     gint64 session_write_due_us;
     GMainContext *main_context;
+    GPtrArray *pending_moves;
     MuxdClipboard *clipboard;
     MuxSessionState *session;
     gchar *session_path;
 } Server;
+
+typedef struct {
+    Server *server;
+    Client *control;
+    Client *source;
+    gchar *layer;
+    GPid child_pid;
+    GSource *child_source;
+    GSource *timeout_source;
+    gint64 deadline_us;
+    gboolean timed_out;
+    gboolean cancelled;
+    gboolean source_lost;
+} PendingMove;
 
 #define SESSION_WRITE_DEBOUNCE_US (250 * 1000)
 #define SESSION_WRITE_RETRY_US (1000 * 1000)
@@ -71,6 +93,10 @@ typedef struct {
 #define MAX_PEER_ENVIRONMENT_BYTES (4u * 1024u * 1024u)
 #define MAX_KITTY_SOCKET_BYTES 4096u
 #define MAX_KITTY_WINDOW_ID_BYTES 20u
+#define MAX_CLIENTS 128u
+#define MAX_CLIENT_OUTPUT_BYTES (1024u * 1024u)
+#define MAX_CLIENT_IO_BYTES_PER_TICK (64u * 1024u)
+#define KITTY_MOVE_TIMEOUT_MS 2500u
 
 static volatile sig_atomic_t stop_requested;
 
@@ -318,6 +344,100 @@ static void persist_active_layer_if_eligible(Server *server,
         schedule_session_write(server);
 }
 
+static gboolean client_queue_line(Client *client, const gchar *line)
+{
+    gsize line_length;
+    gsize wire_length;
+    gchar *wire;
+
+    if (client->closing)
+        return FALSE;
+
+    line_length = strlen(line);
+    if (line_length >= MAX_CLIENT_OUTPUT_BYTES) {
+        client->closing = TRUE;
+        return FALSE;
+    }
+    wire_length = line_length + 1u;
+    if (client->output_bytes > MAX_CLIENT_OUTPUT_BYTES - wire_length) {
+        client->closing = TRUE;
+        return FALSE;
+    }
+
+    wire = g_malloc(wire_length);
+    memcpy(wire, line, line_length);
+    wire[line_length] = '\n';
+    g_queue_push_tail(client->output,
+                      g_bytes_new_take(wire, wire_length));
+    client->output_bytes += wire_length;
+    return TRUE;
+}
+
+static gboolean client_send_line(Client *client,
+                                 const gchar *format,
+                                 ...)
+{
+    va_list arguments;
+    g_autofree gchar *line = NULL;
+
+    va_start(arguments, format);
+    line = g_strdup_vprintf(format, arguments);
+    va_end(arguments);
+    return client_queue_line(client, line);
+}
+
+static void client_close_after_flush(Client *client)
+{
+    client->request_pending = FALSE;
+    client->close_after_flush = TRUE;
+    if (client->output_bytes == 0)
+        client->closing = TRUE;
+}
+
+static gboolean client_flush(Client *client)
+{
+    gsize flushed = 0;
+
+    while (!client->closing && !g_queue_is_empty(client->output) &&
+           flushed < MAX_CLIENT_IO_BYTES_PER_TICK) {
+        GBytes *record = g_queue_peek_head(client->output);
+        gsize record_length = 0;
+        const guint8 *record_data = g_bytes_get_data(record,
+                                                     &record_length);
+        gsize remaining = record_length - client->output_offset;
+        gsize send_length = MIN(remaining,
+                                MAX_CLIENT_IO_BYTES_PER_TICK - flushed);
+        ssize_t sent;
+
+        do {
+            sent = send(client->fd,
+                        record_data + client->output_offset,
+                        send_length,
+                        MSG_DONTWAIT | MSG_NOSIGNAL);
+        } while (sent < 0 && errno == EINTR);
+
+        if (sent > 0) {
+            client->output_offset += (gsize)sent;
+            client->output_bytes -= (gsize)sent;
+            flushed += (gsize)sent;
+            if (client->output_offset == record_length) {
+                g_bytes_unref(g_queue_pop_head(client->output));
+                client->output_offset = 0;
+            }
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return TRUE;
+        client->closing = TRUE;
+        return FALSE;
+    }
+
+    if (!client->closing && client->close_after_flush &&
+        client->output_bytes == 0)
+        client->closing = TRUE;
+    return !client->closing;
+}
+
 static void client_free(gpointer data)
 {
     Client *client = data;
@@ -325,6 +445,11 @@ static void client_free(gpointer data)
         close(client->fd);
     if (client->input)
         g_string_free(client->input, TRUE);
+    if (client->output) {
+        while (!g_queue_is_empty(client->output))
+            g_bytes_unref(g_queue_pop_head(client->output));
+        g_queue_free(client->output);
+    }
     g_free(client->id);
     g_free(client->kitty_window);
     g_free(client->kitty_socket);
@@ -410,8 +535,91 @@ static gboolean kitty_window_id_is_valid(const gchar *id)
     return errno != ERANGE && end == id + length && value > 0;
 }
 
-static gboolean kitty_move_view(const Client *source, const Client *target,
-                                gboolean *spawn_failed)
+static void control_error(Client *client, const gchar *message);
+static void broadcast_view(Server *server, Client *view, const gchar *event);
+
+static void pending_move_destroy_source(GSource **source)
+{
+    if (*source == NULL)
+        return;
+    g_source_destroy(*source);
+    g_source_unref(*source);
+    *source = NULL;
+}
+
+static void pending_move_free(gpointer data)
+{
+    PendingMove *move = data;
+
+    pending_move_destroy_source(&move->timeout_source);
+    pending_move_destroy_source(&move->child_source);
+    g_free(move->layer);
+    g_free(move);
+}
+
+static void pending_move_kill(PendingMove *move)
+{
+    if (move->child_pid <= 0)
+        return;
+    while (kill((pid_t)move->child_pid, SIGKILL) < 0 && errno == EINTR)
+        ;
+}
+
+static gboolean kitty_move_timed_out(gpointer user_data)
+{
+    PendingMove *move = user_data;
+
+    move->timed_out = TRUE;
+    pending_move_kill(move);
+    return G_SOURCE_REMOVE;
+}
+
+static void kitty_move_child_exited(GPid child_pid,
+                                    gint wait_status,
+                                    gpointer user_data)
+{
+    PendingMove *move = user_data;
+    Client *control = move->control;
+    Client *source = move->source;
+    gboolean source_live =
+        source != NULL && source->kind == CLIENT_VIEW &&
+        !source->closing && source->fd >= 0;
+    gboolean accepted = g_spawn_check_wait_status(wait_status, NULL);
+
+    pending_move_destroy_source(&move->timeout_source);
+    pending_move_destroy_source(&move->child_source);
+    g_spawn_close_pid(child_pid);
+    move->child_pid = 0;
+
+    if (!move->timed_out && !move->cancelled && accepted && source_live) {
+        replace_string(&source->layer, g_steal_pointer(&move->layer));
+        update_persisted_view(move->server, source);
+        broadcast_view(move->server, source, "UPSERT");
+        if (control != NULL && !control->closing) {
+            client_send_line(control, "OK");
+            client_close_after_flush(control);
+        }
+    } else if (control != NULL && !control->closing) {
+        if (move->timed_out) {
+            control_error(control, "Kitty layer move timed out");
+        } else if (move->source_lost || !source_live) {
+            control_error(control,
+                          "source view disconnected during Kitty layer move");
+        } else if (move->cancelled) {
+            control_error(control, "Kitty layer move was cancelled");
+        } else {
+            control_error(control, "Kitty rejected layer move");
+        }
+    }
+
+    g_ptr_array_remove(move->server->pending_moves, move);
+}
+
+static gboolean kitty_move_view_async(Server *server,
+                                      Client *control,
+                                      Client *source,
+                                      const Client *target,
+                                      const gchar *layer)
 {
     g_autofree gchar *source_match =
         g_strdup_printf("id:%s", source->kitty_window);
@@ -430,26 +638,118 @@ static gboolean kitty_move_view(const Client *source, const Client *target,
         target_tab,
         NULL,
     };
-    gint wait_status = 0;
+    PendingMove *move;
+    GPid child_pid = 0;
 
-    *spawn_failed = FALSE;
-    if (!g_spawn_sync(NULL,
-                      argv,
-                      NULL,
-                      G_SPAWN_SEARCH_PATH |
-                          G_SPAWN_STDIN_FROM_DEV_NULL |
-                          G_SPAWN_STDOUT_TO_DEV_NULL |
-                          G_SPAWN_STDERR_TO_DEV_NULL,
-                      NULL,
-                      NULL,
-                      NULL,
-                      NULL,
-                      &wait_status,
-                      NULL)) {
-        *spawn_failed = TRUE;
+    if (!g_spawn_async(NULL,
+                       argv,
+                       NULL,
+                       G_SPAWN_SEARCH_PATH |
+                           G_SPAWN_DO_NOT_REAP_CHILD |
+                           G_SPAWN_STDIN_FROM_DEV_NULL |
+                           G_SPAWN_STDOUT_TO_DEV_NULL |
+                           G_SPAWN_STDERR_TO_DEV_NULL,
+                       NULL,
+                       NULL,
+                       &child_pid,
+                       NULL))
         return FALSE;
+
+    move = g_new0(PendingMove, 1);
+    move->server = server;
+    move->control = control;
+    move->source = source;
+    move->layer = g_strdup(layer);
+    move->child_pid = child_pid;
+    move->deadline_us =
+        g_get_monotonic_time() + ((gint64)KITTY_MOVE_TIMEOUT_MS * 1000);
+    move->child_source = g_child_watch_source_new(child_pid);
+    g_source_set_callback(move->child_source,
+                          G_SOURCE_FUNC(kitty_move_child_exited),
+                          move,
+                          NULL);
+    g_source_attach(move->child_source, server->main_context);
+    move->timeout_source = g_timeout_source_new(KITTY_MOVE_TIMEOUT_MS);
+    g_source_set_callback(move->timeout_source,
+                          kitty_move_timed_out,
+                          move,
+                          NULL);
+    g_source_attach(move->timeout_source, server->main_context);
+    g_ptr_array_add(server->pending_moves, move);
+    control->request_pending = TRUE;
+    return TRUE;
+}
+
+static gboolean source_has_pending_move(Server *server,
+                                        const Client *source)
+{
+    for (guint i = 0; i < server->pending_moves->len; i++) {
+        PendingMove *move = g_ptr_array_index(server->pending_moves, i);
+
+        if (move->source == source && !move->cancelled)
+            return TRUE;
     }
-    return g_spawn_check_wait_status(wait_status, NULL);
+    return FALSE;
+}
+
+static void pending_moves_detach_client(Server *server, Client *client)
+{
+    for (guint i = 0; i < server->pending_moves->len; i++) {
+        PendingMove *move = g_ptr_array_index(server->pending_moves, i);
+        gboolean affected = FALSE;
+
+        if (move->control == client) {
+            move->control = NULL;
+            affected = TRUE;
+        }
+        if (move->source == client) {
+            move->source = NULL;
+            move->source_lost = TRUE;
+            affected = TRUE;
+        }
+        if (affected && !move->cancelled) {
+            move->cancelled = TRUE;
+            pending_move_destroy_source(&move->timeout_source);
+            pending_move_kill(move);
+        }
+    }
+}
+
+static void pending_moves_shutdown(Server *server)
+{
+    while (server->pending_moves->len > 0) {
+        PendingMove *move = g_ptr_array_index(server->pending_moves, 0);
+        gint wait_status;
+        pid_t waited;
+
+        pending_move_destroy_source(&move->timeout_source);
+        pending_move_destroy_source(&move->child_source);
+        pending_move_kill(move);
+        do {
+            waited = waitpid((pid_t)move->child_pid, &wait_status, 0);
+        } while (waited < 0 && errno == EINTR);
+        g_spawn_close_pid(move->child_pid);
+        move->child_pid = 0;
+        g_ptr_array_remove_index(server->pending_moves, 0);
+    }
+}
+
+static gint pending_move_poll_timeout(Server *server, gint fallback_ms)
+{
+    gint timeout_ms = fallback_ms;
+    gint64 now_us = g_get_monotonic_time();
+
+    for (guint i = 0; i < server->pending_moves->len; i++) {
+        PendingMove *move = g_ptr_array_index(server->pending_moves, i);
+        gint64 remaining_us = move->deadline_us - now_us;
+        gint remaining_ms = remaining_us <= 0
+            ? 0
+            : (gint)MIN((remaining_us + 999) / 1000,
+                        (gint64)G_MAXINT);
+
+        timeout_ms = MIN(timeout_ms, remaining_ms);
+    }
+    return timeout_ms;
 }
 
 static gboolean kitty_focus(Client *client)
@@ -459,24 +759,30 @@ static gboolean kitty_focus(Client *client)
         return FALSE;
     }
 
-    pid_t pid = fork();
-    if (pid < 0)
-        return FALSE;
-    if (pid == 0) {
-        gchar *match = g_strdup_printf("id:%s", client->kitty_window);
-        execlp(
-            "kitten",
-            "kitten",
-            "@",
-            "--to",
-            client->kitty_socket,
-            "focus-window",
-            "--match",
-            match,
-            NULL);
-        _exit(127);
-    }
-    return TRUE;
+    g_autofree gchar *match =
+        g_strdup_printf("id:%s", client->kitty_window);
+    gchar *argv[] = {
+        "kitten",
+        "@",
+        "--to",
+        client->kitty_socket,
+        "focus-window",
+        "--match",
+        match,
+        NULL,
+    };
+
+    return g_spawn_async(NULL,
+                         argv,
+                         NULL,
+                         G_SPAWN_SEARCH_PATH |
+                             G_SPAWN_STDIN_FROM_DEV_NULL |
+                             G_SPAWN_STDOUT_TO_DEV_NULL |
+                             G_SPAWN_STDERR_TO_DEV_NULL,
+                         NULL,
+                         NULL,
+                         NULL,
+                         NULL);
 }
 
 static guint view_count(Server *server)
@@ -490,13 +796,27 @@ static guint view_count(Server *server)
     return count;
 }
 
+static gboolean send_snapshot_line(Client *client,
+                                   const gchar *format,
+                                   ...)
+{
+    va_list arguments;
+    g_autofree gchar *line = NULL;
+
+    va_start(arguments, format);
+    line = g_strdup_vprintf(format, arguments);
+    va_end(arguments);
+
+    return client_queue_line(client, line);
+}
+
 static void broadcast_line(Server *server, const gchar *line)
 {
     for (guint i = 0; i < server->clients->len; i++) {
         Client *client = g_ptr_array_index(server->clients, i);
         if ((client->kind == CLIENT_SUBSCRIBER ||
              client->kind == CLIENT_BAR) &&
-            !mux_send_line(client->fd, "%s", line)) {
+            !client_queue_line(client, line)) {
             client->closing = TRUE;
         }
     }
@@ -588,10 +908,11 @@ static void set_active(Server *server, Client *view)
 
 static void send_snapshot(Server *server, Client *client)
 {
+    gboolean complete;
     gchar *active = mux_encode(server->active_id);
     gchar *layer = mux_encode(server->current_layer);
-    mux_send_line(
-        client->fd,
+    complete = send_snapshot_line(
+        client,
         "BEGIN\t%" G_GUINT64_FORMAT "\t%s\t%s",
         server->revision,
         active,
@@ -601,7 +922,7 @@ static void send_snapshot(Server *server, Client *client)
 
     for (guint i = 0; i < server->clients->len; i++) {
         Client *view = g_ptr_array_index(server->clients, i);
-        if (view->kind != CLIENT_VIEW)
+        if (!complete || view->kind != CLIENT_VIEW)
             continue;
 
         gchar *id = mux_encode(view->id);
@@ -609,8 +930,8 @@ static void send_snapshot(Server *server, Client *client)
         gchar *uri = mux_encode(view->uri);
         gchar *title = mux_encode(view->title);
         gchar *kitty = mux_encode(view->kitty_window);
-        mux_send_line(
-            client->fd,
+        complete = send_snapshot_line(
+            client,
             "VIEW\t%s\t%s\t%s\t%s\t%d\t%s\t%ld",
             id,
             view_layer,
@@ -625,15 +946,16 @@ static void send_snapshot(Server *server, Client *client)
         g_free(view_layer);
         g_free(id);
     }
-    mux_send_line(client->fd, "END");
+    if (complete)
+        send_snapshot_line(client, "END");
 }
 
 static void control_error(Client *client, const gchar *message)
 {
     gchar *encoded = mux_encode(message);
-    mux_send_line(client->fd, "ERR\t%s", encoded);
+    client_send_line(client, "ERR\t%s", encoded);
     g_free(encoded);
-    client->closing = TRUE;
+    client_close_after_flush(client);
 }
 
 static Client *control_target(Server *server, const gchar *encoded)
@@ -659,20 +981,20 @@ static void handle_control(
     const gchar *command = field_count > 1 ? fields[1] : "";
 
     if (g_strcmp0(command, "PING") == 0) {
-        mux_send_line(client->fd, "PONG\t%d", MUX_PROTOCOL_VERSION);
-        client->closing = TRUE;
+        client_send_line(client, "PONG\t%d", MUX_PROTOCOL_VERSION);
+        client_close_after_flush(client);
         return;
     }
     if (g_strcmp0(command, "LIST") == 0) {
         send_snapshot(server, client);
-        client->closing = TRUE;
+        client_close_after_flush(client);
         return;
     }
     if (g_strcmp0(command, "STATUS") == 0) {
         gchar *active = mux_encode(server->active_id);
         gchar *layer = mux_encode(server->current_layer);
-        mux_send_line(
-            client->fd,
+        client_send_line(
+            client,
             "STATUS\t%" G_GUINT64_FORMAT "\t%s\t%s\t%u",
             server->revision,
             active,
@@ -680,7 +1002,7 @@ static void handle_control(
             view_count(server));
         g_free(layer);
         g_free(active);
-        client->closing = TRUE;
+        client_close_after_flush(client);
         return;
     }
     if (g_strcmp0(command, "LAYER") == 0 && field_count >= 3) {
@@ -700,8 +1022,8 @@ static void handle_control(
             set_active(server, view);
             kitty_focus(view);
         }
-        mux_send_line(client->fd, "OK");
-        client->closing = TRUE;
+        client_send_line(client, "OK");
+        client_close_after_flush(client);
         return;
     }
     if (g_strcmp0(command, "FOCUS") == 0 && field_count >= 3) {
@@ -712,8 +1034,8 @@ static void handle_control(
         }
         set_active(server, view);
         kitty_focus(view);
-        mux_send_line(client->fd, "OK");
-        client->closing = TRUE;
+        client_send_line(client, "OK");
+        client_close_after_flush(client);
         return;
     }
     if (g_strcmp0(command, "MOVE") == 0 && field_count >= 4) {
@@ -723,7 +1045,6 @@ static void handle_control(
         gboolean found_live_view = FALSE;
         gboolean found_invalid_identity = FALSE;
         gboolean found_other_kitty = FALSE;
-        gboolean spawn_failed = FALSE;
 
         if (!view) {
             g_free(layer);
@@ -737,8 +1058,8 @@ static void handle_control(
 
         if (g_strcmp0(view->layer, layer) == 0) {
             g_free(layer);
-            mux_send_line(client->fd, "OK");
-            client->closing = TRUE;
+            client_send_line(client, "OK");
+            client_close_after_flush(client);
             return;
         }
         if (view->closing || view->fd < 0) {
@@ -792,20 +1113,22 @@ static void handle_control(
             return;
         }
 
-        if (!kitty_move_view(view, target, &spawn_failed)) {
+        if (source_has_pending_move(server, view)) {
             g_free(layer);
             control_error(client,
-                          spawn_failed
-                              ? "failed to execute Kitty layer move"
-                              : "Kitty rejected layer move");
+                          "source view already has a pending Kitty layer move");
             return;
         }
-
-        replace_string(&view->layer, layer);
-        update_persisted_view(server, view);
-        broadcast_view(server, view, "UPSERT");
-        mux_send_line(client->fd, "OK");
-        client->closing = TRUE;
+        if (!kitty_move_view_async(server,
+                                   client,
+                                   view,
+                                   target,
+                                   layer)) {
+            g_free(layer);
+            control_error(client, "failed to execute Kitty layer move");
+            return;
+        }
+        g_free(layer);
         return;
     }
 
@@ -824,13 +1147,13 @@ static void handle_control(
             return;
         }
         const gchar *argument = field_count >= 4 ? fields[3] : "";
-        if (!mux_send_line(view->fd, "DO\t%s\t%s", command, argument)) {
+        if (!client_send_line(view, "DO\t%s\t%s", command, argument)) {
             control_error(client, "view connection failed");
             view->closing = TRUE;
             return;
         }
-        mux_send_line(client->fd, "OK");
-        client->closing = TRUE;
+        client_send_line(client, "OK");
+        client_close_after_flush(client);
         return;
     }
 
@@ -874,8 +1197,7 @@ static void handle_view(
     }
     if (g_strcmp0(fields[0], "PROMPT") == 0) {
         Client *bar = find_bar(server, client);
-        if (bar) {
-            mux_send_line(bar->fd, "DO\tEDIT\t");
+        if (bar && client_send_line(bar, "DO\tEDIT\t")) {
             kitty_focus(bar);
         }
         return;
@@ -896,7 +1218,7 @@ static void handle_bar(
     if (g_strcmp0(fields[0], "OPEN") == 0 && field_count >= 2) {
         Client *view = find_view(server, server->active_id);
         if (view) {
-            mux_send_line(view->fd, "DO\tOPEN\t%s", fields[1]);
+            client_send_line(view, "DO\tOPEN\t%s", fields[1]);
             kitty_focus(view);
         }
         return;
@@ -969,10 +1291,10 @@ static void handle_line(Server *server, Client *client, const gchar *line)
             assign_transient_view_id(server, client);
         }
         g_autofree gchar *encoded_assigned_id = mux_encode(client->id);
-        mux_send_line(client->fd,
-                      "OK\t%d\t%s",
-                      MUX_PROTOCOL_VERSION,
-                      encoded_assigned_id);
+        client_send_line(client,
+                         "OK\t%d\t%s",
+                         MUX_PROTOCOL_VERSION,
+                         encoded_assigned_id);
         update_persisted_view(server, client);
         broadcast_view(server, client, "UPSERT");
         if (!server->active_id)
@@ -988,8 +1310,10 @@ static void handle_line(Server *server, Client *client, const gchar *line)
         client->layer = mux_decode(fields[5]);
         client->uri = g_strdup("");
         client->title = g_strdup("");
-        mux_send_line(client->fd, "OK\t%d", MUX_PROTOCOL_VERSION);
-        send_snapshot(server, client);
+        if (client_send_line(client,
+                             "OK\t%d",
+                             MUX_PROTOCOL_VERSION))
+            send_snapshot(server, client);
     } else if (client->kind == CLIENT_UNKNOWN &&
                g_strcmp0(fields[0], "SUB") == 0) {
         client->kind = CLIENT_SUBSCRIBER;
@@ -1007,32 +1331,54 @@ static void handle_line(Server *server, Client *client, const gchar *line)
 static void client_read(Server *server, Client *client)
 {
     gchar buffer[8192];
-    ssize_t count;
-    do {
-        count = recv(client->fd, buffer, sizeof(buffer), 0);
-    } while (count < 0 && errno == EINTR);
+    gsize received = 0;
 
-    if (count <= 0) {
+    while (!client->closing && !client->close_after_flush &&
+           !client->request_pending &&
+           received < MAX_CLIENT_IO_BYTES_PER_TICK) {
+        ssize_t count;
+
+        do {
+            count = recv(client->fd,
+                         buffer,
+                         MIN(sizeof(buffer),
+                             MAX_CLIENT_IO_BYTES_PER_TICK - received),
+                         0);
+        } while (count < 0 && errno == EINTR);
+
+        if (count > 0) {
+            received += (gsize)count;
+            g_string_append_len(client->input, buffer, count);
+            if (client->input->len > 1024 * 1024) {
+                client->closing = TRUE;
+                return;
+            }
+
+            while (!client->closing && !client->close_after_flush &&
+                   !client->request_pending) {
+                gchar *newline = memchr(client->input->str,
+                                        '\n',
+                                        client->input->len);
+                if (!newline)
+                    break;
+                gsize line_length =
+                    (gsize)(newline - client->input->str);
+                gchar *line = g_strndup(client->input->str, line_length);
+                g_strchomp(line);
+                g_string_erase(client->input, 0, line_length + 1);
+                handle_line(server, client, line);
+                g_free(line);
+            }
+            continue;
+        }
+        if (count == 0) {
+            client->closing = TRUE;
+            return;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return;
         client->closing = TRUE;
         return;
-    }
-
-    g_string_append_len(client->input, buffer, count);
-    if (client->input->len > 1024 * 1024) {
-        client->closing = TRUE;
-        return;
-    }
-
-    while (!client->closing) {
-        gchar *newline = memchr(client->input->str, '\n', client->input->len);
-        if (!newline)
-            break;
-        gsize line_length = (gsize)(newline - client->input->str);
-        gchar *line = g_strndup(client->input->str, line_length);
-        g_strchomp(line);
-        g_string_erase(client->input, 0, line_length + 1);
-        handle_line(server, client, line);
-        g_free(line);
     }
 }
 
@@ -1042,6 +1388,8 @@ static void remove_closed_clients(Server *server)
         Client *client = g_ptr_array_index(server->clients, (guint)i);
         if (!client->closing)
             continue;
+
+        pending_moves_detach_client(server, client);
 
         if (client->kind == CLIENT_VIEW) {
             if (client->graceful_bye && client->persistable &&
@@ -1071,9 +1419,17 @@ static void remove_closed_clients(Server *server)
 
 static gboolean accept_client(Server *server)
 {
-    int fd = accept4(server->listener, NULL, NULL, SOCK_CLOEXEC);
+    int fd = accept4(server->listener,
+                     NULL,
+                     NULL,
+                     SOCK_CLOEXEC | SOCK_NONBLOCK);
     if (fd < 0)
         return FALSE;
+
+    if (server->clients->len >= MAX_CLIENTS) {
+        close(fd);
+        return FALSE;
+    }
 
     struct ucred credentials;
     socklen_t credentials_size = sizeof(credentials);
@@ -1092,6 +1448,7 @@ static gboolean accept_client(Server *server)
     client->fd = fd;
     client->peer_pid = credentials.pid;
     client->input = g_string_new(NULL);
+    client->output = g_queue_new();
     g_ptr_array_add(server->clients, client);
     return TRUE;
 }
@@ -1221,6 +1578,7 @@ static int run_server(void)
         .listener = -1,
         .lock_fd = -1,
         .clients = g_ptr_array_new_with_free_func(client_free),
+        .pending_moves = g_ptr_array_new_with_free_func(pending_move_free),
         .current_layer = g_strdup("main"),
         .next_transient_id = 1,
         .running = TRUE,
@@ -1232,6 +1590,7 @@ static int run_server(void)
     if (server.listener < 0) {
         g_printerr("muxd: cannot listen: %s\n", g_strerror(errno));
         g_ptr_array_unref(server.clients);
+        g_ptr_array_unref(server.pending_moves);
         g_free(server.current_layer);
         g_main_context_unref(server.main_context);
         return EXIT_FAILURE;
@@ -1267,6 +1626,7 @@ static int run_server(void)
         unlink(server.socket_path);
         close(server.lock_fd);
         g_ptr_array_unref(server.clients);
+        g_ptr_array_unref(server.pending_moves);
         g_free(server.socket_path);
         g_free(server.current_layer);
         g_free(server.session_path);
@@ -1279,7 +1639,7 @@ static int run_server(void)
     signal(SIGTERM, stop_signal);
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_IGN);
+    signal(SIGCHLD, SIG_DFL);
 
     while (server.running && !stop_requested) {
         guint client_count = server.clients->len;
@@ -1289,14 +1649,22 @@ static int run_server(void)
         for (guint i = 0; i < client_count; i++) {
             Client *client = g_ptr_array_index(server.clients, i);
             poll_fds[i + 1].fd = client->fd;
-            poll_fds[i + 1].events = POLLIN;
+            if (!client->closing && !client->close_after_flush &&
+                !client->request_pending)
+                poll_fds[i + 1].events |= POLLIN;
+            if (!client->closing && client->output_bytes > 0)
+                poll_fds[i + 1].events |= POLLOUT;
         }
 
         int result;
         do {
-            result = poll(poll_fds, client_count + 1, 50);
+            result = poll(poll_fds,
+                          client_count + 1,
+                          pending_move_poll_timeout(&server, 50));
         } while (result < 0 && errno == EINTR && !stop_requested);
 
+        while (g_main_context_iteration(server.main_context, FALSE))
+            ;
         if (result > 0) {
             if (poll_fds[0].revents & POLLIN)
                 accept_client(&server);
@@ -1305,6 +1673,8 @@ static int run_server(void)
                 short events = poll_fds[i + 1].revents;
                 if (events & POLLIN)
                     client_read(&server, client);
+                if ((events & POLLOUT) && !client->closing)
+                    client_flush(client);
                 if (events & (POLLHUP | POLLERR | POLLNVAL))
                     client->closing = TRUE;
             }
@@ -1318,12 +1688,14 @@ static int run_server(void)
 
     if (server.session_dirty)
         persist_session_now(&server);
+    pending_moves_shutdown(&server);
     muxd_clipboard_free(server.clipboard);
     g_main_context_unref(server.main_context);
     close(server.listener);
     unlink(server.socket_path);
     close(server.lock_fd);
     g_ptr_array_unref(server.clients);
+    g_ptr_array_unref(server.pending_moves);
     g_free(server.socket_path);
     g_free(server.active_id);
     g_free(server.current_layer);
