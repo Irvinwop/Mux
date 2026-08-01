@@ -27,6 +27,17 @@ gint mux_pane_test_parse_kitty_graphics_response(const guint8 *sequence,
                                                  gsize length,
                                                  guint *image_id,
                                                  gchar **detail);
+gchar *mux_pane_test_build_kitty_frame_command(gboolean image_present,
+                                                guint32 message_flags,
+                                                guint32 width,
+                                                guint32 height,
+                                                guint32 x,
+                                                guint32 y,
+                                                guint32 rectangle_width,
+                                                guint32 rectangle_height,
+                                                guint64 shm_size,
+                                                guint image_id,
+                                                const gchar *encoded_name);
 
 static void
 put_u16(guint8 *target, guint16 value)
@@ -689,6 +700,80 @@ test_kitty_graphics_response_classification(void)
 }
 
 static void
+test_kitty_frame_trusted_overlay_layering(void)
+{
+    static const gchar encoded_name[] = "L211eC1mcmFtZQ==";
+    static const gchar full_expected[] =
+        "\033[H\033_Ga=T,f=32,t=s,s=800,v=600,S=1920000,"
+        "i=77,z=-1,q=0,C=1;L211eC1mcmFtZQ==\033\\";
+    static const gchar partial_expected[] =
+        "\033_Ga=f,f=32,t=s,s=30,v=40,S=4800,i=77,r=1,"
+        "x=10,y=20,X=1,q=0;L211eC1mcmFtZQ==\033\\";
+    g_autofree gchar *initial = NULL;
+    g_autofree gchar *after_resize = NULL;
+    g_autofree gchar *replacement = NULL;
+    g_autofree gchar *partial = NULL;
+
+    initial = mux_pane_test_build_kitty_frame_command(
+        FALSE,
+        MUX_ENGINE_FLAG_NONE,
+        800,
+        600,
+        0,
+        0,
+        800,
+        600,
+        1920000,
+        77,
+        encoded_name);
+    g_assert_cmpstr(initial, ==, full_expected);
+
+    /* delete_image() clears image_present before a resized frame arrives. */
+    after_resize = mux_pane_test_build_kitty_frame_command(
+        FALSE,
+        MUX_ENGINE_FLAG_NONE,
+        800,
+        600,
+        0,
+        0,
+        800,
+        600,
+        1920000,
+        77,
+        encoded_name);
+    g_assert_cmpstr(after_resize, ==, full_expected);
+
+    replacement = mux_pane_test_build_kitty_frame_command(
+        TRUE,
+        MUX_ENGINE_FLAG_FULL_DAMAGE,
+        800,
+        600,
+        0,
+        0,
+        800,
+        600,
+        1920000,
+        77,
+        encoded_name);
+    g_assert_cmpstr(replacement, ==, full_expected);
+
+    partial = mux_pane_test_build_kitty_frame_command(
+        TRUE,
+        MUX_ENGINE_FLAG_NONE,
+        800,
+        600,
+        10,
+        20,
+        30,
+        40,
+        4800,
+        77,
+        encoded_name);
+    g_assert_cmpstr(partial, ==, partial_expected);
+    g_assert_null(strstr(partial, ",z="));
+}
+
+static void
 test_engine_global_view_capacity(void)
 {
     g_assert_true(mux_engine_test_view_capacity(0, 0));
@@ -883,6 +968,8 @@ main(int argc, char **argv)
                     test_engine_error_payload_validation);
     g_test_add_func("/engine-runtime/graphics/kitty-response",
                     test_kitty_graphics_response_classification);
+    g_test_add_func("/engine-runtime/graphics/trusted-overlay-layering",
+                    test_kitty_frame_trusted_overlay_layering);
     g_test_add_func("/engine-runtime/popup/global-view-capacity",
                     test_engine_global_view_capacity);
     g_test_add_func("/engine-runtime/graphics/backpressure-retry",

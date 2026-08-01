@@ -63,6 +63,7 @@
 #define ENGINE_ERROR_DETAIL_MAX_BYTES 4096u
 #define ENGINE_ERROR_WIRE_MAX_BYTES (8u + ENGINE_ERROR_DETAIL_MAX_BYTES)
 #define KITTY_GRAPHICS_RESPONSE_MAX_BYTES 2048u
+#define KITTY_BROWSER_Z_INDEX (-1)
 
 typedef enum {
     KITTY_GRAPHICS_RESPONSE_IGNORE,
@@ -233,6 +234,48 @@ parse_kitty_graphics_response(const guint8 *sequence,
     return KITTY_GRAPHICS_RESPONSE_ERROR;
 }
 
+static gchar *
+build_kitty_frame_command(gboolean image_present,
+                          guint32 message_flags,
+                          guint32 width,
+                          guint32 height,
+                          guint32 x,
+                          guint32 y,
+                          guint32 rectangle_width,
+                          guint32 rectangle_height,
+                          guint64 shm_size,
+                          guint image_id,
+                          const gchar *encoded_name)
+{
+    if (!image_present ||
+        (message_flags & MUX_ENGINE_FLAG_FULL_DAMAGE)) {
+        return g_strdup_printf(
+            "\033[H\033_Ga=T,f=32,t=s,s=%u,v=%u,S=%" G_GUINT64_FORMAT
+            ",i=%u,z=%d,q=0,C=1;%s\033\\",
+            width,
+            height,
+            shm_size,
+            image_id,
+            KITTY_BROWSER_Z_INDEX,
+            encoded_name);
+    }
+
+    /*
+     * a=f edits the root frame in place, so it retains the z-index from the
+     * a=T placement. For a=f, Kitty defines z as an animation frame delay.
+     */
+    return g_strdup_printf(
+        "\033_Ga=f,f=32,t=s,s=%u,v=%u,S=%" G_GUINT64_FORMAT
+        ",i=%u,r=1,x=%u,y=%u,X=1,q=0;%s\033\\",
+        rectangle_width,
+        rectangle_height,
+        shm_size,
+        image_id,
+        x,
+        y,
+        encoded_name);
+}
+
 #ifdef MUX_PANE_LOGIC_TEST
 
 gboolean
@@ -261,6 +304,32 @@ mux_pane_test_parse_kitty_graphics_response(const guint8 *sequence,
                                          length,
                                          image_id,
                                          detail);
+}
+
+gchar *
+mux_pane_test_build_kitty_frame_command(gboolean image_present,
+                                         guint32 message_flags,
+                                         guint32 width,
+                                         guint32 height,
+                                         guint32 x,
+                                         guint32 y,
+                                         guint32 rectangle_width,
+                                         guint32 rectangle_height,
+                                         guint64 shm_size,
+                                         guint image_id,
+                                         const gchar *encoded_name)
+{
+    return build_kitty_frame_command(image_present,
+                                     message_flags,
+                                     width,
+                                     height,
+                                     x,
+                                     y,
+                                     rectangle_width,
+                                     rectangle_height,
+                                     shm_size,
+                                     image_id,
+                                     encoded_name);
 }
 
 #else
@@ -2189,28 +2258,17 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
 
     encoded_name = g_base64_encode((const guchar *)shm_name,
                                    strlen(shm_name));
-    if (!pane->image_present ||
-        (message->flags & MUX_ENGINE_FLAG_FULL_DAMAGE)) {
-        command = g_strdup_printf(
-            "\033[H\033_Ga=T,f=32,t=s,s=%u,v=%u,S=%" G_GUINT64_FORMAT
-            ",i=%u,q=0,C=1;%s\033\\",
-            width,
-            height,
-            shm_size,
-            pane->image_id,
-            encoded_name);
-    } else {
-        command = g_strdup_printf(
-            "\033_Ga=f,f=32,t=s,s=%u,v=%u,S=%" G_GUINT64_FORMAT
-            ",i=%u,r=1,x=%u,y=%u,X=1,q=0;%s\033\\",
-            rectangle_width,
-            rectangle_height,
-            shm_size,
-            pane->image_id,
-            x,
-            y,
-            encoded_name);
-    }
+    command = build_kitty_frame_command(pane->image_present,
+                                        message->flags,
+                                        width,
+                                        height,
+                                        x,
+                                        y,
+                                        rectangle_width,
+                                        rectangle_height,
+                                        shm_size,
+                                        pane->image_id,
+                                        encoded_name);
     {
         g_autoptr(GError) output_error = NULL;
         GBytes *command_bytes = g_bytes_new(command, strlen(command));
