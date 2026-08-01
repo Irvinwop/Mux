@@ -99,6 +99,7 @@ KITTY_SOCKET=
 KITTY_LISTEN_ON=
 KITTY_PUBLIC_KEY_VALUE=
 SNAPSHOT=
+FRAME_ACK_TELEMETRY=
 MUXD_PID=0
 ENGINE_PID=0
 WESTON_PID=0
@@ -106,6 +107,8 @@ HTTP_PID=0
 KITTY_PID=0
 BOOT_PANE_PID=0
 ALT_PANE_PID=0
+BAR_PID=0
+BAR_KITTY_ID=
 declare -a CHILD_PIDS=()
 declare -a CHILD_LABELS=()
 declare -a KITTY_WINDOW_IDS=()
@@ -362,6 +365,63 @@ wait_title() {
     fail "title $expected_title was not observed for $view_id within 20 seconds"
 }
 
+sha256_text() {
+    local digest
+
+    digest=$(printf '%s' "$1" | sha256sum)
+    printf '%s\n' "${digest%% *}"
+}
+
+wait_frame_ack() {
+    local kitty_window=$1
+    local expected_url=$2
+    local expected_title=$3
+    local kitty_hash uri_hash title_hash attempt
+
+    kitty_hash=$(sha256_text "$kitty_window")
+    uri_hash=$(sha256_text "$expected_url")
+    title_hash=$(sha256_text "$expected_title")
+    for (( attempt=0; attempt < 400; attempt++ )); do
+        if awk -F '\t' \
+            -v kitty_hash="$kitty_hash" \
+            -v uri_hash="$uri_hash" \
+            -v title_hash="$title_hash" '
+                $1 == "KITTY_FRAME_ACK" &&
+                $2 ~ /^view=[1-9][0-9]*$/ &&
+                $3 ~ /^serial=[1-9][0-9]*$/ &&
+                $4 == "kitty_sha256=" kitty_hash &&
+                $5 == "uri_sha256=" uri_hash &&
+                $6 == "title_sha256=" title_hash {
+                    found = 1
+                    exit
+                }
+                END { exit found ? 0 : 1 }
+            ' "$FRAME_ACK_TELEMETRY"; then
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "positive Kitty FRAME_ACK was not observed for $expected_title within 20 seconds"
+}
+
+wait_bar_editing() {
+    local kitty_window=$1
+    local capture="$BASE/bar-editing.txt"
+    local attempt
+
+    for (( attempt=0; attempt < 100; attempt++ )); do
+        if kitty_rc get-text --match "id:$kitty_window" --extent=all \
+            >"$capture" 2>>"$LOG_DIR/kitty-actions.log" &&
+            grep -Fq 'URL>' "$capture"; then
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "global URL bar did not enter edit mode after Super+L"
+}
+
 wait_initial_view() {
     local expected_url=$1
     local expected_title=$2
@@ -517,10 +577,26 @@ cat >"$BASE/site/index.html" <<'HTML'
 <title>MUX_SMOKE_BOOT_LOADING</title>
 <script>
 addEventListener("load", () => {
+    document.body.textContent = "Mux boot fixture rendered";
+    document.body.style.background = "#d7f4e8";
     document.title = "MUX_SMOKE_BOOT_LOADED";
 });
 </script>
 <body>Mux boot fixture</body>
+HTML
+
+cat >"$BASE/site/bar.html" <<'HTML'
+<!doctype html>
+<meta charset="utf-8">
+<title>MUX_SMOKE_BAR_LOADING</title>
+<script>
+addEventListener("load", () => {
+    document.body.textContent = "Mux global URL bar fixture rendered";
+    document.body.style.background = "#f7dfb2";
+    document.title = "MUX_SMOKE_BAR_LOADED";
+});
+</script>
+<body>Mux global URL bar fixture</body>
 HTML
 
 cat >"$BASE/site/second.html" <<'HTML'
@@ -529,6 +605,8 @@ cat >"$BASE/site/second.html" <<'HTML'
 <title>MUX_SMOKE_SECOND_LOADING</title>
 <script>
 addEventListener("load", () => {
+    document.body.textContent = "Mux targeted navigation fixture rendered";
+    document.body.style.background = "#c8e3fa";
     document.title = "MUX_SMOKE_SECOND_LOADED";
 });
 </script>
@@ -543,7 +621,7 @@ import sys
 
 path = Path(sys.argv[1])
 old = 'remote_control_password "" detach-window focus-window launch\n'
-new = 'remote_control_password "" detach-window focus-window launch send-key get-text\n'
+new = 'remote_control_password "" detach-window focus-window launch send-key get-text send-text\n'
 text = path.read_text(encoding="ascii")
 if text.count(old) != 1:
     raise SystemExit("temporary Kitty ACL source did not match production config")
@@ -588,9 +666,10 @@ done
 HTTP_PORT=$(<"$PORT_FILE")
 [[ $HTTP_PORT =~ ^[0-9]+$ ]] || fail "invalid fixture port: $HTTP_PORT"
 BOOT_URL="http://127.0.0.1:$HTTP_PORT/index.html"
+BAR_URL="http://127.0.0.1:$HTTP_PORT/bar.html"
 SECOND_URL="http://127.0.0.1:$HTTP_PORT/second.html"
 
-python3 - "$BOOT_URL" "$SECOND_URL" <<'PY'
+python3 - "$BOOT_URL" "$BAR_URL" "$SECOND_URL" <<'PY'
 import sys
 import urllib.request
 
@@ -609,7 +688,10 @@ initial_status=$(run_muxctl status) || fail "muxctl could not reach muxd"
 [[ $initial_status =~ (^|[[:space:]])views=0($|[[:space:]]) ]] ||
     fail "muxd did not begin with zero views: $initial_status"
 
-"$BIN_DIR/mux-engine" \
+FRAME_ACK_TELEMETRY="$LOG_DIR/frame-acks.log"
+: >"$FRAME_ACK_TELEMETRY"
+chmod 600 "$FRAME_ACK_TELEMETRY"
+MUX_SMOKE_FRAME_ACK_FILE="$FRAME_ACK_TELEMETRY" "$BIN_DIR/mux-engine" \
     --profile "$MUX_PROFILE" \
     --socket "$MUX_ENGINE_SOCKET" \
     >"$LOG_DIR/engine.log" 2>&1 &
@@ -660,10 +742,15 @@ BOOT_KITTY_ID=$(record_field "$SNAPSHOT" "$BOOT_VIEW_ID" kitty)
     fail "muxctl pane PID $reported_boot_pid does not match process $BOOT_PANE_PID"
 [[ -n $BOOT_KITTY_ID ]] || fail "muxctl did not report the initial Kitty window ID"
 KITTY_WINDOW_IDS+=("$BOOT_KITTY_ID")
+BAR_KITTY_ID=$(pid_env_value "$BAR_PID" KITTY_WINDOW_ID || true)
+[[ -n $BAR_KITTY_ID ]] || fail "KITTY_WINDOW_ID was not present in the mux-bar environment"
+[[ $BAR_KITTY_ID != "$BOOT_KITTY_ID" ]] ||
+    fail "mux-bar and mux-pane unexpectedly reported the same Kitty window ID"
 
 KITTY_PUBLIC_KEY_VALUE=$(pid_env_value "$BOOT_PANE_PID" KITTY_PUBLIC_KEY || true)
 [[ -n $KITTY_PUBLIC_KEY_VALUE ]] ||
     fail "KITTY_PUBLIC_KEY was not present in the mux-pane environment"
+wait_frame_ack "$BOOT_KITTY_ID" "$BOOT_URL" MUX_SMOKE_BOOT_LOADED
 
 run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "muxctl focus failed for $BOOT_VIEW_ID"
@@ -708,9 +795,23 @@ run_muxctl layer main >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "muxctl layer failed for main"
 wait_layer main "$BOOT_VIEW_ID"
 
+kitty_rc send-key --match "id:$BOOT_KITTY_ID" super+l \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
+    fail "encrypted Super+L injection failed for $BOOT_VIEW_ID"
+wait_bar_editing "$BAR_KITTY_ID"
+kitty_rc send-text --match "id:$BAR_KITTY_ID" "$BAR_URL" \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
+    fail "encrypted URL input failed for the global bar"
+kitty_rc send-key --match "id:$BAR_KITTY_ID" enter \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
+    fail "encrypted Enter injection failed for the global bar"
+wait_title "$BOOT_VIEW_ID" "$BAR_URL" MUX_SMOKE_BAR_LOADED
+wait_frame_ack "$BOOT_KITTY_ID" "$BAR_URL" MUX_SMOKE_BAR_LOADED
+
 run_muxctl open "$BOOT_VIEW_ID" "$SECOND_URL" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "targeted navigation failed for $BOOT_VIEW_ID"
 wait_title "$BOOT_VIEW_ID" "$SECOND_URL" MUX_SMOKE_SECOND_LOADED
+wait_frame_ack "$BOOT_KITTY_ID" "$SECOND_URL" MUX_SMOKE_SECOND_LOADED
 
 run_muxctl focus "$ALT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "muxctl focus failed for $ALT_VIEW_ID"
@@ -734,8 +835,7 @@ final_status=$(run_muxctl status) || fail "muxctl status failed after pane closu
 pid_alive "$ENGINE_PID" || fail "central engine exited after its last view closed"
 pid_alive "$MUXD_PID" || fail "muxd exited after its last view closed"
 
-printf 'runtime-smoke: JavaScript title, processes, focus, layers, navigation, and graceful close passed\n'
-printf 'runtime-smoke: Kitty pixel FRAME_ACK delivery is not observable and is not proved\n'
+printf 'runtime-smoke: JavaScript title, positive Kitty FRAME_ACK, processes, focus, layers, global-bar and targeted navigation, and graceful close passed\n'
 
 teardown_children
 [[ ! -S $MUX_ENGINE_SOCKET ]] || fail "engine socket remained after shutdown"

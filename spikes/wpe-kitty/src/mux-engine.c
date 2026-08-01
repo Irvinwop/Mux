@@ -223,6 +223,8 @@ struct _EngineView {
     guint64 pending_frame_serial;
     guint64 retired_frame_serial;
     gchar *pending_shm_name;
+    gchar *pending_frame_uri;
+    gchar *pending_frame_title;
     gsize pending_shm_size;
     guint frame_timeout_id;
     guint frame_retry_id;
@@ -249,6 +251,7 @@ struct _Engine {
     WebKitNetworkSession *ephemeral_session;
     int listen_fd;
     int lock_fd;
+    int smoke_frame_ack_fd;
     guint listen_watch_id;
     guint sigint_watch_id;
     guint sigterm_watch_id;
@@ -281,6 +284,122 @@ typedef struct {
 #define MUX_TYPE_PLATFORM_VIEW (mux_platform_view_get_type())
 
 static Engine *display_engine;
+
+static gboolean
+smoke_frame_ack_telemetry_open(Engine *engine, GError **error)
+{
+    const gchar *path = g_getenv("MUX_SMOKE_FRAME_ACK_FILE");
+    struct stat status;
+    int fd;
+
+    if (!path || !*path)
+        return TRUE;
+    if (!g_path_is_absolute(path)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "MUX_SMOKE_FRAME_ACK_FILE must be an absolute path");
+        return FALSE;
+    }
+
+    fd = open(path,
+              O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "open MUX_SMOKE_FRAME_ACK_FILE: %s",
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (fstat(fd, &status) < 0) {
+        int saved_errno = errno;
+
+        close(fd);
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "inspect MUX_SMOKE_FRAME_ACK_FILE: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (!S_ISREG(status.st_mode) ||
+        status.st_uid != getuid() ||
+        (status.st_mode & 0077) != 0) {
+        close(fd);
+        g_set_error_literal(
+            error,
+            G_IO_ERROR,
+            G_IO_ERROR_PERMISSION_DENIED,
+            "MUX_SMOKE_FRAME_ACK_FILE must be an owner-only regular file");
+        return FALSE;
+    }
+
+    engine->smoke_frame_ack_fd = fd;
+    return TRUE;
+}
+
+static void
+smoke_frame_telemetry_write(EngineView *view,
+                            const gchar *event,
+                            guint64 serial)
+{
+    Engine *engine = view->engine;
+    g_autofree gchar *kitty_hash = NULL;
+    g_autofree gchar *uri_hash = NULL;
+    g_autofree gchar *title_hash = NULL;
+    g_autofree gchar *record = NULL;
+    const gchar *cursor;
+    gsize remaining;
+
+    if (engine->smoke_frame_ack_fd < 0)
+        return;
+
+    kitty_hash = g_compute_checksum_for_string(
+        G_CHECKSUM_SHA256,
+        view->owner && view->owner->kitty_window
+            ? view->owner->kitty_window
+            : "",
+        -1);
+    uri_hash = g_compute_checksum_for_string(
+        G_CHECKSUM_SHA256,
+        view->pending_frame_uri ? view->pending_frame_uri : "",
+        -1);
+    title_hash = g_compute_checksum_for_string(
+        G_CHECKSUM_SHA256,
+        view->pending_frame_title ? view->pending_frame_title : "",
+        -1);
+    record = g_strdup_printf(
+        "%s\tview=%" G_GUINT64_FORMAT
+        "\tserial=%" G_GUINT64_FORMAT
+        "\tkitty_sha256=%s\turi_sha256=%s\ttitle_sha256=%s\n",
+        event,
+        view->id,
+        serial,
+        kitty_hash,
+        uri_hash,
+        title_hash);
+
+    cursor = record;
+    remaining = strlen(record);
+    while (remaining) {
+        ssize_t written = write(engine->smoke_frame_ack_fd,
+                                cursor,
+                                remaining);
+
+        if (written > 0) {
+            cursor += written;
+            remaining -= (gsize)written;
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        close(engine->smoke_frame_ack_fd);
+        engine->smoke_frame_ack_fd = -1;
+        return;
+    }
+}
+
 static gboolean mux_platform_render_buffer(WPEView *platform_view,
                                            WPEBuffer *buffer,
                                            const WPERectangle *damage_rects,
@@ -1117,6 +1236,7 @@ popup_create(WebKitWebView *parent,
         return NULL;
     }
     child->engine = engine;
+    child->hidden = TRUE;
     child->layer = g_strdup(parent_view->layer);
     child->width = parent_view->width;
     child->height = parent_view->height;
@@ -1475,6 +1595,8 @@ engine_view_clear_pending_frame(EngineView *view)
         shm_unlink(view->pending_shm_name);
         g_clear_pointer(&view->pending_shm_name, g_free);
     }
+    g_clear_pointer(&view->pending_frame_uri, g_free);
+    g_clear_pointer(&view->pending_frame_title, g_free);
     if (view->pending_shm_size) {
         engine_frame_bytes_release(view->engine,
                                    view->pending_shm_size);
@@ -1644,6 +1766,15 @@ engine_view_send_frame(EngineView *view)
     view->pending_frame_serial = serial;
     view->pending_shm_name = shm_name;
     view->pending_shm_size = shm_size;
+    if (view->engine->smoke_frame_ack_fd >= 0) {
+        view->pending_frame_uri = g_strdup(
+            webkit_web_view_get_uri(view->web_view));
+        view->pending_frame_title = g_strdup(
+            webkit_web_view_get_title(view->web_view));
+        smoke_frame_telemetry_write(view,
+                                    "KITTY_FRAME_SENT",
+                                    serial);
+    }
     view->frame_timeout_id = g_timeout_add_seconds(30,
                                                    frame_timeout,
                                                    view);
@@ -1704,7 +1835,7 @@ engine_view_update_pixels(EngineView *view,
                           guint damage_count)
 {
     GError *error = NULL;
-    g_autoptr(GBytes) bytes = NULL;
+    GBytes *bytes = NULL;
     const guint8 *source;
     gsize source_size;
     guint source_stride;
@@ -2369,6 +2500,7 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
     if (!view) {
         view = g_new0(EngineView, 1);
         view->engine = engine;
+        view->hidden = TRUE;
         view->owner = client;
         view->id = engine->next_view_id++;
         view->layer = *layer ? layer : g_strdup("main");
@@ -3433,6 +3565,9 @@ handle_frame_ack(Client *client, const MuxEngineMessage *request)
         return TRUE;
     }
 
+    smoke_frame_telemetry_write(view,
+                                "KITTY_FRAME_ACK",
+                                request->serial);
     engine_view_clear_pending_frame(view);
     view->frame_rejection_count = 0;
     view->frame_backpressure_count = 0;
@@ -4215,6 +4350,8 @@ engine_clear(Engine *engine)
     g_clear_pointer(&engine->browser_store, mux_browser_store_free);
     if (engine->listen_fd >= 0)
         close(engine->listen_fd);
+    if (engine->smoke_frame_ack_fd >= 0)
+        close(engine->smoke_frame_ack_fd);
     if (engine->socket_bound)
         unlink(engine->socket_path);
     if (engine->lock_fd >= 0)
@@ -4295,6 +4432,7 @@ main(int argc, char **argv)
     Engine engine = {
         .listen_fd = -1,
         .lock_fd = -1,
+        .smoke_frame_ack_fd = -1,
         .next_view_id = 1,
     };
 
@@ -4377,6 +4515,7 @@ main(int argc, char **argv)
     }
 
     if (!write_lock_pid(&engine, &error) ||
+        !smoke_frame_ack_telemetry_open(&engine, &error) ||
         !initialize_browser(&engine, &error)) {
         g_printerr("mux-engine: %s\n", error->message);
         g_clear_error(&error);
