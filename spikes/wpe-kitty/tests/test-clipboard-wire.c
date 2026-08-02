@@ -1382,6 +1382,7 @@ test_timeout_semantics(void)
 typedef struct {
     GPtrArray *packets;
     GPtrArray *failure_operations;
+    GPtrArray *failure_messages;
     guint failures;
     guint would_block_outputs;
     guint failed_outputs;
@@ -1429,6 +1430,8 @@ collect_kitty_failure(MuxKittyClipboard *clipboard,
     sink->failures++;
     g_ptr_array_add(sink->failure_operations,
                     g_strdup(operation != NULL ? operation : ""));
+    g_ptr_array_add(sink->failure_messages,
+                    g_strdup(error != NULL ? error->message : ""));
 }
 
 static void
@@ -1438,6 +1441,7 @@ kitty_sink_init(KittyClipboardSink *sink)
         g_ptr_array_new_with_free_func((GDestroyNotify)g_bytes_unref);
     sink->failure_operations =
         g_ptr_array_new_with_free_func(g_free);
+    sink->failure_messages = g_ptr_array_new_with_free_func(g_free);
 }
 
 static void
@@ -1445,6 +1449,7 @@ kitty_sink_clear(KittyClipboardSink *sink)
 {
     g_clear_pointer(&sink->packets, g_ptr_array_unref);
     g_clear_pointer(&sink->failure_operations, g_ptr_array_unref);
+    g_clear_pointer(&sink->failure_messages, g_ptr_array_unref);
 }
 
 static gboolean
@@ -1515,6 +1520,19 @@ kitty_sink_first_write_id(const KittyClipboardSink *sink, guint start)
             return g_strndup(id, end - id);
     }
     return NULL;
+}
+
+static void
+kitty_assert_packet_text(const KittyClipboardSink *sink,
+                         guint index,
+                         const gchar *expected)
+{
+    GBytes *packet = g_ptr_array_index(sink->packets, index);
+    gsize length = 0;
+    const guint8 *data = g_bytes_get_data(packet, &length);
+
+    g_assert_cmpuint(length, ==, strlen(expected));
+    g_assert_cmpint(memcmp(data, expected, length), ==, 0);
 }
 
 static MuxClipboardSnapshot *
@@ -1604,7 +1622,7 @@ static void
 kitty_ack_write(MuxKittyClipboard *clipboard, const gchar *id)
 {
     g_autofree gchar *response = g_strdup_printf(
-        "\033]5522;type=write:status=DONE:id=%s;\033\\",
+        "\033]5522;type=write:status=DONE:id=%s\033\\",
         id);
     g_autoptr(GError) error = NULL;
 
@@ -1620,7 +1638,7 @@ static void
 kitty_reject_write(MuxKittyClipboard *clipboard, const gchar *id)
 {
     g_autofree gchar *response = g_strdup_printf(
-        "\033]5522;type=write:status=EIO:id=%s;\033\\",
+        "\033]5522;type=write:status=EIO:id=%s\033\\",
         id);
     g_autoptr(GError) error = NULL;
 
@@ -1630,6 +1648,68 @@ kitty_reject_write(MuxKittyClipboard *clipboard, const gchar *id)
         strlen(response),
         &error));
     g_assert_no_error(error);
+}
+
+static void
+test_kitty_write_matches_official_framing(void)
+{
+    static const gchar plain[] = "plain";
+    static const gchar html[] = "<b>plain</b>";
+    KittyClipboardSink sink = { 0 };
+    g_autoptr(MuxKittyClipboard) clipboard = NULL;
+    g_autoptr(MuxClipboardSnapshot) snapshot = NULL;
+    g_autoptr(GError) error = NULL;
+    g_autofree gchar *id = NULL;
+    g_autofree gchar *name64 = NULL;
+    g_autofree gchar *plain_mime64 = NULL;
+    g_autofree gchar *plain64 = NULL;
+    g_autofree gchar *html_mime64 = NULL;
+    g_autofree gchar *html64 = NULL;
+    g_autofree gchar *expected = NULL;
+
+    kitty_sink_init(&sink);
+    clipboard = mux_kitty_clipboard_new(collect_kitty_packet,
+                                        NULL,
+                                        collect_kitty_failure,
+                                        &sink,
+                                        NULL);
+    snapshot = kitty_text_snapshot_new(19, plain, html);
+    g_assert_true(mux_kitty_clipboard_publish(
+        clipboard, MUX_OSC5522_LOCATION_CLIPBOARD, snapshot, &error));
+    g_assert_no_error(error);
+    g_assert_cmpuint(sink.packets->len, ==, 4U);
+
+    id = kitty_sink_first_write_id(&sink, 0);
+    g_assert_nonnull(id);
+    name64 = g_base64_encode((const guchar *)"Mux browser",
+                             strlen("Mux browser"));
+    expected = g_strdup_printf(
+        "\033]5522;type=write:id=%s:name=%s;\033\\", id, name64);
+    kitty_assert_packet_text(&sink, 0, expected);
+
+    plain_mime64 = g_base64_encode((const guchar *)"text/plain",
+                                    strlen("text/plain"));
+    plain64 = g_base64_encode((const guchar *)plain, strlen(plain));
+    g_free(expected);
+    expected = g_strdup_printf("\033]5522;type=wdata:mime=%s;%s\033\\",
+                               plain_mime64,
+                               plain64);
+    kitty_assert_packet_text(&sink, 1, expected);
+
+    html_mime64 = g_base64_encode((const guchar *)"text/html",
+                                   strlen("text/html"));
+    html64 = g_base64_encode((const guchar *)html, strlen(html));
+    g_free(expected);
+    expected = g_strdup_printf("\033]5522;type=wdata:mime=%s;%s\033\\",
+                               html_mime64,
+                               html64);
+    kitty_assert_packet_text(&sink, 2, expected);
+    kitty_assert_packet_text(&sink, 3, "\033]5522;type=wdata;\033\\");
+
+    kitty_ack_write(clipboard, id);
+    g_assert_false(mux_kitty_clipboard_write_pending(clipboard));
+    g_assert_cmpuint(sink.failures, ==, 0);
+    kitty_sink_clear(&sink);
 }
 
 static void
@@ -1734,6 +1814,8 @@ test_kitty_write_rejection_promotes_latest(void)
     g_assert_nonnull(active_id);
     kitty_reject_write(clipboard, active_id);
     g_assert_cmpuint(sink.failures, ==, 1);
+    g_assert_nonnull(g_strstr_len(
+        g_ptr_array_index(sink.failure_messages, 0), -1, "EIO"));
     g_assert_true(mux_kitty_clipboard_write_pending(clipboard));
 
     winning_start = sink.packets->len;
@@ -2010,6 +2092,7 @@ typedef struct {
     gboolean destroy_on_observe;
     gboolean disable_on_observe;
     gboolean fail_terminal_output_once;
+    const gchar *terminal_failure_message;
     MuxClipboardPaneLink **owned_link;
 } PaneLinkSink;
 
@@ -2027,7 +2110,9 @@ pane_link_terminal_output(MuxClipboardPaneLink *link,
         g_set_error_literal(error,
                             G_IO_ERROR,
                             G_IO_ERROR_FAILED,
-                            "forced terminal publication failure");
+                            sink->terminal_failure_message != NULL
+                                ? sink->terminal_failure_message
+                                : "forced terminal publication failure");
         return FALSE;
     }
     g_ptr_array_add(sink->terminal_packets, g_bytes_ref(packet));
@@ -2181,6 +2266,35 @@ assert_pane_link_result(PaneLinkSink *sink,
     mux_clipboard_wire_record_clear(&result);
 }
 
+static gchar *
+pane_link_result_reason(PaneLinkSink *sink, guint index)
+{
+    GBytes *packet = g_ptr_array_index(sink->wire_packets, index);
+    MuxClipboardWireRecord result = { 0 };
+    g_autoptr(GError) error = NULL;
+    const guint8 *reason;
+    gsize packet_length;
+    gsize reason_length;
+    const guint8 *packet_data = g_bytes_get_data(packet, &packet_length);
+    gchar *copy;
+
+    g_assert_true(mux_clipboard_wire_record_decode(packet_data,
+                                                   packet_length,
+                                                   &result,
+                                                   &error));
+    g_assert_no_error(error);
+    g_assert_cmpint(result.type, ==, MUX_CLIPBOARD_WIRE_REMOTE_ERROR);
+    g_assert_nonnull(result.payload);
+    reason = g_bytes_get_data(result.payload, &reason_length);
+    g_assert_true(g_utf8_validate((const gchar *)reason,
+                                  reason_length,
+                                  NULL));
+    g_assert_null(memchr(reason, '\0', reason_length));
+    copy = g_strndup((const gchar *)reason, reason_length);
+    mux_clipboard_wire_record_clear(&result);
+    return copy;
+}
+
 static void
 test_pane_link_waits_for_kitty_completion(void)
 {
@@ -2241,7 +2355,7 @@ test_pane_link_waits_for_kitty_completion(void)
     kitty_sink.packets = sink.terminal_packets;
     id = kitty_sink_first_write_id(&kitty_sink, 0);
     g_assert_nonnull(id);
-    done = g_strdup_printf("\033]5522;type=write:status=DONE:id=%s;\033\\",
+    done = g_strdup_printf("\033]5522;type=write:status=DONE:id=%s\033\\",
                            id);
     g_assert_true(mux_clipboard_pane_link_handle_osc(
         link,
@@ -2280,6 +2394,8 @@ test_pane_link_rejects_busy_and_failed_writes(void)
     KittyClipboardSink kitty_sink = { 0 };
     g_autofree gchar *id = NULL;
     g_autofree gchar *rejected = NULL;
+    g_autofree gchar *busy_reason = NULL;
+    g_autofree gchar *rejected_reason = NULL;
 
     sink.terminal_packets = g_ptr_array_new_with_free_func(
         (GDestroyNotify)g_bytes_unref);
@@ -2304,12 +2420,16 @@ test_pane_link_rejects_busy_and_failed_writes(void)
                             0,
                             MUX_CLIPBOARD_WIRE_REMOTE_ERROR,
                             9003);
+    busy_reason = pane_link_result_reason(&sink, 0);
+    g_assert_cmpstr(busy_reason,
+                    ==,
+                    "Kitty clipboard write is already pending");
     g_assert_cmpuint(sink.observations, ==, 0);
 
     kitty_sink.packets = sink.terminal_packets;
     id = kitty_sink_first_write_id(&kitty_sink, 0);
     g_assert_nonnull(id);
-    rejected = g_strdup_printf("\033]5522;type=write:status=EIO:id=%s;\033\\",
+    rejected = g_strdup_printf("\033]5522;type=write:status=EIO:id=%s\033\\",
                                id);
     g_assert_true(mux_clipboard_pane_link_handle_osc(
         link,
@@ -2322,6 +2442,8 @@ test_pane_link_rejects_busy_and_failed_writes(void)
                             1,
                             MUX_CLIPBOARD_WIRE_REMOTE_ERROR,
                             9002);
+    rejected_reason = pane_link_result_reason(&sink, 1);
+    g_assert_nonnull(g_strstr_len(rejected_reason, -1, "EIO"));
     g_assert_cmpuint(sink.observations, ==, 0);
 
     g_ptr_array_unref(sink.wire_packets);
@@ -2360,7 +2482,7 @@ test_pane_link_callback_destruction_and_reentrancy(void)
     kitty_sink.packets = sink.terminal_packets;
     id = kitty_sink_first_write_id(&kitty_sink, 0);
     g_assert_nonnull(id);
-    done = g_strdup_printf("\033]5522;type=write:status=DONE:id=%s;\033\\",
+    done = g_strdup_printf("\033]5522;type=write:status=DONE:id=%s\033\\",
                            id);
     g_assert_true(mux_clipboard_pane_link_handle_osc(
         link,
@@ -2413,7 +2535,7 @@ test_pane_link_observe_disable_is_reentrant_safe(void)
     kitty_sink.packets = sink.terminal_packets;
     id = kitty_sink_first_write_id(&kitty_sink, 0);
     g_assert_nonnull(id);
-    done = g_strdup_printf("\033]5522;type=write:status=DONE:id=%s;\033\\",
+    done = g_strdup_printf("\033]5522;type=write:status=DONE:id=%s\033\\",
                            id);
     g_assert_true(mux_clipboard_pane_link_handle_osc(
         link,
@@ -2445,6 +2567,8 @@ test_pane_link_publication_failure_is_recoverable(void)
     KittyClipboardSink kitty_sink = { 0 };
     g_autofree gchar *id = NULL;
     g_autofree gchar *done = NULL;
+    g_autofree gchar *long_failure = NULL;
+    g_autofree gchar *failure_reason = NULL;
 
     sink.terminal_packets = g_ptr_array_new_with_free_func(
         (GDestroyNotify)g_bytes_unref);
@@ -2461,6 +2585,8 @@ test_pane_link_publication_failure_is_recoverable(void)
                                        NULL);
     snapshot = kitty_text_snapshot_new(83, "plain", "<b>plain</b>");
 
+    long_failure = g_strnfill(2048, 'x');
+    sink.terminal_failure_message = long_failure;
     sink.fail_terminal_output_once = TRUE;
     feed_engine_snapshot(link, 9011, snapshot);
     g_assert_cmpuint(sink.wire_packets->len, ==, 1);
@@ -2468,12 +2594,14 @@ test_pane_link_publication_failure_is_recoverable(void)
                             0,
                             MUX_CLIPBOARD_WIRE_REMOTE_ERROR,
                             9011);
+    failure_reason = pane_link_result_reason(&sink, 0);
+    g_assert_cmpuint(strlen(failure_reason), ==, 512U);
 
     feed_engine_snapshot(link, 9012, snapshot);
     kitty_sink.packets = sink.terminal_packets;
     id = kitty_sink_first_write_id(&kitty_sink, 0);
     g_assert_nonnull(id);
-    done = g_strdup_printf("\033]5522;type=write:status=DONE:id=%s;\033\\",
+    done = g_strdup_printf("\033]5522;type=write:status=DONE:id=%s\033\\",
                            id);
     g_assert_true(mux_clipboard_pane_link_handle_osc(
         link,
@@ -2509,6 +2637,8 @@ main(int argc, char **argv)
                     test_timeout_semantics);
     g_test_add_func("/clipboard/kitty-write/incremental-bounds",
                     test_kitty_write_is_incremental_and_bounded);
+    g_test_add_func("/clipboard/kitty-write/official-framing",
+                    test_kitty_write_matches_official_framing);
     g_test_add_func("/clipboard/kitty-write/latest-wins",
                     test_kitty_write_queue_is_bounded_latest_wins);
     g_test_add_func("/clipboard/kitty-write/retry-would-block",

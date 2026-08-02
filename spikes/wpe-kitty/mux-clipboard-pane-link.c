@@ -3,12 +3,15 @@
 
 #include <string.h>
 
+#define MUX_CLIPBOARD_REMOTE_ERROR_MAX_BYTES 512U
+
 typedef struct {
     guint64 transaction_id;
     guint32 flags;
     gchar *source_origin;
     guint64 source_view_id;
     MuxClipboardSnapshot *snapshot;
+    gchar *rejection_reason;
     gboolean observed;
     gboolean rejected;
 } PendingEngineWrite;
@@ -60,23 +63,65 @@ pending_engine_write_free(PendingEngineWrite *pending)
     if (pending == NULL)
         return;
     g_free(pending->source_origin);
+    g_free(pending->rejection_reason);
     mux_clipboard_snapshot_unref(pending->snapshot);
     g_free(pending);
+}
+
+static gchar *
+bounded_failure_reason(const gchar *message)
+{
+    g_autofree gchar *valid = NULL;
+    gsize length;
+    gsize i;
+
+    if (message == NULL || message[0] == '\0')
+        return NULL;
+    valid = g_utf8_make_valid(message, -1);
+    length = MIN(strlen(valid),
+                 (gsize)MUX_CLIPBOARD_REMOTE_ERROR_MAX_BYTES);
+    while (length > 0 && !g_utf8_validate(valid, length, NULL))
+        length--;
+    for (i = 0; i < length; i++) {
+        if ((guchar)valid[i] < 0x20 || (guchar)valid[i] == 0x7f)
+            valid[i] = ' ';
+    }
+    return g_strndup(valid, length);
+}
+
+static void
+set_pending_rejection(PendingEngineWrite *pending, const gchar *reason)
+{
+    gchar *bounded;
+
+    if (pending == NULL)
+        return;
+    bounded = bounded_failure_reason(reason);
+    g_free(pending->rejection_reason);
+    pending->rejection_reason = bounded;
+    pending->rejected = TRUE;
 }
 
 static gboolean
 send_engine_result(MuxClipboardPaneLink *link,
                    MuxClipboardWireType type,
                    guint64 transaction_id,
+                   const gchar *reason,
                    GError **error)
 {
+    g_autoptr(GBytes) payload = NULL;
     MuxClipboardWireRecord record = {
         .type = type,
         .transaction_id = transaction_id
     };
-    GBytes *packet = mux_clipboard_wire_record_encode(&record, error);
+    GBytes *packet;
     gboolean result;
 
+    if (reason != NULL && reason[0] != '\0') {
+        payload = g_bytes_new(reason, strlen(reason));
+        record.payload = payload;
+    }
+    packet = mux_clipboard_wire_record_encode(&record, error);
     if (packet == NULL)
         return FALSE;
     result = link->wire_output_func(link,
@@ -88,17 +133,24 @@ send_engine_result(MuxClipboardPaneLink *link,
 }
 
 static gboolean
-reject_pending_engine_write(MuxClipboardPaneLink *link, GError **error)
+reject_pending_engine_write(MuxClipboardPaneLink *link,
+                            const gchar *fallback_reason,
+                            GError **error)
 {
     PendingEngineWrite *pending = link->pending_engine_write;
+    const gchar *reason;
     gboolean result;
 
     if (pending == NULL)
         return TRUE;
     link->pending_engine_write = NULL;
+    reason = pending->rejection_reason != NULL
+                 ? pending->rejection_reason
+                 : fallback_reason;
     result = send_engine_result(link,
                                 MUX_CLIPBOARD_WIRE_REMOTE_ERROR,
                                 pending->transaction_id,
+                                reason,
                                 error);
     pending_engine_write_free(pending);
     return result;
@@ -114,7 +166,8 @@ complete_pending_engine_write(MuxClipboardPaneLink *link, GError **error)
     if (pending == NULL || mux_kitty_clipboard_write_pending(link->kitty))
         return TRUE;
     if (pending->rejected)
-        return reject_pending_engine_write(link, error);
+        return reject_pending_engine_write(
+            link, "Kitty rejected clipboard transaction", error);
     transaction_id = pending->transaction_id;
     if (!pending->observed &&
         (pending->flags & MUX_CLIPBOARD_WIRE_FLAG_HISTORY) &&
@@ -134,6 +187,7 @@ complete_pending_engine_write(MuxClipboardPaneLink *link, GError **error)
     result = send_engine_result(link,
                                 MUX_CLIPBOARD_WIRE_ACK,
                                 transaction_id,
+                                NULL,
                                 error);
     pending_engine_write_free(pending);
     return result;
@@ -193,8 +247,10 @@ kitty_failure(MuxKittyClipboard *clipboard,
 
     (void)clipboard;
     if (g_strcmp0(operation, "clipboard-write") == 0 &&
-        link->pending_engine_write != NULL)
-        link->pending_engine_write->rejected = TRUE;
+        link->pending_engine_write != NULL) {
+        set_pending_rejection(link->pending_engine_write,
+                              error != NULL ? error->message : NULL);
+    }
     report_failure(link, operation, error);
 }
 
@@ -346,8 +402,12 @@ mux_clipboard_pane_link_set_enabled(MuxClipboardPaneLink *link,
     g_return_val_if_fail(link != NULL, FALSE);
     operation = pane_link_acquire(link);
     (void)operation;
-    if (!enabled && link->pending_engine_write != NULL)
-        rejection_sent = reject_pending_engine_write(link, &reject_error);
+    if (!enabled && link->pending_engine_write != NULL) {
+        rejection_sent = reject_pending_engine_write(
+            link,
+            "Kitty clipboard was disabled before write completion",
+            &reject_error);
+    }
     result = mux_kitty_clipboard_set_enabled(link->kitty, enabled, error);
     if (!rejection_sent) {
         report_failure(link, "clipboard-engine-reject", reject_error);
@@ -475,6 +535,7 @@ mux_clipboard_pane_link_handle_packet(MuxClipboardPaneLink *link,
         result = send_engine_result(link,
                                     MUX_CLIPBOARD_WIRE_REMOTE_ERROR,
                                     transaction_id,
+                                    "Kitty clipboard write is already pending",
                                     error);
         mux_clipboard_wire_transfer_free(transfer);
         return result;
@@ -501,7 +562,18 @@ mux_clipboard_pane_link_handle_packet(MuxClipboardPaneLink *link,
             link->pending_engine_write != NULL &&
             link->pending_engine_write->rejected;
 
-        result = reject_pending_engine_write(link, error);
+        if (!failure_reported && publish_error == NULL) {
+            publish_error = g_error_new_literal(
+                G_IO_ERROR,
+                G_IO_ERROR_FAILED,
+                "Kitty rejected clipboard publication");
+        }
+        if (!failure_reported) {
+            set_pending_rejection(link->pending_engine_write,
+                                  publish_error->message);
+        }
+        result = reject_pending_engine_write(
+            link, "Kitty rejected clipboard publication", error);
         if (!failure_reported) {
             if (publish_error == NULL) {
                 publish_error = g_error_new_literal(

@@ -1,5 +1,6 @@
 #include "mux-kitty-clipboard.h"
 
+#include <string.h>
 #include <unistd.h>
 
 typedef struct {
@@ -453,6 +454,26 @@ remote_error_code(MuxOsc5522RemoteError remote_error)
     }
 }
 
+static const gchar *
+remote_error_name(MuxOsc5522RemoteError remote_error)
+{
+    switch (remote_error) {
+    case MUX_OSC5522_REMOTE_ERROR_IO:
+        return "EIO";
+    case MUX_OSC5522_REMOTE_ERROR_INVALID:
+        return "EINVAL";
+    case MUX_OSC5522_REMOTE_ERROR_UNSUPPORTED:
+        return "ENOSYS";
+    case MUX_OSC5522_REMOTE_ERROR_PERMISSION:
+        return "EPERM";
+    case MUX_OSC5522_REMOTE_ERROR_BUSY:
+        return "EBUSY";
+    case MUX_OSC5522_REMOTE_ERROR_NONE:
+    default:
+        return "EUNKNOWN";
+    }
+}
+
 static void
 handle_remote_error(MuxKittyClipboard *clipboard,
                     const MuxOsc5522Event *event)
@@ -460,9 +481,10 @@ handle_remote_error(MuxKittyClipboard *clipboard,
     g_autoptr(GError) error = g_error_new(
         G_IO_ERROR,
         remote_error_code(event->remote_error),
-        "Kitty rejected clipboard transaction%s%s",
+        "Kitty rejected OSC 5522 clipboard transaction%s%s with %s",
         event->id != NULL ? " " : "",
-        event->id != NULL ? event->id : "");
+        event->id != NULL ? event->id : "",
+        remote_error_name(event->remote_error));
 
     if (event->id != NULL && clipboard->read != NULL &&
         g_str_equal(event->id, clipboard->read->id)) {
@@ -933,6 +955,51 @@ handle_offer_event(MuxKittyClipboard *clipboard,
     }
 }
 
+static gboolean
+parse_terminal_event(const guint8 *sequence,
+                     gsize length,
+                     MuxOsc5522Event **event,
+                     GError **error)
+{
+    static const guint8 prefix[] = "\033]5522;";
+    const gsize prefix_length = sizeof(prefix) - 1U;
+    g_autofree guint8 *normalized = NULL;
+    gsize body_end;
+    gsize terminator_length;
+
+    if (sequence == NULL || length <= prefix_length ||
+        memcmp(sequence, prefix, prefix_length) != 0)
+        return mux_osc5522_parse(sequence, length, event, error);
+
+    if (sequence[length - 1U] == '\a') {
+        terminator_length = 1U;
+    } else if (length >= 2U && sequence[length - 2U] == '\033' &&
+               sequence[length - 1U] == '\\') {
+        terminator_length = 2U;
+    } else {
+        return mux_osc5522_parse(sequence, length, event, error);
+    }
+
+    body_end = length - terminator_length;
+    if (memchr(sequence + prefix_length,
+               ';',
+               body_end - prefix_length) != NULL ||
+        length >= MUX_OSC5522_MAX_SEQUENCE) {
+        return mux_osc5522_parse(sequence, length, event, error);
+    }
+
+    /* Kitty follows the OSC 5522 examples and omits the payload separator
+     * on responses with no payload. The shared codec uses an explicit empty
+     * payload internally, so normalize only that official wire form here. */
+    normalized = g_malloc(length + 1U);
+    memcpy(normalized, sequence, body_end);
+    normalized[body_end] = ';';
+    memcpy(normalized + body_end + 1U,
+           sequence + body_end,
+           terminator_length);
+    return mux_osc5522_parse(normalized, length + 1U, event, error);
+}
+
 gboolean
 mux_kitty_clipboard_handle_osc(MuxKittyClipboard *clipboard,
                                const guint8 *sequence,
@@ -945,7 +1012,7 @@ mux_kitty_clipboard_handle_osc(MuxKittyClipboard *clipboard,
 
     g_return_val_if_fail(clipboard != NULL, FALSE);
     guard = mux_kitty_clipboard_ref(clipboard);
-    if (!mux_osc5522_parse(sequence, length, &event, error))
+    if (!parse_terminal_event(sequence, length, &event, error))
         goto out;
 
     if (event->id == NULL) {
