@@ -292,6 +292,10 @@ trace_event_name(MuxClipboardTraceEvent event)
         return "engine-external";
     case MUX_CLIPBOARD_TRACE_DELAYED_PASTE:
         return "delayed-paste";
+    case MUX_CLIPBOARD_TRACE_WPE_READ_HIT:
+        return "wpe-read-hit";
+    case MUX_CLIPBOARD_TRACE_WPE_READ_MISS:
+        return "wpe-read-miss";
     }
     return NULL;
 }

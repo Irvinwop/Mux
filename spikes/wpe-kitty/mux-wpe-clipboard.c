@@ -180,6 +180,13 @@ mux_wpe_clipboard_read(WPEClipboard *base, const gchar *format)
         return NULL;
 
     bytes = mux_clipboard_snapshot_find(clipboard->external, format);
+    mux_clipboard_smoke_trace(
+        bytes != NULL ? MUX_CLIPBOARD_TRACE_WPE_READ_HIT
+                      : MUX_CLIPBOARD_TRACE_WPE_READ_MISS,
+        &(MuxClipboardTraceFields) {
+            .snapshot = clipboard->external,
+            .has_text_plain = g_str_has_prefix(format, "text/plain")
+        });
     return bytes != NULL ? g_bytes_ref(bytes) : NULL;
 }
 
