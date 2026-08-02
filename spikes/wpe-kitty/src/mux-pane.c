@@ -3089,7 +3089,10 @@ fresh_paste_ready(MuxPaneClipboard *clipboard,
             .key_count = key_count,
             .fresh = fresh
         });
-    forward_delayed_paste_keys(pane);
+    if (fresh)
+        pane->delayed_paste_count = 0;
+    else
+        forward_delayed_paste_keys(pane);
 }
 
 static gboolean
