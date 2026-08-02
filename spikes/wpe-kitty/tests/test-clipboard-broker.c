@@ -30,6 +30,10 @@ typedef struct {
   gchar *last_failure;
 } BrokerHarness;
 
+typedef struct {
+  BrokerHarness *harness;
+} ObservationContext;
+
 static gboolean
 client_output(MuxClipboardBrokerClient *client,
               GBytes *packet,
@@ -66,7 +70,8 @@ client_observed(MuxClipboardBrokerClient *client,
                 const GError *error,
                 gpointer user_data)
 {
-  BrokerHarness *harness = user_data;
+  ObservationContext *context = user_data;
+  BrokerHarness *harness = context->harness;
 
   (void)client;
   (void)error;
@@ -252,6 +257,7 @@ static void
 test_client_peer_round_trip(void)
 {
   BrokerHarness harness = { 0 };
+  ObservationContext observation_context = { .harness = &harness };
   MuxClipboardSnapshot *snapshot;
   MuxClipboardSnapshot *oversized;
   MuxClipboardSnapshot *current;
@@ -277,7 +283,8 @@ test_client_peer_round_trip(void)
       &harness,
       NULL);
   mux_clipboard_broker_client_set_observation_func(harness.client,
-                                                   client_observed);
+                                                   client_observed,
+                                                   &observation_context);
 
   g_assert_true(mux_clipboard_broker_client_start(harness.client, &error));
   g_assert_no_error(error);
@@ -532,6 +539,7 @@ static void
 test_observation_order_and_errors(void)
 {
   BrokerHarness harness = { 0 };
+  ObservationContext observation_context = { .harness = &harness };
   MuxClipboardSnapshot *snapshot;
   guint64 first_id = 0;
   guint64 second_id = 0;
@@ -555,7 +563,8 @@ test_observation_order_and_errors(void)
       &harness,
       NULL);
   mux_clipboard_broker_client_set_observation_func(harness.client,
-                                                   client_observed);
+                                                   client_observed,
+                                                   &observation_context);
   g_assert_true(mux_clipboard_broker_client_start(harness.client, &error));
   g_assert_no_error(error);
   snapshot = broker_snapshot_new();

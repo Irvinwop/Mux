@@ -8,6 +8,7 @@
 typedef struct {
     GAction *action;
     GVariant *target;
+    gchar *download_uri;
 } ContextAction;
 
 typedef struct {
@@ -27,6 +28,7 @@ struct _MuxBrowserAffordanceBridge {
     WebKitWebView *web_view;
     GHashTable *pending;
     MuxBrowserAffordanceSendFunc send_func;
+    MuxBrowserAffordanceDownloadFunc download_func;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     gboolean private_profile;
@@ -82,6 +84,7 @@ context_action_free(ContextAction *item)
         return;
     g_clear_object(&item->action);
     g_clear_pointer(&item->target, g_variant_unref);
+    g_free(item->download_uri);
     g_free(item);
 }
 
@@ -579,6 +582,48 @@ on_show_option_menu(WebKitWebView *web_view,
 }
 
 static void
+append_download_context_choice(MuxBrowserAffordanceBridge *bridge,
+                               MuxUiRequest *request,
+                               PendingAffordance *pending,
+                               const gchar *label,
+                               const gchar *uri)
+{
+    g_autofree gchar *scheme = NULL;
+    guint32 choice_id;
+    guint i;
+    ContextAction *stored;
+
+    if (!bridge->download_func || !uri || !*uri ||
+        strlen(uri) > MUX_UI_MAX_PATH || !g_utf8_validate(uri, -1, NULL) ||
+        request->choices->len >= MUX_UI_MAX_CHOICES)
+        return;
+    scheme = g_uri_parse_scheme(uri);
+    if (!scheme ||
+        !(g_ascii_strcasecmp(scheme, "http") == 0 ||
+          g_ascii_strcasecmp(scheme, "https") == 0 ||
+          g_ascii_strcasecmp(scheme, "ftp") == 0 ||
+          g_ascii_strcasecmp(scheme, "data") == 0 ||
+          g_ascii_strcasecmp(scheme, "blob") == 0 ||
+          g_ascii_strcasecmp(scheme, "file") == 0))
+        return;
+    for (i = 0; i < pending->context_actions->len; i++) {
+        const ContextAction *existing =
+            g_ptr_array_index(pending->context_actions, i);
+
+        if (existing->download_uri &&
+            g_str_equal(existing->download_uri, uri))
+            return;
+    }
+
+    choice_id = pending->context_actions->len;
+    stored = g_new0(ContextAction, 1);
+    stored->download_uri = g_strdup(uri);
+    g_ptr_array_add(pending->context_actions, stored);
+    g_ptr_array_add(request->choices,
+                    mux_ui_choice_new(choice_id, 0, label));
+}
+
+static void
 append_context_menu(MuxUiRequest *request,
                     PendingAffordance *pending,
                     WebKitContextMenu *menu,
@@ -663,7 +708,9 @@ context_has_selectable(const PendingAffordance *pending)
         const ContextAction *item =
             g_ptr_array_index(pending->context_actions, i);
 
-        if (item && item->action && g_action_get_enabled(item->action))
+        if (item &&
+            (item->download_uri ||
+             (item->action && g_action_get_enabled(item->action))))
             return TRUE;
     }
     return FALSE;
@@ -680,7 +727,6 @@ on_context_menu(WebKitWebView *web_view,
     g_autoptr(GError) error = NULL;
     PendingAffordance *pending = g_new0(PendingAffordance, 1);
 
-    (void)hit_test;
     request->request_id = next_request_id(bridge);
     request->flags = bridge->private_profile
                          ? MUX_UI_REQUEST_FLAG_PRIVATE_PROFILE
@@ -694,6 +740,33 @@ on_context_menu(WebKitWebView *web_view,
     pending->kind = request->kind;
     pending->context_actions = g_ptr_array_new_with_free_func(
         (GDestroyNotify)context_action_free);
+    if (hit_test && webkit_hit_test_result_context_is_image(hit_test))
+        append_download_context_choice(
+            bridge,
+            request,
+            pending,
+            "Download image to clipboard",
+            webkit_hit_test_result_get_image_uri(hit_test));
+    if (hit_test && webkit_hit_test_result_context_is_media(hit_test))
+        append_download_context_choice(
+            bridge,
+            request,
+            pending,
+            "Download media to clipboard",
+            webkit_hit_test_result_get_media_uri(hit_test));
+    if (hit_test && webkit_hit_test_result_context_is_link(hit_test))
+        append_download_context_choice(
+            bridge,
+            request,
+            pending,
+            "Download link target to clipboard",
+            webkit_hit_test_result_get_link_uri(hit_test));
+    if (pending->context_actions->len == 0)
+        append_download_context_choice(bridge,
+                                       request,
+                                       pending,
+                                       "Download page to clipboard",
+                                       webkit_web_view_get_uri(web_view));
     append_context_menu(request, pending, menu, NULL, 0);
     if (!context_has_selectable(pending)) {
         pending_affordance_free(pending);
@@ -942,8 +1015,17 @@ resolve_pending(MuxBrowserAffordanceBridge *bridge,
                 break;
             item = g_ptr_array_index(pending->context_actions,
                                      choice_id);
-            if (!item || !item->action ||
-                !g_action_get_enabled(item->action))
+            if (!item)
+                break;
+            if (item->download_uri) {
+                if (!bridge->download_func)
+                    break;
+                return bridge->download_func(bridge->web_view,
+                                             item->download_uri,
+                                             bridge->user_data,
+                                             error);
+            }
+            if (!item->action || !g_action_get_enabled(item->action))
                 break;
             g_action_activate(item->action, item->target);
             return TRUE;
@@ -1120,4 +1202,13 @@ mux_browser_affordance_bridge_pending_count(
 {
     g_return_val_if_fail(bridge, 0);
     return g_hash_table_size(bridge->pending);
+}
+
+void
+mux_browser_affordance_bridge_set_download_func(
+    MuxBrowserAffordanceBridge *bridge,
+    MuxBrowserAffordanceDownloadFunc download_func)
+{
+    g_return_if_fail(bridge);
+    bridge->download_func = download_func;
 }

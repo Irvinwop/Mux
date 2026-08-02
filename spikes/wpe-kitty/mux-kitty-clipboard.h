@@ -63,6 +63,14 @@ gboolean mux_kitty_clipboard_request(MuxKittyClipboard *clipboard,
                                      gboolean is_paste,
                                      GError **error);
 
+/* Discovers and reads every MIME type currently advertised by Kitty. */
+gboolean mux_kitty_clipboard_request_all(MuxKittyClipboard *clipboard,
+                                         MuxOsc5522Location location,
+                                         const gchar *password,
+                                         const gchar *human_name,
+                                         gboolean is_paste,
+                                         GError **error);
+
 /* Cancels only the current read transaction; late responses are ignored. */
 void mux_kitty_clipboard_cancel_read(MuxKittyClipboard *clipboard);
 
@@ -80,6 +88,12 @@ gboolean mux_kitty_clipboard_handle_osc(MuxKittyClipboard *clipboard,
                                         const guint8 *sequence,
                                         gsize length,
                                         GError **error);
+gboolean mux_kitty_clipboard_osc_matches_pending_read(
+    const MuxKittyClipboard *clipboard,
+    const guint8 *sequence,
+    gsize length,
+    gboolean *matches,
+    GError **error);
 
 /*
  * Expires stale transactions and advances an active write by at most

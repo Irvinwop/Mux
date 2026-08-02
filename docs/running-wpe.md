@@ -109,6 +109,13 @@ memory-only snapshot and isolate history by profile. Text, HTML, images, and
 arbitrary binary variants are representable. Pages can request only the current
 clipboard through WebKit's permission path; they cannot enumerate history.
 
+The trusted right-click menu can download an image, media resource, link target,
+or current page directly to the file clipboard. Mux retains the download in an
+owner-only temporary directory for the current memory-only session and
+publishes desktop file-URI variants plus MIME bytes for files up to 16 MiB.
+Repeated identical clipboard snapshots are deduplicated even if the user
+presses the copy shortcut multiple times.
+
 History records traffic observed by Mux, not every external desktop clipboard
 change. Full Kitty-to-WPE behavior, large payload handling, and private-profile
 isolation still require interactive validation.
@@ -124,6 +131,8 @@ isolation still require interactive validation.
   while it is pending forces teardown; the two-minute timeout cancels the close.
 - Browser UI paths such as uploads, downloads, popups, notifications, and
   permission prompts need live-site testing.
+- File paste and file drag are separate platform operations. Download to
+  clipboard does not yet emulate a drop for sites that reject pasted files.
 - Shortcut routing has not been validated against a broad set of Kitty user
   configurations.
 - Media support depends on the installed GStreamer plugins and site codec

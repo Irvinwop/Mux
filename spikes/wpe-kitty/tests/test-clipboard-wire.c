@@ -1383,6 +1383,10 @@ typedef struct {
     GPtrArray *packets;
     GPtrArray *failure_operations;
     GPtrArray *failure_messages;
+    MuxClipboardSnapshot *received;
+    MuxOsc5522Location received_location;
+    gboolean received_is_paste;
+    guint receives;
     guint failures;
     guint would_block_outputs;
     guint failed_outputs;
@@ -1418,6 +1422,23 @@ collect_kitty_packet(MuxKittyClipboard *clipboard,
 }
 
 static void
+collect_kitty_snapshot(MuxKittyClipboard *clipboard,
+                       MuxOsc5522Location location,
+                       MuxClipboardSnapshot *snapshot,
+                       gboolean is_paste,
+                       gpointer user_data)
+{
+    KittyClipboardSink *sink = user_data;
+
+    (void)clipboard;
+    g_clear_pointer(&sink->received, mux_clipboard_snapshot_unref);
+    sink->received = mux_clipboard_snapshot_dup_sealed(snapshot);
+    sink->received_location = location;
+    sink->received_is_paste = is_paste;
+    sink->receives++;
+}
+
+static void
 collect_kitty_failure(MuxKittyClipboard *clipboard,
                       const gchar *operation,
                       const GError *error,
@@ -1450,6 +1471,7 @@ kitty_sink_clear(KittyClipboardSink *sink)
     g_clear_pointer(&sink->packets, g_ptr_array_unref);
     g_clear_pointer(&sink->failure_operations, g_ptr_array_unref);
     g_clear_pointer(&sink->failure_messages, g_ptr_array_unref);
+    g_clear_pointer(&sink->received, mux_clipboard_snapshot_unref);
 }
 
 static gboolean
@@ -1496,7 +1518,9 @@ kitty_sink_contains_since(const KittyClipboardSink *sink,
 }
 
 static gchar *
-kitty_sink_first_write_id(const KittyClipboardSink *sink, guint start)
+kitty_sink_first_id(const KittyClipboardSink *sink,
+                    guint start,
+                    const gchar *type)
 {
     guint i;
 
@@ -1507,7 +1531,7 @@ kitty_sink_first_write_id(const KittyClipboardSink *sink, guint start)
         const gchar *id;
         const gchar *end;
 
-        if (g_strstr_len(data, length, "type=write") == NULL)
+        if (type != NULL && g_strstr_len(data, length, type) == NULL)
             continue;
         id = g_strstr_len(data, length, ":id=");
         if (id == NULL)
@@ -1520,6 +1544,12 @@ kitty_sink_first_write_id(const KittyClipboardSink *sink, guint start)
             return g_strndup(id, end - id);
     }
     return NULL;
+}
+
+static gchar *
+kitty_sink_first_write_id(const KittyClipboardSink *sink, guint start)
+{
+    return kitty_sink_first_id(sink, start, "type=write");
 }
 
 static void
@@ -1755,6 +1785,10 @@ test_kitty_read_cancellation_ignores_late_response(void)
     KittyClipboardSink sink = { 0 };
     g_autoptr(MuxKittyClipboard) clipboard = NULL;
     g_autoptr(GError) error = NULL;
+    g_autofree gchar *id = NULL;
+    g_autofree gchar *done = NULL;
+    g_autofree gchar *foreign_done = NULL;
+    gboolean matches = FALSE;
 
     kitty_sink_init(&sink);
     clipboard = mux_kitty_clipboard_new(collect_kitty_packet,
@@ -1774,9 +1808,167 @@ test_kitty_read_cancellation_ignores_late_response(void)
     g_assert_true(mux_kitty_clipboard_read_pending(clipboard));
     g_assert_cmpuint(sink.packets->len, ==, 1);
 
+    id = kitty_sink_first_id(&sink, 0, "type=read");
+    g_assert_nonnull(id);
+    done = g_strdup_printf(
+        "\033]5522;type=read:status=DONE:id=%s\033\\",
+        id);
+    g_assert_true(mux_kitty_clipboard_osc_matches_pending_read(
+        clipboard,
+        (const guint8 *)done,
+        strlen(done),
+        &matches,
+        &error));
+    g_assert_no_error(error);
+    g_assert_true(matches);
+
+    foreign_done = g_strdup(
+        "\033]5522;type=read:status=DONE:id=foreign\033\\");
+    g_assert_true(mux_kitty_clipboard_osc_matches_pending_read(
+        clipboard,
+        (const guint8 *)foreign_done,
+        strlen(foreign_done),
+        &matches,
+        &error));
+    g_assert_no_error(error);
+    g_assert_false(matches);
+
     mux_kitty_clipboard_cancel_read(clipboard);
     g_assert_false(mux_kitty_clipboard_read_pending(clipboard));
     g_assert_cmpuint(sink.failures, ==, 0);
+    kitty_sink_clear(&sink);
+}
+
+static void
+test_kitty_read_all_discovers_and_fetches_mimes(void)
+{
+    static const gchar targets_text[] =
+        "text/plain text/html image/png\n";
+    static const gchar plain_text[] = "discovered paste";
+    static const guint8 png_data[] = { 0x89, 'P', 'N', 'G', '\r', '\n' };
+    KittyClipboardSink sink = { 0 };
+    g_autoptr(MuxKittyClipboard) clipboard = NULL;
+    g_autoptr(GError) error = NULL;
+    g_autofree gchar *targets_id = NULL;
+    g_autofree gchar *content_id = NULL;
+    g_autofree gchar *targets64 = NULL;
+    g_autofree gchar *requested64 = NULL;
+    g_autofree gchar *plain64 = NULL;
+    g_autofree gchar *png64 = NULL;
+    g_autofree gchar *response = NULL;
+    GBytes *bytes;
+
+    kitty_sink_init(&sink);
+    clipboard = mux_kitty_clipboard_new(collect_kitty_packet,
+                                        collect_kitty_snapshot,
+                                        collect_kitty_failure,
+                                        &sink,
+                                        NULL);
+    g_assert_true(mux_kitty_clipboard_request_all(
+        clipboard,
+        MUX_OSC5522_LOCATION_CLIPBOARD,
+        NULL,
+        "discover all test",
+        FALSE,
+        &error));
+    g_assert_no_error(error);
+    g_assert_cmpuint(sink.packets->len, ==, 1);
+    g_assert_true(kitty_sink_contains_since(&sink, 0, ";Lg=="));
+
+    targets_id = kitty_sink_first_id(&sink, 0, "type=read");
+    g_assert_nonnull(targets_id);
+    response = g_strdup_printf(
+        "\033]5522;type=read:status=OK:id=%s\033\\",
+        targets_id);
+    g_assert_true(mux_kitty_clipboard_handle_osc(
+        clipboard, (const guint8 *)response, strlen(response), &error));
+    g_assert_no_error(error);
+    g_clear_pointer(&response, g_free);
+
+    targets64 = g_base64_encode((const guchar *)targets_text,
+                                strlen(targets_text));
+    response = g_strdup_printf(
+        "\033]5522;type=read:status=DATA:id=%s:mime=Lg==;%s\033\\",
+        targets_id,
+        targets64);
+    g_assert_true(mux_kitty_clipboard_handle_osc(
+        clipboard, (const guint8 *)response, strlen(response), &error));
+    g_assert_no_error(error);
+    g_clear_pointer(&response, g_free);
+
+    response = g_strdup_printf(
+        "\033]5522;type=read:status=DONE:id=%s\033\\",
+        targets_id);
+    g_assert_true(mux_kitty_clipboard_handle_osc(
+        clipboard, (const guint8 *)response, strlen(response), &error));
+    g_assert_no_error(error);
+    g_clear_pointer(&response, g_free);
+
+    g_assert_cmpuint(sink.packets->len, ==, 2);
+    requested64 = g_base64_encode(
+        (const guchar *)"text/plain text/html image/png",
+        strlen("text/plain text/html image/png"));
+    g_assert_true(kitty_sink_contains_since(&sink, 1, requested64));
+    content_id = kitty_sink_first_id(&sink, 1, "type=read");
+    g_assert_nonnull(content_id);
+
+    response = g_strdup_printf(
+        "\033]5522;type=read:status=OK:id=%s\033\\",
+        content_id);
+    g_assert_true(mux_kitty_clipboard_handle_osc(
+        clipboard, (const guint8 *)response, strlen(response), &error));
+    g_assert_no_error(error);
+    g_clear_pointer(&response, g_free);
+
+    plain64 = g_base64_encode((const guchar *)plain_text,
+                              strlen(plain_text));
+    response = g_strdup_printf(
+        "\033]5522;type=read:status=DATA:id=%s:mime=dGV4dC9wbGFpbg==;%s\033\\",
+        content_id,
+        plain64);
+    g_assert_true(mux_kitty_clipboard_handle_osc(
+        clipboard, (const guint8 *)response, strlen(response), &error));
+    g_assert_no_error(error);
+    g_clear_pointer(&response, g_free);
+
+    png64 = g_base64_encode(png_data, sizeof(png_data));
+    response = g_strdup_printf(
+        "\033]5522;type=read:status=DATA:id=%s:mime=aW1hZ2UvcG5n;%s\033\\",
+        content_id,
+        png64);
+    g_assert_true(mux_kitty_clipboard_handle_osc(
+        clipboard, (const guint8 *)response, strlen(response), &error));
+    g_assert_no_error(error);
+    g_clear_pointer(&response, g_free);
+
+    response = g_strdup_printf(
+        "\033]5522;type=read:status=DONE:id=%s\033\\",
+        content_id);
+    g_assert_true(mux_kitty_clipboard_handle_osc(
+        clipboard, (const guint8 *)response, strlen(response), &error));
+    g_assert_no_error(error);
+
+    g_assert_cmpuint(sink.receives, ==, 1);
+    g_assert_nonnull(sink.received);
+    g_assert_cmpint(sink.received_location,
+                    ==,
+                    MUX_OSC5522_LOCATION_CLIPBOARD);
+    g_assert_false(sink.received_is_paste);
+    g_assert_cmpuint(mux_clipboard_snapshot_get_count(sink.received), ==, 2);
+    bytes = mux_clipboard_snapshot_find(sink.received, "text/plain");
+    g_assert_nonnull(bytes);
+    g_assert_cmpmem(g_bytes_get_data(bytes, NULL),
+                    g_bytes_get_size(bytes),
+                    plain_text,
+                    strlen(plain_text));
+    bytes = mux_clipboard_snapshot_find(sink.received, "image/png");
+    g_assert_nonnull(bytes);
+    g_assert_cmpmem(g_bytes_get_data(bytes, NULL),
+                    g_bytes_get_size(bytes),
+                    png_data,
+                    sizeof(png_data));
+    g_assert_cmpuint(sink.failures, ==, 0);
+    g_assert_false(mux_kitty_clipboard_read_pending(clipboard));
     kitty_sink_clear(&sink);
 }
 
@@ -2645,6 +2837,8 @@ main(int argc, char **argv)
                     test_kitty_write_retries_would_block);
     g_test_add_func("/clipboard/kitty-read/cancel",
                     test_kitty_read_cancellation_ignores_late_response);
+    g_test_add_func("/clipboard/kitty-read/discover-all",
+                    test_kitty_read_all_discovers_and_fetches_mimes);
     g_test_add_func("/clipboard/kitty-write/rejection-promotes-latest",
                     test_kitty_write_rejection_promotes_latest);
     g_test_add_func("/clipboard/kitty-write/timeout-promotes-latest",

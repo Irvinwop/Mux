@@ -333,13 +333,12 @@ fresh_failure(MuxKittyClipboard *kitty,
 static gboolean
 start_fresh_read(MuxPaneClipboard *clipboard, GError **error)
 {
-    if (mux_kitty_clipboard_request(clipboard->fresh_kitty,
-                                    MUX_OSC5522_LOCATION_CLIPBOARD,
-                                    NULL,
-                                    NULL,
-                                    "Mux fresh paste",
-                                    FALSE,
-                                    error)) {
+    if (mux_kitty_clipboard_request_all(clipboard->fresh_kitty,
+                                        MUX_OSC5522_LOCATION_CLIPBOARD,
+                                        NULL,
+                                        "Mux fresh paste",
+                                        FALSE,
+                                        error)) {
         clipboard->fresh_state = FRESH_PASTE_READING;
         return TRUE;
     }
@@ -660,7 +659,8 @@ broker_ready(MuxClipboardBrokerClient *client, gpointer user_data)
     clipboard->client = client;
     mux_clipboard_broker_client_set_observation_func(
         client,
-        broker_observation_result);
+        broker_observation_result,
+        clipboard);
     clipboard->broker_ready = TRUE;
     clipboard->reconnect_after_us = 0;
     if (clipboard->open_when_ready) {
@@ -878,7 +878,8 @@ connect_broker(MuxPaneClipboard *clipboard, GError **error)
             clipboard->transport);
     mux_clipboard_broker_client_set_observation_func(
         clipboard->client,
-        broker_observation_result);
+        broker_observation_result,
+        clipboard);
     return TRUE;
 }
 
@@ -1100,21 +1101,21 @@ mux_pane_clipboard_handle_osc(MuxPaneClipboard *clipboard,
                               GError **error)
 {
     g_autoptr(MuxPaneClipboardOperation) operation = NULL;
-    MuxOsc5522Event *event = NULL;
     g_autoptr(GError) probe_error = NULL;
+    gboolean matches_fresh_read = FALSE;
     gboolean result;
 
     g_return_val_if_fail(clipboard != NULL, FALSE);
     operation = pane_clipboard_acquire(clipboard);
     (void)operation;
     if (clipboard->fresh_state != FRESH_PASTE_IDLE &&
-        mux_osc5522_parse(sequence,
-                          length,
-                          &event,
-                          &probe_error) &&
-        event->id != NULL) {
-        mux_osc5522_event_free(event);
-        event = NULL;
+        mux_kitty_clipboard_osc_matches_pending_read(
+            clipboard->fresh_kitty,
+            sequence,
+            length,
+            &matches_fresh_read,
+            &probe_error) &&
+        matches_fresh_read) {
         if (!mux_kitty_clipboard_handle_osc(clipboard->fresh_kitty,
                                             sequence,
                                             length,
@@ -1124,8 +1125,9 @@ mux_pane_clipboard_handle_osc(MuxPaneClipboard *clipboard,
             complete_failed_fresh_paste(clipboard);
             return FALSE;
         }
+        complete_failed_fresh_paste(clipboard);
+        return TRUE;
     }
-    mux_osc5522_event_free(event);
     result = mux_clipboard_pane_link_handle_osc(clipboard->link,
                                                sequence,
                                                length,

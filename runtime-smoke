@@ -13,6 +13,11 @@ die() {
 
 [[ $(uname -s) == Linux ]] || die "Linux is required."
 
+# The Linux qualification deliberately exercises Mux's compatibility aliases.
+# User-facing macOS clipboard shortcuts remain Super/Command-first.
+readonly LINUX_COMPAT_COPY_CHORD=ctrl+c
+readonly LINUX_COMPAT_PASTE_CHORD=ctrl+v
+
 if (( EUID == 0 )); then
     if [[ ${CI:-} != true || ${MUX_SMOKE_ALLOW_ROOT_CI:-0} != 1 ]]; then
         die "do not run as root; CI may opt in with CI=true MUX_SMOKE_ALLOW_ROOT_CI=1"
@@ -38,6 +43,11 @@ timeout_seconds=${MUX_SMOKE_TIMEOUT_SECONDS:-120}
 [[ $timeout_seconds =~ ^[0-9]+$ ]] || die "MUX_SMOKE_TIMEOUT_SECONDS must be an integer"
 (( timeout_seconds >= 30 && timeout_seconds <= 900 )) ||
     die "MUX_SMOKE_TIMEOUT_SECONDS must be between 30 and 900"
+
+poll_attempts=${MUX_SMOKE_POLL_ATTEMPTS:-400}
+[[ $poll_attempts =~ ^[0-9]+$ ]] || die "MUX_SMOKE_POLL_ATTEMPTS must be an integer"
+(( poll_attempts >= 400 && poll_attempts <= 2400 )) ||
+    die "MUX_SMOKE_POLL_ATTEMPTS must be between 400 and 2400"
 
 if [[ ${1:-} != --runtime-smoke-inner ]]; then
     (( $# == 0 )) || die "usage: ./runtime-smoke"
@@ -78,6 +88,9 @@ pkg-config --atleast-version=2.52.5 wpe-webkit-2.0 ||
 pkg-config --atleast-version=2.52.5 wpe-platform-2.0 ||
     die "wpe-platform-2.0 2.52.5 or newer is required"
 weston --version >/dev/null 2>&1 || die "weston --version failed"
+weston_help=$(weston --help 2>&1) || die "weston --help failed"
+[[ $weston_help == *--fake-seat* ]] ||
+    die "Weston headless --fake-seat support is required"
 python3 --version >/dev/null 2>&1 || die "python3 --version failed"
 dbus-run-session --version >/dev/null 2>&1 || die "dbus-run-session --version failed"
 
@@ -100,15 +113,20 @@ KITTY_LISTEN_ON=
 KITTY_PUBLIC_KEY_VALUE=
 SNAPSHOT=
 FRAME_ACK_TELEMETRY=
+CLIPBOARD_TELEMETRY=
+FIXTURE_STATE=
 MUXD_PID=0
 ENGINE_PID=0
+ISOLATED_ENGINE_PID=0
 WESTON_PID=0
 HTTP_PID=0
 KITTY_PID=0
 BOOT_PANE_PID=0
 ALT_PANE_PID=0
+ISOLATED_PANE_PID=0
 BAR_PID=0
 BAR_KITTY_ID=
+ISOLATED_ENGINE_SOCKET=
 declare -a CHILD_PIDS=()
 declare -a CHILD_LABELS=()
 declare -a KITTY_WINDOW_IDS=()
@@ -228,6 +246,14 @@ dump_failure() {
             safe_dump_file "$capture" || true
         done
     fi
+
+    if [[ -d ${FIXTURE_STATE:-/nonexistent} ]]; then
+        for capture in "$FIXTURE_STATE"/*.status; do
+            [[ -f $capture ]] || continue
+            printf '\n--- fixture %s ---\n' "$(basename -- "$capture")" >&2
+            safe_dump_file "$capture" || true
+        done
+    fi
 }
 
 teardown_children() {
@@ -306,12 +332,74 @@ wait_socket() {
     fail "$label did not create $path within 10 seconds"
 }
 
+wait_child_reaped() {
+    local pid=$1
+    local label=$2
+    local attempt state
+
+    for (( attempt=0; attempt < 100; attempt++ )); do
+        if [[ ! -r /proc/$pid/stat ]]; then
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+        state=$(awk '{ print $3; exit }' "/proc/$pid/stat" 2>/dev/null || true)
+        if [[ $state == Z ]]; then
+            wait "$pid" 2>/dev/null || true
+            pid_alive "$pid" && fail "$label remained after being reaped"
+            return 0
+        fi
+        sleep 0.05
+    done
+    fail "$label was not reaped within 5 seconds"
+}
+
 assert_core_alive() {
     pid_alive "$WESTON_PID" || fail "Weston exited"
     pid_alive "$HTTP_PID" || fail "HTTP fixture server exited"
     pid_alive "$MUXD_PID" || fail "muxd exited"
     pid_alive "$ENGINE_PID" || fail "mux-engine exited"
+    if (( ISOLATED_ENGINE_PID > 0 )); then
+        pid_alive "$ISOLATED_ENGINE_PID" || fail "isolated mux-engine exited"
+    fi
     pid_alive "$KITTY_PID" || fail "Kitty exited"
+}
+
+wait_fixture_event() {
+    local scenario=$1
+    local event=$2
+    local path="$FIXTURE_STATE/$scenario.$event.status"
+    local attempt result
+
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        if [[ -s $path ]]; then
+            IFS=$'\t' read -r result _ <"$path"
+            if [[ $result == PASS ]]; then
+                FIXTURE_EVENT_RECORD=$(<"$path")
+                return 0
+            fi
+            FIXTURE_EVENT_RECORD=$(<"$path")
+            fail "fixture rejected $scenario/$event: $FIXTURE_EVENT_RECORD"
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "fixture did not attest $scenario/$event within 10 seconds"
+}
+
+fixture_record_field() {
+    local record=$1
+    local field=$2
+
+    awk -F '\t' -v prefix="$field=" '
+        {
+            for (i = 1; i <= NF; i++) {
+                if (index($i, prefix) == 1) {
+                    print substr($i, length(prefix) + 1)
+                    exit
+                }
+            }
+        }
+    ' <<<"$record"
 }
 
 run_muxctl() {
@@ -352,7 +440,7 @@ wait_title() {
     local expected_title=$3
     local attempt listing record
 
-    for (( attempt=0; attempt < 400; attempt++ )); do
+    for (( attempt=0; attempt < poll_attempts; attempt++ )); do
         listing=$(run_muxctl list 2>/dev/null || true)
         record=$(view_record "$listing" "$view_id")
         if [[ $record == *"$expected_url"* && $record == *"$expected_title"* ]]; then
@@ -362,7 +450,7 @@ wait_title() {
         assert_core_alive
         sleep 0.05
     done
-    fail "title $expected_title was not observed for $view_id within 20 seconds"
+    fail "title $expected_title was not observed for $view_id within the polling deadline; last record: ${record:-<missing>}"
 }
 
 sha256_text() {
@@ -381,7 +469,7 @@ wait_frame_ack() {
     kitty_hash=$(sha256_text "$kitty_window")
     uri_hash=$(sha256_text "$expected_url")
     title_hash=$(sha256_text "$expected_title")
-    for (( attempt=0; attempt < 400; attempt++ )); do
+    for (( attempt=0; attempt < poll_attempts; attempt++ )); do
         if awk -F '\t' \
             -v kitty_hash="$kitty_hash" \
             -v uri_hash="$uri_hash" \
@@ -402,7 +490,7 @@ wait_frame_ack() {
         assert_core_alive
         sleep 0.05
     done
-    fail "positive Kitty FRAME_ACK was not observed for $expected_title within 20 seconds"
+    fail "positive Kitty FRAME_ACK was not observed for $expected_title within the polling deadline"
 }
 
 wait_bar_editing() {
@@ -447,32 +535,88 @@ wait_initial_view() {
     fail "initial JavaScript title was not observed within 20 seconds"
 }
 
-wait_new_view() {
-    local old_view=$1
-    local attempt listing new_view
+wait_new_view_since() {
+    local before_listing=$1
+    local expected_url=${2:-}
+    local attempt listing new_view record
 
     for (( attempt=0; attempt < 400; attempt++ )); do
         listing=$(run_muxctl list 2>/dev/null || true)
-        new_view=$(awk -v old="$old_view" '
-            {
-                candidate = ""
-                if ($1 == "*" && $2 ~ /^(view|transient)-/) candidate = $2
-                else if ($1 ~ /^(view|transient)-/) candidate = $1
-                if (candidate != "" && candidate != old) {
-                    print candidate
-                    exit
+        new_view=$(awk -v before="$before_listing" '
+            function extract_view_id(first, second) {
+                if (first == "*" && second ~ /^(view|transient)-/) return second
+                if (first ~ /^(view|transient)-/) return first
+                return ""
+            }
+            BEGIN {
+                line_count = split(before, lines, "\n")
+                for (line = 1; line <= line_count; line++) {
+                    split(lines[line], fields)
+                    candidate = extract_view_id(fields[1], fields[2])
+                    if (candidate != "") previous[candidate] = 1
                 }
             }
+            {
+                candidate = extract_view_id($1, $2)
+                if (candidate != "" && !previous[candidate] && !seen[candidate]++) {
+                    found += 1
+                    result = candidate
+                }
+            }
+            END {
+                if (found == 1) print result
+                else if (found > 1) print "__AMBIGUOUS__"
+            }
         ' <<<"$listing")
+        if [[ $new_view == __AMBIGUOUS__ ]]; then
+            fail "more than one view appeared after a single pane launch"
+        fi
         if [[ -n $new_view ]]; then
-            SNAPSHOT=$listing
-            printf '%s\n' "$new_view"
-            return 0
+            record=$(view_record "$listing" "$new_view")
+            if [[ -z $expected_url || $record == *"$expected_url"* ]]; then
+                SNAPSHOT=$listing
+                printf '%s\n' "$new_view"
+                return 0
+            fi
         fi
         assert_core_alive
         sleep 0.05
     done
-    fail "second Kitty layer did not register a view within 20 seconds"
+    fail "a unique newly launched view did not register within 20 seconds"
+}
+
+qualify_private_history_absence() {
+    local kitty_window=$1
+    local capture="$BASE/private-history-picker.txt"
+    local marker=MUX_SMOKE_PROFILE_SOURCE_
+    local attempt saw_picker=0
+
+    kitty_rc send-key --match "id:$kitty_window" super+shift+v \
+        >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
+        fail "encrypted clipboard picker shortcut failed"
+
+    for (( attempt=0; attempt < 40; attempt++ )); do
+        if kitty_rc get-text --match "id:$kitty_window" --extent=all \
+            >"$capture" 2>>"$LOG_DIR/kitty-actions.log"; then
+            if grep -Eiq 'clipboard|history' "$capture"; then
+                saw_picker=1
+            fi
+            if grep -Fq "$marker" "$capture"; then
+                fail "private profile history exposed another profile's clipboard preview"
+            fi
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    (( saw_picker == 1 )) || fail "clipboard history picker did not render in the private profile"
+
+    printf 'PROFILE_HISTORY_ISOLATION\tprofile_sha256=%s\tmarker_sha256=%s\tresult=PASS\n' \
+        "$(sha256_text runtime-smoke-private)" "$(sha256_text "$marker")" \
+        >>"$CLIPBOARD_TELEMETRY"
+    rm -f -- "$capture"
+    kitty_rc send-key --match "id:$kitty_window" esc \
+        >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
+        fail "encrypted clipboard picker close failed"
 }
 
 wait_active_view() {
@@ -568,50 +712,17 @@ install -d -m 700 \
     "$XDG_CONFIG_HOME" \
     "$MUX_PROFILE_DATA_DIR" \
     "$MUX_PROFILE_CACHE_DIR" \
-    "$BASE/site" \
+    "$BASE/private-profile-data" \
+    "$BASE/private-profile-cache" \
+    "$BASE/fixture-state" \
     "$BASE/kitty"
 
-cat >"$BASE/site/index.html" <<'HTML'
-<!doctype html>
-<meta charset="utf-8">
-<title>MUX_SMOKE_BOOT_LOADING</title>
-<script>
-addEventListener("load", () => {
-    document.body.textContent = "Mux boot fixture rendered";
-    document.body.style.background = "#d7f4e8";
-    document.title = "MUX_SMOKE_BOOT_LOADED";
-});
-</script>
-<body>Mux boot fixture</body>
-HTML
-
-cat >"$BASE/site/bar.html" <<'HTML'
-<!doctype html>
-<meta charset="utf-8">
-<title>MUX_SMOKE_BAR_LOADING</title>
-<script>
-addEventListener("load", () => {
-    document.body.textContent = "Mux global URL bar fixture rendered";
-    document.body.style.background = "#f7dfb2";
-    document.title = "MUX_SMOKE_BAR_LOADED";
-});
-</script>
-<body>Mux global URL bar fixture</body>
-HTML
-
-cat >"$BASE/site/second.html" <<'HTML'
-<!doctype html>
-<meta charset="utf-8">
-<title>MUX_SMOKE_SECOND_LOADING</title>
-<script>
-addEventListener("load", () => {
-    document.body.textContent = "Mux targeted navigation fixture rendered";
-    document.body.style.background = "#c8e3fa";
-    document.title = "MUX_SMOKE_SECOND_LOADED";
-});
-</script>
-<body>Mux targeted navigation fixture</body>
-HTML
+FIXTURE_STATE="$BASE/fixture-state"
+CLIPBOARD_TELEMETRY="$LOG_DIR/clipboard-qualification.log"
+: >"$CLIPBOARD_TELEMETRY"
+chmod 600 "$CLIPBOARD_TELEMETRY"
+FIXTURE_SERVER="$REPO_ROOT/scripts/runtime-smoke-browser-clipboard-fixture.py"
+[[ -r $FIXTURE_SERVER ]] || fail "missing browser/clipboard fixture server: $FIXTURE_SERVER"
 
 cp "$REPO_ROOT/kitty/kitty.conf" "$BASE/kitty/kitty.conf"
 cp "$REPO_ROOT/kitty/wpe.conf" "$BASE/kitty/wpe.conf"
@@ -625,11 +736,17 @@ new = 'remote_control_password "" detach-window focus-window launch send-key get
 text = path.read_text(encoding="ascii")
 if text.count(old) != 1:
     raise SystemExit("temporary Kitty ACL source did not match production config")
-path.write_text(text.replace(old, new), encoding="ascii")
+text = text.replace(old, new)
+text += "\n# Preserve sanitizer diagnostics after a held smoke-test child exits.\n"
+text += "scrollback_lines 100000\n"
+text += "# Headless qualification cannot answer Kitty's clipboard prompt.\n"
+text += "clipboard_control write-clipboard write-primary read-clipboard read-primary\n"
+path.write_text(text, encoding="ascii")
 PY
 
 weston \
     --backend=headless \
+    --fake-seat \
     --renderer=pixman \
     --shell=kiosk-shell.so \
     --width=1280 \
@@ -643,17 +760,8 @@ track_child "$WESTON_PID" weston
 wait_socket "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" "$WESTON_PID" weston
 
 PORT_FILE="$BASE/http.port"
-python3 - "$BASE/site" "$PORT_FILE" >"$LOG_DIR/http.log" 2>&1 <<'PY' &
-from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-import sys
-
-handler = partial(SimpleHTTPRequestHandler, directory=sys.argv[1])
-server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-Path(sys.argv[2]).write_text(str(server.server_port), encoding="ascii")
-server.serve_forever()
-PY
+python3 "$FIXTURE_SERVER" "$PORT_FILE" "$FIXTURE_STATE" \
+    >"$LOG_DIR/http.log" 2>&1 &
 HTTP_PID=$!
 track_child "$HTTP_PID" http
 
@@ -668,8 +776,20 @@ HTTP_PORT=$(<"$PORT_FILE")
 BOOT_URL="http://127.0.0.1:$HTTP_PORT/index.html"
 BAR_URL="http://127.0.0.1:$HTTP_PORT/bar.html"
 SECOND_URL="http://127.0.0.1:$HTTP_PORT/second.html"
+SAME_CLIPBOARD_URL="http://127.0.0.1:$HTTP_PORT/clipboard-same.html"
+SAME_CLIPBOARD_TARGET_URL="http://127.0.0.1:$HTTP_PORT/clipboard-same-target.html"
+CROSS_PANE_SOURCE_URL="http://127.0.0.1:$HTTP_PORT/clipboard-cross-pane-source.html"
+CROSS_PANE_TARGET_URL="http://127.0.0.1:$HTTP_PORT/clipboard-cross-pane-target.html"
+CROSS_PROFILE_SOURCE_URL="http://127.0.0.1:$HTTP_PORT/clipboard-cross-profile-source.html"
+CROSS_PROFILE_TARGET_URL="http://127.0.0.1:$HTTP_PORT/clipboard-cross-profile-target.html"
+PASSIVE_READ_URL="http://127.0.0.1:$HTTP_PORT/clipboard-passive-read.html"
 
-python3 - "$BOOT_URL" "$BAR_URL" "$SECOND_URL" <<'PY'
+python3 - \
+    "$BOOT_URL" "$BAR_URL" "$SECOND_URL" "$SAME_CLIPBOARD_URL" \
+    "$SAME_CLIPBOARD_TARGET_URL" \
+    "$CROSS_PANE_SOURCE_URL" "$CROSS_PANE_TARGET_URL" \
+    "$CROSS_PROFILE_SOURCE_URL" "$CROSS_PROFILE_TARGET_URL" \
+    "$PASSIVE_READ_URL" <<'PY'
 import sys
 import urllib.request
 
@@ -707,6 +827,7 @@ kitty \
     --config "$BASE/kitty/wpe.conf" \
     --listen-on "$KITTY_LISTEN_ON" \
     --title Mux \
+    --hold \
     env \
         XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
         XDG_STATE_HOME="$XDG_STATE_HOME" \
@@ -756,15 +877,18 @@ run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "muxctl focus failed for $BOOT_VIEW_ID"
 wait_active_view "$BOOT_VIEW_ID"
 
+ALT_BEFORE_SNAPSHOT=$(run_muxctl list) ||
+    fail "muxctl list failed before alternate pane launch"
 kitty_rc launch \
     --source-window "id:$BOOT_KITTY_ID" \
     --type=tab \
     --copy-env \
+    --hold \
     "$BIN_DIR/mux-layer" --new \
     >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "Kitty could not launch the alternate Mux layer"
 
-ALT_VIEW_ID=$(wait_new_view "$BOOT_VIEW_ID")
+ALT_VIEW_ID=$(wait_new_view_since "$ALT_BEFORE_SNAPSHOT")
 SNAPSHOT=$(run_muxctl list)
 ALT_LAYER=$(record_field "$SNAPSHOT" "$ALT_VIEW_ID" layer)
 ALT_KITTY_ID=$(record_field "$SNAPSHOT" "$ALT_VIEW_ID" kitty)
@@ -813,6 +937,139 @@ run_muxctl open "$BOOT_VIEW_ID" "$SECOND_URL" >>"$LOG_DIR/muxctl-actions.log" 2>
 wait_title "$BOOT_VIEW_ID" "$SECOND_URL" MUX_SMOKE_SECOND_LOADED
 wait_frame_ack "$BOOT_KITTY_ID" "$SECOND_URL" MUX_SMOKE_SECOND_LOADED
 
+run_muxctl open "$BOOT_VIEW_ID" "$SAME_CLIPBOARD_URL" \
+    >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "same-page clipboard fixture navigation failed"
+wait_title "$BOOT_VIEW_ID" "$SAME_CLIPBOARD_URL" MUX_CLIP_SAME_SOURCE_READY
+wait_frame_ack "$BOOT_KITTY_ID" "$SAME_CLIPBOARD_URL" MUX_CLIP_SAME_SOURCE_READY
+run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl focus failed before same-page copy"
+wait_active_view "$BOOT_VIEW_ID"
+kitty_rc send-key --match "id:$BOOT_KITTY_ID" "$LINUX_COMPAT_COPY_CHORD" \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 || fail "same-page copy injection failed"
+wait_fixture_event same copy
+wait_title "$BOOT_VIEW_ID" "$SAME_CLIPBOARD_URL" MUX_CLIP_SAME_COPY_PASS
+wait_frame_ack "$BOOT_KITTY_ID" "$SAME_CLIPBOARD_URL" MUX_CLIP_SAME_COPY_PASS
+run_muxctl open "$BOOT_VIEW_ID" "$SAME_CLIPBOARD_TARGET_URL" \
+    >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "same-pane clipboard target navigation failed"
+wait_title "$BOOT_VIEW_ID" "$SAME_CLIPBOARD_TARGET_URL" MUX_CLIP_SAME_TARGET_READY
+wait_frame_ack "$BOOT_KITTY_ID" "$SAME_CLIPBOARD_TARGET_URL" MUX_CLIP_SAME_TARGET_READY
+kitty_rc send-key --match "id:$BOOT_KITTY_ID" "$LINUX_COMPAT_PASTE_CHORD" \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 || fail "same-pane paste injection failed"
+wait_fixture_event same paste
+wait_title "$BOOT_VIEW_ID" "$SAME_CLIPBOARD_TARGET_URL" MUX_CLIP_SAME_PASS
+wait_frame_ack "$BOOT_KITTY_ID" "$SAME_CLIPBOARD_TARGET_URL" MUX_CLIP_SAME_PASS
+
+run_muxctl open "$BOOT_VIEW_ID" "$CROSS_PANE_SOURCE_URL" \
+    >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "cross-pane clipboard source navigation failed"
+wait_title "$BOOT_VIEW_ID" "$CROSS_PANE_SOURCE_URL" MUX_CLIP_CROSS_PANE_SOURCE_READY
+wait_frame_ack "$BOOT_KITTY_ID" "$CROSS_PANE_SOURCE_URL" MUX_CLIP_CROSS_PANE_SOURCE_READY
+kitty_rc send-key --match "id:$BOOT_KITTY_ID" "$LINUX_COMPAT_COPY_CHORD" \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 || fail "cross-pane copy injection failed"
+wait_fixture_event cross-pane copy
+wait_title "$BOOT_VIEW_ID" "$CROSS_PANE_SOURCE_URL" MUX_CLIP_CROSS_PANE_COPY_PASS
+wait_frame_ack "$BOOT_KITTY_ID" "$CROSS_PANE_SOURCE_URL" MUX_CLIP_CROSS_PANE_COPY_PASS
+
+run_muxctl open "$ALT_VIEW_ID" "$CROSS_PANE_TARGET_URL" \
+    >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "cross-pane clipboard target navigation failed"
+run_muxctl focus "$ALT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl focus failed before cross-pane paste"
+wait_active_view "$ALT_VIEW_ID"
+wait_title "$ALT_VIEW_ID" "$CROSS_PANE_TARGET_URL" MUX_CLIP_CROSS_PANE_TARGET_READY
+wait_frame_ack "$ALT_KITTY_ID" "$CROSS_PANE_TARGET_URL" MUX_CLIP_CROSS_PANE_TARGET_READY
+kitty_rc send-key --match "id:$ALT_KITTY_ID" "$LINUX_COMPAT_PASTE_CHORD" \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 || fail "cross-pane paste injection failed"
+wait_fixture_event cross-pane paste
+wait_title "$ALT_VIEW_ID" "$CROSS_PANE_TARGET_URL" MUX_CLIP_CROSS_PANE_PASS
+wait_frame_ack "$ALT_KITTY_ID" "$CROSS_PANE_TARGET_URL" MUX_CLIP_CROSS_PANE_PASS
+
+run_muxctl open "$BOOT_VIEW_ID" "$CROSS_PROFILE_SOURCE_URL" \
+    >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "cross-profile clipboard source navigation failed"
+run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl focus failed before cross-profile copy"
+wait_active_view "$BOOT_VIEW_ID"
+wait_title "$BOOT_VIEW_ID" "$CROSS_PROFILE_SOURCE_URL" MUX_CLIP_CROSS_PROFILE_SOURCE_READY
+wait_frame_ack "$BOOT_KITTY_ID" "$CROSS_PROFILE_SOURCE_URL" MUX_CLIP_CROSS_PROFILE_SOURCE_READY
+kitty_rc send-key --match "id:$BOOT_KITTY_ID" "$LINUX_COMPAT_COPY_CHORD" \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 || fail "cross-profile copy injection failed"
+wait_fixture_event cross-profile copy
+wait_title "$BOOT_VIEW_ID" "$CROSS_PROFILE_SOURCE_URL" MUX_CLIP_CROSS_PROFILE_COPY_PASS
+wait_frame_ack "$BOOT_KITTY_ID" "$CROSS_PROFILE_SOURCE_URL" MUX_CLIP_CROSS_PROFILE_COPY_PASS
+
+ISOLATED_PROFILE=runtime-smoke-private
+ISOLATED_LAYER=runtime-smoke-private
+ISOLATED_ENGINE_SOCKET="$XDG_RUNTIME_DIR/mux/private-engine.sock"
+env \
+    MUX_PROFILE="$ISOLATED_PROFILE" \
+    MUX_EPHEMERAL=1 \
+    MUX_ENGINE_SOCKET="$ISOLATED_ENGINE_SOCKET" \
+    MUX_PROFILE_DATA_DIR="$BASE/private-profile-data" \
+    MUX_PROFILE_CACHE_DIR="$BASE/private-profile-cache" \
+    MUX_SMOKE_FRAME_ACK_FILE="$FRAME_ACK_TELEMETRY" \
+    "$BIN_DIR/mux-engine" --profile "$ISOLATED_PROFILE" --socket "$ISOLATED_ENGINE_SOCKET" \
+    >"$LOG_DIR/private-engine.log" 2>&1 &
+ISOLATED_ENGINE_PID=$!
+track_child "$ISOLATED_ENGINE_PID" private-mux-engine
+wait_socket "$ISOLATED_ENGINE_SOCKET" "$ISOLATED_ENGINE_PID" private-mux-engine
+
+ISOLATED_BEFORE_SNAPSHOT=$(run_muxctl list) ||
+    fail "muxctl list failed before isolated pane launch"
+kitty_rc launch \
+    --source-window "id:$BOOT_KITTY_ID" \
+    --type=tab \
+    --copy-env \
+    --hold \
+    env \
+        MUX_PROFILE="$ISOLATED_PROFILE" \
+        MUX_EPHEMERAL=1 \
+        MUX_LAYER="$ISOLATED_LAYER" \
+        MUX_GLOBAL_BAR=0 \
+        MUX_ENGINE_SOCKET="$ISOLATED_ENGINE_SOCKET" \
+        MUX_PROFILE_DATA_DIR="$BASE/private-profile-data" \
+        MUX_PROFILE_CACHE_DIR="$BASE/private-profile-cache" \
+        "$BIN_DIR/mux-pane" "$PASSIVE_READ_URL" \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
+    fail "Kitty could not launch the isolated-profile pane"
+
+ISOLATED_VIEW_ID=$(wait_new_view_since "$ISOLATED_BEFORE_SNAPSHOT" "$PASSIVE_READ_URL")
+SNAPSHOT=$(run_muxctl list)
+ISOLATED_KITTY_ID=$(record_field "$SNAPSHOT" "$ISOLATED_VIEW_ID" kitty)
+ISOLATED_PANE_PID=$(record_field "$SNAPSHOT" "$ISOLATED_VIEW_ID" pid)
+[[ -n $ISOLATED_KITTY_ID ]] || fail "isolated pane did not report a Kitty window ID"
+[[ $ISOLATED_PANE_PID =~ ^[1-9][0-9]*$ ]] || fail "isolated pane did not report a PID"
+KITTY_WINDOW_IDS+=("$ISOLATED_KITTY_ID")
+wait_active_view "$ISOLATED_VIEW_ID"
+wait_fixture_event passive-read read
+privacy_mode=$(fixture_record_field "$FIXTURE_EVENT_RECORD" mode)
+case $privacy_mode in
+    rejected) privacy_title=MUX_CLIP_PRIVACY_BLOCKED ;;
+    unavailable) privacy_title=MUX_CLIP_PRIVACY_UNAVAILABLE ;;
+    *) fail "unexpected passive clipboard read result: $FIXTURE_EVENT_RECORD" ;;
+esac
+wait_title "$ISOLATED_VIEW_ID" "$PASSIVE_READ_URL" "$privacy_title"
+wait_frame_ack "$ISOLATED_KITTY_ID" "$PASSIVE_READ_URL" "$privacy_title"
+qualify_private_history_absence "$ISOLATED_KITTY_ID"
+
+run_muxctl open "$ISOLATED_VIEW_ID" "$CROSS_PROFILE_TARGET_URL" \
+    >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "cross-profile clipboard target navigation failed"
+wait_title "$ISOLATED_VIEW_ID" "$CROSS_PROFILE_TARGET_URL" MUX_CLIP_CROSS_PROFILE_TARGET_READY
+wait_frame_ack "$ISOLATED_KITTY_ID" "$CROSS_PROFILE_TARGET_URL" MUX_CLIP_CROSS_PROFILE_TARGET_READY
+kitty_rc send-key --match "id:$ISOLATED_KITTY_ID" "$LINUX_COMPAT_PASTE_CHORD" \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 || fail "cross-profile paste injection failed"
+wait_fixture_event cross-profile paste
+wait_title "$ISOLATED_VIEW_ID" "$CROSS_PROFILE_TARGET_URL" MUX_CLIP_CROSS_PROFILE_PASS
+wait_frame_ack "$ISOLATED_KITTY_ID" "$CROSS_PROFILE_TARGET_URL" MUX_CLIP_CROSS_PROFILE_PASS
+
+kitty_rc send-key --match "id:$ISOLATED_KITTY_ID" super+q \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
+    fail "encrypted Super+Q injection failed for $ISOLATED_VIEW_ID"
+wait_view_closed "$ISOLATED_VIEW_ID" "$ISOLATED_PANE_PID"
+
 run_muxctl focus "$ALT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "muxctl focus failed for $ALT_VIEW_ID"
 wait_active_view "$ALT_VIEW_ID"
@@ -833,12 +1090,20 @@ final_status=$(run_muxctl status) || fail "muxctl status failed after pane closu
 [[ $final_status =~ (^|[[:space:]])views=0($|[[:space:]]) ]] ||
     fail "muxd retained views after graceful close: $final_status"
 pid_alive "$ENGINE_PID" || fail "central engine exited after its last view closed"
+pid_alive "$ISOLATED_ENGINE_PID" || fail "isolated engine exited after its last view closed"
 pid_alive "$MUXD_PID" || fail "muxd exited after its last view closed"
 
-printf 'runtime-smoke: JavaScript title, positive Kitty FRAME_ACK, processes, focus, layers, global-bar and targeted navigation, and graceful close passed\n'
+printf 'runtime-smoke: browser path, hashed Kitty FRAME_ACK, same-page/cross-pane/cross-profile clipboard, privacy boundaries, focus, layers, navigation, and graceful close passed\n'
+
+timeout 6s "$BIN_DIR/muxctl" stop >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl stop did not complete within its lifecycle deadline"
+wait_child_reaped "$ENGINE_PID" "central profile engine"
+wait_child_reaped "$ISOLATED_ENGINE_PID" "isolated profile engine"
+wait_child_reaped "$MUXD_PID" muxd
 
 teardown_children
 [[ ! -S $MUX_ENGINE_SOCKET ]] || fail "engine socket remained after shutdown"
+[[ ! -S $ISOLATED_ENGINE_SOCKET ]] || fail "isolated engine socket remained after shutdown"
 [[ ! -S $XDG_RUNTIME_DIR/mux/muxd.sock ]] || fail "muxd socket remained after shutdown"
 
 printf 'runtime-smoke: PASS\n'

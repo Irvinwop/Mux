@@ -87,7 +87,8 @@ void mux_clipboard_broker_client_unref(
     MuxClipboardBrokerClient *client);
 void mux_clipboard_broker_client_set_observation_func(
     MuxClipboardBrokerClient *client,
-    MuxClipboardBrokerClientObservationFunc observation_func);
+    MuxClipboardBrokerClientObservationFunc observation_func,
+    gpointer observation_data);
 
 gboolean mux_clipboard_broker_client_start(
     MuxClipboardBrokerClient *client,

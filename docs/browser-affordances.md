@@ -197,6 +197,24 @@ Default behavior:
 5. Atomically rename on completion.
 6. Remove the partial file on cancellation or failure unless explicitly kept.
 
+The trusted context menu prepends `Download ... to clipboard` for image, media,
+and link targets, with the current page as a fallback. This uses the same
+WebKit session and download state machine, but selects a private `0700`
+directory below the user's temporary directory instead of prompting for a
+destination. Completed files remain available for the memory-only browser
+session and are removed when that profile's download manager shuts down.
+
+The resulting clipboard snapshot keeps the backing file URI together with
+`text/uri-list`, GNOME and KDE file-copy variants, `public.file-url`, and a
+plain path. The response MIME bytes are included when the file is no larger
+than the clipboard's 16 MiB per-item limit. Repeating an identical ordinary
+copy does not append history: `muxd` compares the complete MIME snapshot and
+returns the existing entry ID.
+
+File clipboard publication is not equivalent to drag-and-drop. A site that
+requires `DataTransfer.files` will not accept a synthetic paste of the URI;
+that path requires real terminal-to-WPE drag event transport.
+
 `DOWNLOAD_EVENT` reports started, progress, finished, failed, and cancelled
 states. Progress updates are coalesced to at most four per second. The global bar
 may summarize active downloads, but it never blocks frame delivery.

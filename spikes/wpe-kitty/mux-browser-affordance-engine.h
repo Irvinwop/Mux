@@ -17,6 +17,12 @@ typedef gboolean (*MuxBrowserAffordanceChoiceFunc)(guint32 choice_id,
                                                     gpointer user_data,
                                                     GError **error);
 
+typedef gboolean (*MuxBrowserAffordanceDownloadFunc)(
+    WebKitWebView *web_view,
+    const gchar *uri,
+    gpointer user_data,
+    GError **error);
+
 MuxBrowserAffordanceBridge *mux_browser_affordance_bridge_new(
     WebKitWebView *web_view,
     gboolean private_profile,
@@ -40,6 +46,10 @@ void mux_browser_affordance_bridge_cancel_all(
 
 guint mux_browser_affordance_bridge_pending_count(
     const MuxBrowserAffordanceBridge *bridge);
+
+void mux_browser_affordance_bridge_set_download_func(
+    MuxBrowserAffordanceBridge *bridge,
+    MuxBrowserAffordanceDownloadFunc download_func);
 
 gboolean mux_browser_affordance_bridge_show_command_surface(
     MuxBrowserAffordanceBridge *bridge,

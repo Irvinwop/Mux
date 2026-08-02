@@ -53,6 +53,7 @@ typedef struct {
     gboolean pending_slot_held;
     gboolean active_slot_held;
     gboolean destination_emitted;
+    gboolean clipboard_target;
     gint64 last_progress_us;
     guint destination_timeout_id;
     gulong decide_destination_handler;
@@ -72,10 +73,16 @@ struct _MuxDownloadManager {
     guint active_count;
     MuxDownloadSendFunc send_func;
     MuxDownloadEventFunc event_func;
+    MuxDownloadClipboardFunc clipboard_func;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     gulong download_started_handler;
+    GHashTable *clipboard_requests;
+    GPtrArray *clipboard_paths;
+    gchar *clipboard_directory;
 };
+
+static gboolean safe_destination_directory(const struct stat *status);
 
 static gpointer
 download_view_key(MuxDownloadManager *manager,
@@ -260,6 +267,52 @@ default_download_directory(void)
     if (configured && *configured)
         return g_strdup(configured);
     return g_build_filename(g_get_home_dir(), "Downloads", NULL);
+}
+
+static gboolean
+ensure_clipboard_directory(MuxDownloadManager *manager, GError **error)
+{
+    struct stat status;
+
+    if (manager->clipboard_directory)
+        return TRUE;
+    manager->clipboard_directory =
+        g_dir_make_tmp("mux-download-clipboard-XXXXXX", error);
+    if (!manager->clipboard_directory)
+        return FALSE;
+    errno = 0;
+    if (g_chmod(manager->clipboard_directory, 0700) < 0 ||
+        g_stat(manager->clipboard_directory, &status) < 0 ||
+        !safe_destination_directory(&status) ||
+        (status.st_mode & 0777) != 0700) {
+        gint saved_errno = errno != 0 ? errno : EPERM;
+
+        g_rmdir(manager->clipboard_directory);
+        g_clear_pointer(&manager->clipboard_directory, g_free);
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "cannot secure clipboard download directory: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void
+cleanup_clipboard_directory(MuxDownloadManager *manager)
+{
+    guint i;
+
+    if (manager->clipboard_paths) {
+        for (i = 0; i < manager->clipboard_paths->len; i++)
+            g_unlink(g_ptr_array_index(manager->clipboard_paths, i));
+        g_ptr_array_set_size(manager->clipboard_paths, 0);
+    }
+    if (manager->clipboard_directory) {
+        g_rmdir(manager->clipboard_directory);
+        g_clear_pointer(&manager->clipboard_directory, g_free);
+    }
 }
 
 static gchar *
@@ -1085,12 +1138,10 @@ on_decide_destination(WebKitDownload *download,
                       const gchar *suggested_filename,
                       PendingDownload *pending)
 {
-    g_autofree gchar *download_directory =
-        default_download_directory();
+    g_autofree gchar *download_directory = NULL;
     g_autofree gchar *safe_name =
         sanitize_filename(suggested_filename);
-    g_autofree gchar *default_path =
-        g_build_filename(download_directory, safe_name, NULL);
+    g_autofree gchar *default_path = NULL;
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_DOWNLOAD_DESTINATION);
     g_autoptr(GBytes) payload = NULL;
@@ -1103,7 +1154,19 @@ on_decide_destination(WebKitDownload *download,
                                 "download requested a destination twice");
         return TRUE;
     }
-    if (g_mkdir_with_parents(download_directory, 0700) < 0) {
+    if (pending->clipboard_target) {
+        if (!ensure_clipboard_directory(pending->manager, &error)) {
+            request_download_cancel(pending, error->message);
+            return TRUE;
+        }
+        download_directory =
+            g_strdup(pending->manager->clipboard_directory);
+    } else {
+        download_directory = default_download_directory();
+    }
+    default_path = g_build_filename(download_directory, safe_name, NULL);
+    if (!pending->clipboard_target &&
+        g_mkdir_with_parents(download_directory, 0700) < 0) {
         failure = g_strdup_printf("cannot create download directory: %s",
                                   g_strerror(errno));
         request_download_cancel(pending, failure);
@@ -1112,6 +1175,11 @@ on_decide_destination(WebKitDownload *download,
     g_free(pending->suggested_filename);
     pending->suggested_filename = g_strdup(safe_name);
     pending->state = DOWNLOAD_STATE_WAITING_DESTINATION;
+    if (pending->clipboard_target) {
+        if (!begin_destination(pending, default_path, &error))
+            request_download_cancel(pending, error->message);
+        return TRUE;
+    }
     clear_destination_timeout(pending);
     pending->destination_timeout_id = g_timeout_add(
         MUX_DOWNLOAD_DESTINATION_TIMEOUT_MS,
@@ -1225,7 +1293,51 @@ on_finished(WebKitDownload *download, PendingDownload *pending)
         event_message = g_strdup(pending->failure_message);
         emit_terminal = TRUE;
     } else if (pending->state != DOWNLOAD_STATE_FAILED) {
-        if (finalize_download(pending, &error)) {
+        if (finalize_download(pending, &error) &&
+            pending->clipboard_target) {
+            MuxDownloadManager *manager = pending->manager;
+            MuxDownloadClipboardFunc clipboard_func =
+                manager->clipboard_func;
+            WebKitURIResponse *response =
+                webkit_download_get_response(pending->download);
+            g_autofree gchar *mime_type = g_strdup(
+                response ? webkit_uri_response_get_mime_type(response)
+                         : NULL);
+            g_autofree gchar *path = g_strdup(pending->final_path);
+            WebKitWebView *view = pending->source_view
+                                      ? g_object_ref(pending->source_view)
+                                      : NULL;
+            gpointer callback_data = manager->user_data;
+
+            if (g_chmod(path, 0600) < 0 || !clipboard_func) {
+                g_autofree gchar *message = !clipboard_func
+                    ? g_strdup("clipboard publication is unavailable")
+                    : g_strdup_printf("cannot secure clipboard file: %s",
+                                      g_strerror(errno));
+
+                g_unlink(path);
+                pending->state = DOWNLOAD_STATE_FAILED;
+                remove_pending(pending);
+                if (view)
+                    g_object_unref(view);
+                g_warning("download to clipboard failed: %s", message);
+                return;
+            }
+
+            pending->state = DOWNLOAD_STATE_FINISHED;
+            g_ptr_array_add(manager->clipboard_paths, g_strdup(path));
+            remove_pending(pending);
+            if (!clipboard_func(view,
+                                path,
+                                mime_type,
+                                callback_data,
+                                &error))
+                g_warning("download to clipboard publication failed: %s",
+                          error ? error->message : "unknown error");
+            if (view)
+                g_object_unref(view);
+            return;
+        } else if (!error) {
             pending->state = DOWNLOAD_STATE_FINISHED;
             event.type = MUX_DOWNLOAD_EVENT_FINISHED;
         } else {
@@ -1282,6 +1394,8 @@ on_download_started(WebKitNetworkSession *network_session,
     pending->manager = manager;
     pending->download = g_object_ref(download);
     pending->source_view = source_view ? g_object_ref(source_view) : NULL;
+    pending->clipboard_target =
+        g_hash_table_remove(manager->clipboard_requests, download);
     if (!reserve_pending_slot(pending) ||
         !reserve_active_slot(pending)) {
         pending_download_free(pending);
@@ -1345,6 +1459,11 @@ mux_download_manager_new(WebKitNetworkSession *network_session,
         g_hash_table_new(g_direct_hash, g_direct_equal);
     manager->active_by_view =
         g_hash_table_new(g_direct_hash, g_direct_equal);
+    manager->clipboard_requests = g_hash_table_new_full(g_direct_hash,
+                                                        g_direct_equal,
+                                                        g_object_unref,
+                                                        NULL);
+    manager->clipboard_paths = g_ptr_array_new_with_free_func(g_free);
     manager->send_func = send_func;
     manager->event_func = event_func;
     manager->user_data = user_data;
@@ -1383,10 +1502,77 @@ mux_download_manager_free(MuxDownloadManager *manager)
     g_assert(manager->active_count == 0);
     g_clear_pointer(&manager->pending_by_view, g_hash_table_unref);
     g_clear_pointer(&manager->active_by_view, g_hash_table_unref);
+    g_clear_pointer(&manager->clipboard_requests, g_hash_table_unref);
+    cleanup_clipboard_directory(manager);
+    g_clear_pointer(&manager->clipboard_paths, g_ptr_array_unref);
     if (manager->user_data_destroy)
         manager->user_data_destroy(manager->user_data);
     g_clear_object(&manager->network_session);
     g_free(manager);
+}
+
+void
+mux_download_manager_set_clipboard_func(
+    MuxDownloadManager *manager,
+    MuxDownloadClipboardFunc clipboard_func)
+{
+    g_return_if_fail(manager);
+    manager->clipboard_func = clipboard_func;
+}
+
+gboolean
+mux_download_manager_download_uri_to_clipboard(
+    MuxDownloadManager *manager,
+    WebKitWebView *source_view,
+    const gchar *uri,
+    GError **error)
+{
+    g_autofree gchar *scheme = NULL;
+    WebKitDownload *download;
+    PendingDownload *pending;
+
+    g_return_val_if_fail(manager, FALSE);
+    g_return_val_if_fail(WEBKIT_IS_WEB_VIEW(source_view), FALSE);
+    if (!uri || !*uri || strlen(uri) > MUX_UI_MAX_PATH ||
+        !g_utf8_validate(uri, -1, NULL)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "clipboard download URI is invalid");
+        return FALSE;
+    }
+    scheme = g_uri_parse_scheme(uri);
+    if (!scheme ||
+        !(g_ascii_strcasecmp(scheme, "http") == 0 ||
+          g_ascii_strcasecmp(scheme, "https") == 0 ||
+          g_ascii_strcasecmp(scheme, "ftp") == 0 ||
+          g_ascii_strcasecmp(scheme, "data") == 0 ||
+          g_ascii_strcasecmp(scheme, "blob") == 0 ||
+          g_ascii_strcasecmp(scheme, "file") == 0)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_SUPPORTED,
+                            "clipboard download URI scheme is unsupported");
+        return FALSE;
+    }
+
+    download = webkit_web_view_download_uri(source_view, uri);
+    if (!download) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "WebKit did not create the clipboard download");
+        return FALSE;
+    }
+    pending = g_hash_table_lookup(manager->by_download, download);
+    if (pending) {
+        pending->clipboard_target = TRUE;
+    } else {
+        g_hash_table_add(manager->clipboard_requests,
+                         g_object_ref(download));
+    }
+    g_object_unref(download);
+    return TRUE;
 }
 
 gboolean

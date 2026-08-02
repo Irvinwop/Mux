@@ -187,6 +187,35 @@ test_terminal_event_classification(void)
     pending_clear(&pending);
 }
 
+static void
+test_clipboard_directory_is_private_and_retained(void)
+{
+    MuxDownloadManager manager = { 0 };
+    g_autofree gchar *directory = NULL;
+    g_autofree gchar *path = NULL;
+    g_autoptr(GError) error = NULL;
+    struct stat status;
+
+    manager.clipboard_paths = g_ptr_array_new_with_free_func(g_free);
+    g_assert_true(ensure_clipboard_directory(&manager, &error));
+    g_assert_no_error(error);
+    directory = g_strdup(manager.clipboard_directory);
+    g_assert_cmpint(g_stat(directory, &status), ==, 0);
+    g_assert_true(S_ISDIR(status.st_mode));
+    g_assert_cmpuint(status.st_uid, ==, geteuid());
+    g_assert_cmpuint(status.st_mode & 0777, ==, 0700);
+
+    path = g_build_filename(directory, "retained.bin", NULL);
+    g_assert_true(g_file_set_contents(path, "file", 4, &error));
+    g_assert_no_error(error);
+    g_ptr_array_add(manager.clipboard_paths, g_strdup(path));
+    cleanup_clipboard_directory(&manager);
+    g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+    g_assert_false(g_file_test(directory, G_FILE_TEST_EXISTS));
+    g_assert_null(manager.clipboard_directory);
+    g_ptr_array_unref(manager.clipboard_paths);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -199,5 +228,7 @@ main(int argc, char **argv)
                     test_collision_safe_atomic_completion);
     g_test_add_func("/download/terminal-events",
                     test_terminal_event_classification);
+    g_test_add_func("/download/clipboard-private-retention",
+                    test_clipboard_directory_is_private_and_retained);
     return g_test_run();
 }

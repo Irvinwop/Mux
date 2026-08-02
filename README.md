@@ -166,6 +166,8 @@ The v0.1 code currently wires these paths:
 - URL navigation and search-query resolution.
 - Keyboard, pointer, focus, resize, and high-DPI input transport.
 - Clipboard synchronization and bounded, profile-scoped clipboard history.
+- Context-menu downloads directly to a multi-format file clipboard backed by
+  an owner-only temporary directory.
 - Trusted UI requests for dialogs, permissions, authentication, file choices,
   downloads, menus, popups, notifications, and renderer crashes.
 
@@ -217,6 +219,8 @@ Browser content does not execute inside `muxd`.
 - In-flight trusted UI requests are cancelled when an engine crashes.
 - One dedicated Kitty OS window is supported; layers are tabs in that window.
 - Browser shortcuts and trusted overlays still require interactive coverage.
+- Download-to-clipboard supports paste-aware file consumers. Sites that accept
+  only a real drag event still need the separate drag-and-drop bridge.
 - Site compatibility, media codecs, downloads, uploads, permissions, popups,
   notifications, clipboard bridging, and renderer recovery are not yet
   release-qualified end to end.

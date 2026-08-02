@@ -2397,6 +2397,7 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
         stride != rectangle_width * 4 ||
         shm_size != (guint64)stride * rectangle_height ||
         !g_str_has_prefix(shm_name, "/")) {
+        g_printerr("mux-pane: invalid FRAME payload\n");
         g_free(shm_name);
         return FALSE;
     }
@@ -2413,6 +2414,7 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
     }
 
     if (pane->frame_waiting) {
+        g_printerr("mux-pane: FRAME arrived while Kitty response is pending\n");
         g_free(shm_name);
         return FALSE;
     }
@@ -2459,6 +2461,7 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
         }
     }
     if (!queue_frame_response(pane, message->serial)) {
+        g_printerr("mux-pane: could not track Kitty FRAME response\n");
         g_free(command);
         g_free(encoded_name);
         g_free(shm_name);
@@ -3134,6 +3137,7 @@ static void
 handle_kitty_key(Pane *pane, const gchar *parameters)
 {
     gchar **fields = g_strsplit(parameters, ";", 4);
+    gsize field_count = g_strv_length(fields);
     gchar **key_fields;
     gchar **modifier_fields = NULL;
     g_autofree gchar *committed_text = NULL;
@@ -3153,7 +3157,7 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
     }
     key_fields = g_strsplit(fields[0], ":", 3);
     key_number = (guint32)g_ascii_strtoull(key_fields[0], NULL, 10);
-    if (fields[1] && *fields[1]) {
+    if (field_count > 1 && fields[1] && *fields[1]) {
         modifier_fields = g_strsplit(fields[1], ":", 2);
         encoded_modifiers =
             (guint)g_ascii_strtoull(modifier_fields[0], NULL, 10);
@@ -3161,7 +3165,9 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
             event_type =
                 (guint)g_ascii_strtoull(modifier_fields[1], NULL, 10);
     }
-    committed_text = kitty_committed_text(fields[2], key_number);
+    committed_text = kitty_committed_text(
+        field_count > 2 ? fields[2] : NULL,
+        key_number);
     if (committed_text && *committed_text)
         text_codepoint = g_utf8_get_char(committed_text);
 

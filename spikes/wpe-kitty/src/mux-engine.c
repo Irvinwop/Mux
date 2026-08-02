@@ -652,19 +652,26 @@ engine_view_apply_geometry(EngineView *view)
         ? wpe_view_get_toplevel(wpe_view)
         : NULL;
     WPEScreen *screen;
+    guint logical_width;
+    guint logical_height;
+    int current_width;
+    int current_height;
     gdouble scale;
 
     if (!toplevel)
         return FALSE;
     scale = view->scale_milli / 1000.0;
+    logical_width = logical_dimension(view->width, view->scale_milli);
+    logical_height = logical_dimension(view->height, view->scale_milli);
     screen = wpe_toplevel_get_screen(toplevel);
     if (screen)
         wpe_screen_set_scale(screen, scale);
     wpe_toplevel_scale_changed(toplevel, scale);
-    return wpe_toplevel_resize(
-        toplevel,
-        logical_dimension(view->width, view->scale_milli),
-        logical_dimension(view->height, view->scale_milli));
+    wpe_toplevel_get_size(toplevel, &current_width, &current_height);
+    if (current_width == (int)logical_width &&
+        current_height == (int)logical_height)
+        return TRUE;
+    return wpe_toplevel_resize(toplevel, logical_width, logical_height);
 }
 
 static gboolean
@@ -1611,6 +1618,165 @@ download_output(WebKitWebView *source_view,
 }
 
 static gboolean
+add_download_clipboard_text(MuxClipboardSnapshot *snapshot,
+                            const gchar *mime,
+                            const gchar *text,
+                            GError **error)
+{
+    GBytes *bytes = g_bytes_new(text, strlen(text));
+    gboolean result =
+        mux_clipboard_snapshot_add(snapshot, mime, bytes, error);
+
+    g_bytes_unref(bytes);
+    return result;
+}
+
+static MuxClipboardSnapshot *
+download_clipboard_snapshot(const gchar *path,
+                            const gchar *mime_type,
+                            GError **error)
+{
+    g_autofree gchar *uri = g_filename_to_uri(path, NULL, error);
+    g_autofree gchar *uri_list = NULL;
+    g_autofree gchar *gnome_files = NULL;
+    MuxClipboardSnapshot *snapshot;
+    const gchar *content_mime =
+        mux_clipboard_mime_is_valid(mime_type)
+            ? mime_type
+            : "application/octet-stream";
+    struct stat status;
+
+    if (!uri)
+        return NULL;
+    uri_list = g_strconcat(uri, "\r\n", NULL);
+    gnome_files = g_strconcat("copy\n", uri, "\n", NULL);
+    snapshot = mux_clipboard_snapshot_new((guint64)g_get_monotonic_time());
+    if (!add_download_clipboard_text(snapshot,
+                                     "text/uri-list",
+                                     uri_list,
+                                     error) ||
+        !add_download_clipboard_text(snapshot,
+                                     "x-special/gnome-copied-files",
+                                     gnome_files,
+                                     error) ||
+        !add_download_clipboard_text(snapshot,
+                                     "application/x-kde4-urilist",
+                                     uri_list,
+                                     error) ||
+        !add_download_clipboard_text(snapshot,
+                                     "public.file-url",
+                                     uri,
+                                     error) ||
+        !add_download_clipboard_text(snapshot,
+                                     "text/plain;charset=utf-8",
+                                     path,
+                                     error)) {
+        mux_clipboard_snapshot_unref(snapshot);
+        return NULL;
+    }
+
+    if (stat(path, &status) == 0 && S_ISREG(status.st_mode) &&
+        status.st_size >= 0 &&
+        (guint64)status.st_size <= MUX_CLIPBOARD_MAX_ITEM_BYTES &&
+        !mux_clipboard_snapshot_find(snapshot, content_mime)) {
+        GBytes *bytes = NULL;
+        GMappedFile *mapped = NULL;
+
+        if (status.st_size == 0) {
+            bytes = g_bytes_new_static("", 0);
+        } else {
+            mapped = g_mapped_file_new(path, FALSE, NULL);
+            if (mapped)
+                bytes = g_mapped_file_get_bytes(mapped);
+        }
+        if (bytes && !mux_clipboard_snapshot_add(snapshot,
+                                                  content_mime,
+                                                  bytes,
+                                                  error)) {
+            g_bytes_unref(bytes);
+            if (mapped)
+                g_mapped_file_unref(mapped);
+            mux_clipboard_snapshot_unref(snapshot);
+            return NULL;
+        }
+        if (bytes)
+            g_bytes_unref(bytes);
+        if (mapped)
+            g_mapped_file_unref(mapped);
+    }
+    mux_clipboard_snapshot_seal(snapshot);
+    return snapshot;
+}
+
+static gboolean
+download_clipboard_output(WebKitWebView *source_view,
+                          const gchar *path,
+                          const gchar *mime_type,
+                          gpointer data,
+                          GError **error)
+{
+    Engine *engine = data;
+    EngineView *view = view_for_web_view(engine, source_view);
+    g_autoptr(MuxClipboardSnapshot) snapshot = NULL;
+    g_autoptr(MuxClipboardEngineWrite) write = NULL;
+    g_autofree gchar *origin = NULL;
+
+    if (!view || !engine->clipboard_link) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_CONNECTED,
+                            "clipboard download source pane is unavailable");
+        return FALSE;
+    }
+    snapshot = download_clipboard_snapshot(path, mime_type, error);
+    if (!snapshot)
+        return FALSE;
+    origin = clipboard_origin(view);
+    if (!mux_clipboard_engine_link_set_active_source(engine->clipboard_link,
+                                                     view->id,
+                                                     origin,
+                                                     view->ephemeral,
+                                                     error))
+        return FALSE;
+    write = mux_clipboard_engine_link_begin_write(engine->clipboard_link);
+    if (!write ||
+        !mux_clipboard_engine_link_complete_write(engine->clipboard_link,
+                                                  write,
+                                                  snapshot,
+                                                  error))
+        return FALSE;
+    mux_wpe_clipboard_set_external(
+        MUX_WPE_CLIPBOARD(mux_clipboard_engine_link_get_clipboard(
+            engine->clipboard_link)),
+        snapshot);
+    return TRUE;
+}
+
+static gboolean
+download_context_to_clipboard(WebKitWebView *web_view,
+                              const gchar *uri,
+                              gpointer data,
+                              GError **error)
+{
+    EngineView *view = data;
+    MuxDownloadManager *manager = view->ephemeral
+        ? view->download_manager
+        : view->engine->download_manager;
+
+    if (!manager) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_CONNECTED,
+                            "download manager is unavailable");
+        return FALSE;
+    }
+    return mux_download_manager_download_uri_to_clipboard(manager,
+                                                          web_view,
+                                                          uri,
+                                                          error);
+}
+
+static gboolean
 engine_view_prepare_private_network(EngineView *view, GError **error)
 {
     g_return_val_if_fail(view != NULL, FALSE);
@@ -1636,6 +1802,8 @@ engine_view_prepare_private_network(EngineView *view, GError **error)
                             "private WebKit download manager construction failed");
         return FALSE;
     }
+    mux_download_manager_set_clipboard_func(view->download_manager,
+                                            download_clipboard_output);
     return TRUE;
 }
 
@@ -3133,6 +3301,9 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
         g_free(uri);
         return TRUE;
     }
+    mux_browser_affordance_bridge_set_download_func(
+        view->affordance_bridge,
+        download_context_to_clipboard);
     view->notification_engine = mux_notification_engine_new(
         view->web_view,
         view->ephemeral,
@@ -5126,6 +5297,8 @@ initialize_browser(Engine *engine, GError **error)
                             "WebKit download manager construction failed");
         return FALSE;
     }
+    mux_download_manager_set_clipboard_func(engine->download_manager,
+                                            download_clipboard_output);
 
     webkit_network_session_set_itp_enabled(engine->persistent_session, TRUE);
     return TRUE;

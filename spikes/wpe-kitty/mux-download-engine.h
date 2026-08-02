@@ -46,6 +46,12 @@ typedef gboolean (*MuxDownloadSendFunc)(WebKitWebView *source_view,
 typedef void (*MuxDownloadEventFunc)(const MuxDownloadEvent *event,
                                      gpointer user_data);
 
+typedef gboolean (*MuxDownloadClipboardFunc)(WebKitWebView *source_view,
+                                              const gchar *path,
+                                              const gchar *mime_type,
+                                              gpointer user_data,
+                                              GError **error);
+
 MuxDownloadManager *mux_download_manager_new(
     WebKitNetworkSession *network_session,
     MuxDownloadSendFunc send_func,
@@ -54,6 +60,16 @@ MuxDownloadManager *mux_download_manager_new(
     GDestroyNotify user_data_destroy);
 
 void mux_download_manager_free(MuxDownloadManager *manager);
+
+void mux_download_manager_set_clipboard_func(
+    MuxDownloadManager *manager,
+    MuxDownloadClipboardFunc clipboard_func);
+
+gboolean mux_download_manager_download_uri_to_clipboard(
+    MuxDownloadManager *manager,
+    WebKitWebView *source_view,
+    const gchar *uri,
+    GError **error);
 
 /*
  * Handles a mux-ui response or cancel record routed from any pane.

@@ -28,6 +28,7 @@ struct _MuxClipboardBrokerClient {
     MuxClipboardBrokerClientMutationFunc mutation_func;
     MuxClipboardBrokerClientFailureFunc failure_func;
     MuxClipboardBrokerClientObservationFunc observation_func;
+    gpointer observation_data;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     MuxClipboardWireAssembler *assembler;
@@ -279,10 +280,12 @@ mux_clipboard_broker_client_unref(MuxClipboardBrokerClient *client)
 void
 mux_clipboard_broker_client_set_observation_func(
     MuxClipboardBrokerClient *client,
-    MuxClipboardBrokerClientObservationFunc observation_func)
+    MuxClipboardBrokerClientObservationFunc observation_func,
+    gpointer observation_data)
 {
     g_return_if_fail(client != NULL);
     client->observation_func = observation_func;
+    client->observation_data = observation_data;
 }
 
 gboolean
@@ -477,7 +480,7 @@ complete_observation(MuxClipboardBrokerClient *client,
                                  transaction_id,
                                  result,
                                  cause,
-                                 client->user_data);
+                                 client->observation_data);
     } else if (result == MUX_CLIPBOARD_BROKER_OBSERVATION_REJECTED) {
         report_failure(client, "clipboard-observe", cause);
     }
