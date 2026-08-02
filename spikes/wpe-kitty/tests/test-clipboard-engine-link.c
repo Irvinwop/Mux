@@ -272,6 +272,41 @@ test_cancelled_write_has_independent_lifetime(void)
     packet_sink_clear(&sink);
 }
 
+static void
+test_external_content_is_readable_through_wpe(void)
+{
+    PacketSink sink = { 0 };
+    g_autoptr(MuxClipboardEngineLink) link = NULL;
+    g_autoptr(MuxClipboardSnapshot) snapshot = test_snapshot(9);
+    g_autoptr(GBytes) bytes = NULL;
+    const gchar *data;
+    gsize length;
+
+    packet_sink_init(&sink);
+    link = mux_clipboard_engine_link_new(test_display(),
+                                         "profile-d",
+                                         FALSE,
+                                         packet_output,
+                                         NULL,
+                                         NULL,
+                                         &sink,
+                                         NULL);
+    g_assert_nonnull(link);
+
+    mux_wpe_clipboard_set_external(
+        MUX_WPE_CLIPBOARD(mux_clipboard_engine_link_get_clipboard(link)),
+        snapshot);
+    bytes = wpe_clipboard_read_bytes(
+        mux_clipboard_engine_link_get_clipboard(link),
+        "text/plain;charset=utf-8");
+    g_assert_nonnull(bytes);
+    data = g_bytes_get_data(bytes, &length);
+    g_assert_cmpuint(length, ==, 7);
+    g_assert_cmpmem(data, length, "payload", 7);
+
+    packet_sink_clear(&sink);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -282,5 +317,7 @@ main(int argc, char **argv)
                     test_wpe_publication_survives_reentrant_focus_switch);
     g_test_add_func("/clipboard/engine-link/cancel-lifetime",
                     test_cancelled_write_has_independent_lifetime);
+    g_test_add_func("/clipboard/engine-link/wpe-external-public-read",
+                    test_external_content_is_readable_through_wpe);
     return g_test_run();
 }

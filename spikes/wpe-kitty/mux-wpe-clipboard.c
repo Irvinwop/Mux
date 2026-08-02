@@ -301,12 +301,12 @@ mux_wpe_clipboard_set_external(MuxWpeClipboard *clipboard,
     g_clear_pointer(&clipboard->external, mux_clipboard_snapshot_unref);
     clipboard->external = copy;
 
-    formats = g_ptr_array_new_with_free_func(g_free);
+    formats = g_ptr_array_new();
     for (i = 0; i < mux_clipboard_snapshot_get_count(copy); i++) {
         const gchar *mime = NULL;
 
         mux_clipboard_snapshot_get_item(copy, i, &mime, NULL);
-        g_ptr_array_add(formats, g_strdup(mime));
+        g_ptr_array_add(formats, (gpointer)g_intern_string(mime));
     }
     g_ptr_array_add(formats, NULL);
 
