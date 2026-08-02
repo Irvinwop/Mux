@@ -1213,7 +1213,8 @@ mux_pane_clipboard_request_fresh_paste(
         (gint64)MUX_PANE_CLIPBOARD_FRESH_PASTE_TIMEOUT_MS * 1000;
     clipboard->fresh_callback = callback;
     clipboard->fresh_callback_data = callback_data;
-    if (!start_fresh_read(clipboard, error)) {
+    if (!mux_clipboard_pane_link_write_pending(clipboard->link) &&
+        !start_fresh_read(clipboard, error)) {
         clear_fresh_paste(clipboard);
         return FALSE;
     }
@@ -1304,6 +1305,10 @@ mux_pane_clipboard_tick(MuxPaneClipboard *clipboard, gint64 monotonic_us)
     operation = pane_clipboard_acquire(clipboard);
     (void)operation;
     mux_clipboard_pane_link_tick(clipboard->link, monotonic_us);
+    if (clipboard->fresh_state == FRESH_PASTE_STARTING &&
+        !mux_clipboard_pane_link_write_pending(clipboard->link) &&
+        !start_fresh_read(clipboard, &error))
+        fail_fresh_paste(clipboard, "fresh-paste-read", error);
     mux_kitty_clipboard_tick(clipboard->fresh_kitty, monotonic_us);
     if (clipboard->fresh_error != NULL) {
         complete_failed_fresh_paste(clipboard);

@@ -591,6 +591,14 @@ mux_clipboard_pane_link_handle_packet(MuxClipboardPaneLink *link,
 }
 
 gboolean
+mux_clipboard_pane_link_write_pending(const MuxClipboardPaneLink *link)
+{
+    g_return_val_if_fail(link != NULL, FALSE);
+    return link->pending_engine_write != NULL ||
+           mux_kitty_clipboard_write_pending(link->kitty);
+}
+
+gboolean
 mux_clipboard_pane_link_apply_history(
     MuxClipboardPaneLink *link,
     const MuxClipboardSnapshot *snapshot,
