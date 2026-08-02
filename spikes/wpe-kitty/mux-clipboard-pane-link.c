@@ -169,6 +169,13 @@ complete_pending_engine_write(MuxClipboardPaneLink *link, GError **error)
         return reject_pending_engine_write(
             link, "Kitty rejected clipboard transaction", error);
     transaction_id = pending->transaction_id;
+    mux_clipboard_smoke_trace(
+        MUX_CLIPBOARD_TRACE_KITTY_WRITE_DONE,
+        &(MuxClipboardTraceFields) {
+            .transaction_id = transaction_id,
+            .view_id = pending->source_view_id,
+            .snapshot = pending->snapshot
+        });
     if (!pending->observed &&
         (pending->flags & MUX_CLIPBOARD_WIRE_FLAG_HISTORY) &&
         link->observe_func != NULL) {
@@ -530,6 +537,14 @@ mux_clipboard_pane_link_handle_packet(MuxClipboardPaneLink *link,
     snapshot = mux_clipboard_wire_transfer_get_snapshot(transfer);
     transaction_id =
         mux_clipboard_wire_transfer_get_transaction_id(transfer);
+    mux_clipboard_smoke_trace(
+        MUX_CLIPBOARD_TRACE_ENGINE_TO_PANE,
+        &(MuxClipboardTraceFields) {
+            .transaction_id = transaction_id,
+            .view_id =
+                mux_clipboard_wire_transfer_get_source_view_id(transfer),
+            .snapshot = snapshot
+        });
     if (link->pending_engine_write != NULL ||
         mux_kitty_clipboard_write_pending(link->kitty)) {
         result = send_engine_result(link,

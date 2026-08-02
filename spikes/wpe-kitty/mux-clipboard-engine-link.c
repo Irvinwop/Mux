@@ -169,6 +169,13 @@ on_webkit_publish(MuxWpeClipboard *clipboard,
     g_autoptr(GError) error = NULL;
 
     (void)clipboard;
+    mux_clipboard_smoke_trace(
+        MUX_CLIPBOARD_TRACE_WPE_LOCAL,
+        &(MuxClipboardTraceFields) {
+            .transaction_id = write->transaction_id,
+            .view_id = write->source_view_id,
+            .snapshot = snapshot
+        });
     if (!mux_clipboard_engine_link_complete_write(link,
                                                   write,
                                                   snapshot,
@@ -368,8 +375,18 @@ mux_clipboard_engine_link_handle_packet(MuxClipboardEngineLink *link,
         goto out;
     }
 
+    transaction_id =
+        mux_clipboard_wire_transfer_get_transaction_id(transfer);
     snapshot = mux_clipboard_wire_transfer_get_snapshot(transfer);
     mux_wpe_clipboard_set_external(link->clipboard, snapshot);
+    mux_clipboard_smoke_trace(
+        MUX_CLIPBOARD_TRACE_ENGINE_EXTERNAL,
+        &(MuxClipboardTraceFields) {
+            .transaction_id = transaction_id,
+            .view_id =
+                mux_clipboard_wire_transfer_get_source_view_id(transfer),
+            .snapshot = snapshot
+        });
     if ((mux_clipboard_wire_transfer_get_flags(transfer) &
          MUX_CLIPBOARD_WIRE_FLAG_PASTE) &&
         link->paste_func != NULL) {
@@ -381,9 +398,6 @@ mux_clipboard_engine_link_handle_packet(MuxClipboardEngineLink *link,
                          snapshot,
                          link->user_data);
     }
-
-    transaction_id =
-        mux_clipboard_wire_transfer_get_transaction_id(transfer);
     result = send_ack(link, transaction_id, error);
 
 out:

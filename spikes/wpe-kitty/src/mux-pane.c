@@ -3075,12 +3075,20 @@ fresh_paste_ready(MuxPaneClipboard *clipboard,
                   gpointer user_data)
 {
     Pane *pane = user_data;
+    guint key_count;
 
     (void)clipboard;
-    (void)fresh;
     if (request_id != pane->fresh_paste_request_id)
         return;
+    key_count = pane->delayed_paste_count;
     pane->fresh_paste_request_id = 0;
+    mux_clipboard_smoke_trace(
+        MUX_CLIPBOARD_TRACE_DELAYED_PASTE,
+        &(MuxClipboardTraceFields) {
+            .request_id = request_id,
+            .key_count = key_count,
+            .fresh = fresh
+        });
     forward_delayed_paste_keys(pane);
 }
 

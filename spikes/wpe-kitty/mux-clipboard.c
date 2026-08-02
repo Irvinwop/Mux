@@ -1,6 +1,11 @@
+#define _GNU_SOURCE
+
 #include "mux-clipboard.h"
 
+#include <fcntl.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 typedef struct {
     gchar *mime;
@@ -269,4 +274,99 @@ mux_clipboard_snapshot_get_item(const MuxClipboardSnapshot *snapshot,
     if (bytes != NULL)
         *bytes = item->bytes;
     return TRUE;
+}
+
+static const gchar *
+trace_event_name(MuxClipboardTraceEvent event)
+{
+    switch (event) {
+    case MUX_CLIPBOARD_TRACE_WPE_LOCAL:
+        return "wpe-local";
+    case MUX_CLIPBOARD_TRACE_ENGINE_TO_PANE:
+        return "engine-to-pane";
+    case MUX_CLIPBOARD_TRACE_KITTY_WRITE_DONE:
+        return "kitty-write-done";
+    case MUX_CLIPBOARD_TRACE_MIME_DISCOVERY:
+        return "mime-discovery";
+    case MUX_CLIPBOARD_TRACE_ENGINE_EXTERNAL:
+        return "engine-external";
+    case MUX_CLIPBOARD_TRACE_DELAYED_PASTE:
+        return "delayed-paste";
+    }
+    return NULL;
+}
+
+void
+mux_clipboard_smoke_trace(MuxClipboardTraceEvent event,
+                          const MuxClipboardTraceFields *fields)
+{
+    const MuxClipboardSnapshot *snapshot;
+    const gchar *event_name;
+    const gchar *path;
+    struct stat status;
+    gchar line[512];
+    guint64 serial = 0;
+    gsize total_bytes = 0;
+    guint format_count;
+    gboolean has_text_plain;
+    gint length;
+    guint i;
+    int fd;
+
+    path = g_getenv("MUX_SMOKE_CLIPBOARD_TRACE_FILE");
+    if (path == NULL || !g_path_is_absolute(path) || fields == NULL)
+        return;
+    event_name = trace_event_name(event);
+    if (event_name == NULL)
+        return;
+
+    fd = open(path, O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return;
+    if (fstat(fd, &status) < 0 || !S_ISREG(status.st_mode) ||
+        status.st_uid != geteuid() || status.st_nlink != 1 ||
+        (status.st_mode & 0777) != (S_IRUSR | S_IWUSR)) {
+        close(fd);
+        return;
+    }
+
+    snapshot = fields->snapshot;
+    format_count = fields->format_count;
+    has_text_plain = fields->has_text_plain;
+    if (snapshot != NULL) {
+        serial = mux_clipboard_snapshot_get_serial(snapshot);
+        format_count = mux_clipboard_snapshot_get_count(snapshot);
+        total_bytes = mux_clipboard_snapshot_get_total_bytes(snapshot);
+        for (i = 0; i < format_count; i++) {
+            const gchar *mime = NULL;
+
+            if (mux_clipboard_snapshot_get_item(snapshot, i, &mime, NULL) &&
+                g_str_has_prefix(mime, "text/plain")) {
+                has_text_plain = TRUE;
+                break;
+            }
+        }
+    }
+
+    length = g_snprintf(
+        line,
+        sizeof(line),
+        "MUX_CLIPBOARD_TRACE_V1\tevent=%s\tpid=%ld\ttx=%" G_GUINT64_FORMAT
+        "\trequest=%" G_GUINT64_FORMAT "\tview=%" G_GUINT64_FORMAT
+        "\tserial=%" G_GUINT64_FORMAT "\tformats=%u\tbytes=%" G_GSIZE_FORMAT
+        "\tplain=%u\tfresh=%u\tkeys=%u\n",
+        event_name,
+        (long)getpid(),
+        fields->transaction_id,
+        fields->request_id,
+        fields->view_id,
+        serial,
+        format_count,
+        total_bytes,
+        has_text_plain,
+        fields->fresh,
+        fields->key_count);
+    if (length > 0 && (gsize)length < sizeof(line))
+        (void)write(fd, line, (gsize)length);
+    close(fd);
 }

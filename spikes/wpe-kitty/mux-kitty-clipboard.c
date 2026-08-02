@@ -423,6 +423,25 @@ complete_read(MuxKittyClipboard *clipboard, GError **error)
             launch_pending_offer(clipboard);
             return FALSE;
         }
+        {
+            gboolean has_text_plain = FALSE;
+            guint format_count = mimes->len > 0 ? mimes->len - 1 : 0;
+            guint i;
+
+            for (i = 0; i < format_count; i++) {
+                if (g_str_has_prefix(g_ptr_array_index(mimes, i),
+                                     "text/plain")) {
+                    has_text_plain = TRUE;
+                    break;
+                }
+            }
+            mux_clipboard_smoke_trace(
+                MUX_CLIPBOARD_TRACE_MIME_DISCOVERY,
+                &(MuxClipboardTraceFields) {
+                    .format_count = format_count,
+                    .has_text_plain = has_text_plain
+                });
+        }
         result = start_read(clipboard,
                             location,
                             (const gchar *const *)mimes->pdata,

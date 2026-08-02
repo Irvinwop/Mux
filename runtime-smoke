@@ -721,6 +721,7 @@ FIXTURE_STATE="$BASE/fixture-state"
 CLIPBOARD_TELEMETRY="$LOG_DIR/clipboard-qualification.log"
 : >"$CLIPBOARD_TELEMETRY"
 chmod 600 "$CLIPBOARD_TELEMETRY"
+export MUX_SMOKE_CLIPBOARD_TRACE_FILE="$CLIPBOARD_TELEMETRY"
 FIXTURE_SERVER="$REPO_ROOT/scripts/runtime-smoke-browser-clipboard-fixture.py"
 [[ -r $FIXTURE_SERVER ]] || fail "missing browser/clipboard fixture server: $FIXTURE_SERVER"
 
