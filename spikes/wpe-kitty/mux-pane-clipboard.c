@@ -1336,12 +1336,6 @@ mux_pane_clipboard_tick(MuxPaneClipboard *clipboard, gint64 monotonic_us)
             monotonic_us + MUX_PANE_CLIPBOARD_RECONNECT_US;
         g_clear_error(&error);
     }
-    if (clipboard->fresh_state == FRESH_PASTE_STARTING &&
-        !start_fresh_read(clipboard, &error)) {
-        fail_fresh_paste(clipboard, "fresh-paste-read", error);
-        complete_failed_fresh_paste(clipboard);
-        g_clear_error(&error);
-    }
     flush_fresh_observation(clipboard);
     flush_observation(clipboard);
 }
