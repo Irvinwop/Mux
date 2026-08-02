@@ -276,6 +276,78 @@ build_kitty_frame_command(gboolean image_present,
         encoded_name);
 }
 
+static gchar *
+find_overlay_label(const gchar *query,
+                   MuxEngineFindStatus status,
+                   guint matches,
+                   guint columns)
+{
+    static const gchar prefix[] = "MUX FIND | ";
+    g_autofree gchar *status_text = NULL;
+    GString *label = g_string_sized_new(MIN(columns, 256u));
+    const gchar *cursor;
+    guint status_width;
+    guint prefix_budget;
+    guint query_budget;
+    guint query_width = 0;
+
+    if (status == MUX_ENGINE_FIND_IDLE)
+        status_text = g_strdup("type to search");
+    else if (status == MUX_ENGINE_FIND_PENDING)
+        status_text = g_strdup("searching");
+    else if (status == MUX_ENGINE_FIND_FOUND)
+        status_text = g_strdup_printf("%u match%s",
+                                      matches,
+                                      matches == 1 ? "" : "es");
+    else if (status == MUX_ENGINE_FIND_NOT_FOUND)
+        status_text = g_strdup("no matches");
+    else
+        status_text = g_strdup("closed");
+
+    status_width = strlen(status_text);
+    if (!columns)
+        return g_string_free(label, FALSE);
+    if (columns <= status_width) {
+        g_string_append_len(label, status_text, columns);
+        return g_string_free(label, FALSE);
+    }
+
+    /* Preserve the complete status before allocating any space to query. */
+    prefix_budget = columns - status_width - 1u;
+    if (prefix_budget) {
+        guint prefix_width = MIN(prefix_budget, (guint)strlen(prefix));
+
+        g_string_append_len(label, prefix, prefix_width);
+        prefix_budget -= prefix_width;
+    }
+    query_budget = prefix_budget;
+    cursor = query ? query : "";
+    while (*cursor && query_width < query_budget) {
+        gunichar character = g_utf8_get_char_validated(cursor, -1);
+        guint width;
+
+        if (character == (gunichar)-1 || character == (gunichar)-2) {
+            character = '?';
+            cursor++;
+        } else {
+            cursor = g_utf8_next_char(cursor);
+            if (!g_unichar_isprint(character))
+                character = '?';
+        }
+        width = g_unichar_iszerowidth(character)
+            ? 0
+            : g_unichar_iswide(character) ? 2 : 1;
+        if (query_width + width > query_budget)
+            break;
+        g_string_append_unichar(label, character);
+        query_width += width;
+    }
+    if (label->len)
+        g_string_append_c(label, ' ');
+    g_string_append(label, status_text);
+    return g_string_free(label, FALSE);
+}
+
 #ifdef MUX_PANE_LOGIC_TEST
 
 gboolean
@@ -332,6 +404,15 @@ mux_pane_test_build_kitty_frame_command(gboolean image_present,
                                      encoded_name);
 }
 
+gchar *
+mux_pane_test_find_overlay_label(const gchar *query,
+                                 MuxEngineFindStatus status,
+                                 guint matches,
+                                 guint columns)
+{
+    return find_overlay_label(query, status, matches, columns);
+}
+
 #else
 
 /*
@@ -372,6 +453,9 @@ typedef struct {
     guint width;
     guint height;
     guint scale_milli;
+    guint64 find_generation;
+    guint find_matches;
+    MuxEngineFindStatus find_status;
     guint pointer_modifiers;
     gboolean image_present;
     gboolean frame_waiting;
@@ -382,6 +466,8 @@ typedef struct {
     gboolean visible;
     gboolean focused;
     gboolean ephemeral;
+    gboolean find_active;
+    gboolean find_overlay_visible;
     gboolean shutting_down;
     gboolean quit;
     struct termios saved_terminal;
@@ -409,6 +495,7 @@ typedef struct {
     gchar *control_id;
     gchar *active_layer;
     gchar *popup_token;
+    gchar *find_query;
     guint engine_backoff_ms;
     guint control_backoff_ms;
     guint events_backoff_ms;
@@ -427,6 +514,9 @@ typedef struct {
 
 static volatile sig_atomic_t resize_requested;
 static volatile sig_atomic_t quit_requested;
+
+static void find_overlay_repaint(Pane *pane);
+static void find_overlay_hide(Pane *pane);
 
 static void send_navigation(Pane *pane,
                             MuxEngineNavigationAction action,
@@ -679,6 +769,74 @@ terminal_write(Pane *pane, const gchar *text)
     return FALSE;
 }
 
+static void
+find_overlay_write(Pane *pane, const gchar *label)
+{
+    struct winsize window = { 0 };
+    g_autoptr(GString) command = NULL;
+    g_autoptr(GError) error = NULL;
+
+    if (!pane->terminal_active ||
+        ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) < 0 ||
+        !window.ws_row)
+        return;
+    command = g_string_new("\033[?2026h\0337");
+    g_string_append_printf(command,
+                           "\033[%u;1H\033[2K",
+                           (guint)window.ws_row);
+    if (label && *label) {
+        g_string_append(command, "\033[1;30;46m");
+        g_string_append(command, label);
+        g_string_append(command, "\033[0m");
+    }
+    g_string_append(command, "\0338\033[?2026l");
+    if (!terminal_output_enqueue(pane,
+                                 command->str,
+                                 command->len,
+                                 TERMINAL_OUTPUT_FRAME_RESERVE_BYTES,
+                                 &error))
+        g_warning("find overlay output failed: %s",
+                  error ? error->message : "unknown error");
+}
+
+static void
+find_overlay_hide(Pane *pane)
+{
+    if (!pane->find_overlay_visible)
+        return;
+    find_overlay_write(pane, NULL);
+    pane->find_overlay_visible = FALSE;
+}
+
+static void
+find_overlay_repaint(Pane *pane)
+{
+    struct winsize window = { 0 };
+    g_autofree gchar *label = NULL;
+
+    if (!pane->find_active) {
+        find_overlay_hide(pane);
+        return;
+    }
+    if (!pane->terminal_active || !pane->visible ||
+        (pane->ui_bridge &&
+         mux_ui_pane_bridge_is_active(pane->ui_bridge)) ||
+        (pane->clipboard &&
+         mux_pane_clipboard_picker_is_open(pane->clipboard))) {
+        pane->find_overlay_visible = FALSE;
+        return;
+    }
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) < 0 ||
+        !window.ws_col)
+        return;
+    label = find_overlay_label(pane->find_query,
+                               pane->find_status,
+                               pane->find_matches,
+                               window.ws_col);
+    find_overlay_write(pane, label);
+    pane->find_overlay_visible = TRUE;
+}
+
 static gboolean
 terminal_write_critical(Pane *pane, const gchar *text)
 {
@@ -875,6 +1033,12 @@ handle_runtime_engine_error(Pane *pane,
 static void
 disconnect_engine(Pane *pane)
 {
+    find_overlay_hide(pane);
+    pane->find_active = FALSE;
+    pane->find_generation = 0;
+    pane->find_status = MUX_ENGINE_FIND_CLOSED;
+    pane->find_matches = 0;
+    g_clear_pointer(&pane->find_query, g_free);
     if (pane->engine_fd >= 0)
         close(pane->engine_fd);
     pane->engine_fd = -1;
@@ -1549,6 +1713,11 @@ start_view(Pane *pane, const gchar *initial_uri)
         return FALSE;
     }
     pane->view_id = response.view_id;
+    pane->find_generation = 0;
+    pane->find_active = FALSE;
+    pane->find_status = MUX_ENGINE_FIND_CLOSED;
+    pane->find_matches = 0;
+    g_clear_pointer(&pane->find_query, g_free);
     pane->next_image_id++;
     if (!pane->next_image_id)
         pane->next_image_id++;
@@ -2421,6 +2590,50 @@ handle_metadata(Pane *pane, const MuxEngineMessage *message)
 }
 
 static gboolean
+handle_find_state(Pane *pane, const MuxEngineMessage *message)
+{
+    MuxEngineCursor cursor;
+    guint32 active;
+    guint32 status;
+    guint32 matches;
+    guint64 generation;
+    g_autofree gchar *query = NULL;
+    gsize query_length;
+
+    mux_engine_cursor_init(&cursor, message->payload);
+    if (message->flags != MUX_ENGINE_FLAG_NONE || !message->serial ||
+        !mux_engine_cursor_get_u32(&cursor, &active) || active > 1 ||
+        !mux_engine_cursor_get_u32(&cursor, &status) ||
+        status > MUX_ENGINE_FIND_NOT_FOUND ||
+        !mux_engine_cursor_get_u32(&cursor, &matches) ||
+        matches > MUX_ENGINE_MAX_FIND_MATCHES ||
+        !mux_engine_cursor_get_u64(&cursor, &generation) || !generation ||
+        !mux_engine_cursor_get_string(&cursor, &query) ||
+        !mux_engine_cursor_done(&cursor))
+        return FALSE;
+    query_length = strlen(query);
+    if (query_length > MUX_ENGINE_MAX_FIND_TEXT_BYTES ||
+        !g_utf8_validate(query, query_length, NULL) ||
+        (!active && (status != MUX_ENGINE_FIND_CLOSED ||
+                     matches || query_length)) ||
+        (active && status == MUX_ENGINE_FIND_CLOSED) ||
+        (status == MUX_ENGINE_FIND_FOUND && !matches) ||
+        (status != MUX_ENGINE_FIND_FOUND && matches))
+        return FALSE;
+    if (generation < pane->find_generation)
+        return TRUE;
+
+    pane->find_generation = generation;
+    pane->find_active = active != 0;
+    pane->find_status = (MuxEngineFindStatus)status;
+    pane->find_matches = matches;
+    g_free(pane->find_query);
+    pane->find_query = g_steal_pointer(&query);
+    find_overlay_repaint(pane);
+    return TRUE;
+}
+
+static gboolean
 handle_chooser_payload(Pane *pane,
                        MuxUiRecordType record_type,
                        const guint8 *packet,
@@ -2486,6 +2699,12 @@ handle_engine_message(Pane *pane)
         break;
     case MUX_ENGINE_MESSAGE_METADATA:
         handle_metadata(pane, &message);
+        break;
+    case MUX_ENGINE_MESSAGE_FIND_STATE:
+        if (!handle_find_state(pane, &message)) {
+            g_printerr("mux-pane: invalid FIND_STATE\n");
+            disconnect_engine(pane);
+        }
         break;
     case MUX_ENGINE_MESSAGE_CLOSE_READY:
         if (message.flags != MUX_ENGINE_FLAG_NONE ||
@@ -2561,6 +2780,9 @@ handle_engine_message(Pane *pane)
                                                         &error))
                 g_warning("pane UI payload rejected: %s",
                           error ? error->message : "unknown error");
+            if (pane->ui_bridge &&
+                mux_ui_pane_bridge_is_active(pane->ui_bridge))
+                pane->find_overlay_visible = FALSE;
         } else if (pane->clipboard != NULL &&
                    !mux_pane_clipboard_handle_engine_packet(
                        pane->clipboard,
@@ -2660,6 +2882,7 @@ chooser_suspend(gpointer user_data, GError **error)
                             "pane terminal is already suspended");
         return FALSE;
     }
+    find_overlay_hide(pane);
     g_byte_array_set_size(pane->input, 0);
     return terminal_disable(pane, error);
 }
@@ -2694,6 +2917,7 @@ chooser_resume(gpointer user_data, GError **error)
     if (pane->clipboard != NULL &&
         mux_pane_clipboard_picker_is_open(pane->clipboard))
         redraw_clipboard_picker(pane);
+    find_overlay_repaint(pane);
     return TRUE;
 }
 
@@ -2748,6 +2972,8 @@ handle_ui_key(Pane *pane,
                       error ? error->message : "unknown error");
             g_clear_error(&error);
         }
+        if (!mux_ui_pane_bridge_is_active(pane->ui_bridge))
+            find_overlay_repaint(pane);
     }
     return TRUE;
 }
@@ -2951,6 +3177,20 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
                       modifiers,
                       keyval,
                       text_codepoint)) {
+    } else if (pane->find_active) {
+        if (event_type != MUX_ENGINE_KEY_RELEASE &&
+            committed_text && *committed_text &&
+            !(modifiers & (WPE_MODIFIER_CONTROL |
+                           WPE_MODIFIER_ALT |
+                           WPE_MODIFIER_META)))
+            send_text_commit(pane,
+                             keyval,
+                             committed_text,
+                             strlen(committed_text));
+        send_key(pane,
+                 engine_key_event_type(event_type),
+                 modifiers,
+                 keyval);
     } else if (pane->clipboard != NULL &&
                owned_shortcut == MUX_SHORTCUT_CLIPBOARD_HISTORY) {
         if (execute_owned_shortcut) {
@@ -3251,7 +3491,9 @@ handle_csi(Pane *pane,
         MuxShortcut navigation_shortcut =
             mux_shortcut_match_engine(modifiers, keyval);
 
-        if (pane->clipboard != NULL &&
+        if (pane->find_active)
+            send_key_pair(pane, modifiers, keyval);
+        else if (pane->clipboard != NULL &&
             mux_pane_clipboard_picker_is_open(pane->clipboard)) {
             MuxClipboardPickerKey picker_key;
 
@@ -3436,7 +3678,18 @@ process_terminal_input(Pane *pane)
             }
         } else if (data[0] < 0x20 || data[0] == 0x7f) {
             guint byte = data[0];
-            if (pane->clipboard != NULL &&
+            if (pane->find_active) {
+                if (byte == 9)
+                    send_key_pair(pane, 0, KEY_TAB);
+                else if (byte == 13 || byte == 10)
+                    send_key_pair(pane, 0, KEY_RETURN);
+                else if (byte == 127)
+                    send_key_pair(pane, 0, KEY_BACKSPACE);
+                else if (byte >= 1 && byte <= 26)
+                    send_key_pair(pane,
+                                  WPE_MODIFIER_CONTROL,
+                                  'a' + byte - 1);
+            } else if (pane->clipboard != NULL &&
                 mux_pane_clipboard_picker_is_open(pane->clipboard) &&
                 (byte == 13 || byte == 10 || byte == 127 ||
                  byte == 21 || byte == 23)) {
@@ -3540,6 +3793,8 @@ handle_resize(Pane *pane)
     pane->height = height;
     delete_image(pane);
     send_resize(pane);
+    (void)ui_update_size(pane, NULL);
+    find_overlay_repaint(pane);
 }
 
 static void
@@ -3551,6 +3806,8 @@ set_visibility(Pane *pane, gboolean visible)
     if (pane->visible == visible)
         return;
     pane->visible = visible;
+    if (!visible)
+        find_overlay_hide(pane);
     send_engine_visibility(pane);
     if (!visible) {
         send_engine_focus(pane, FALSE);
@@ -3563,6 +3820,7 @@ set_visibility(Pane *pane, gboolean visible)
         pane->width = width;
         pane->height = height;
     }
+    find_overlay_repaint(pane);
     if (pane->clipboard != NULL &&
         mux_pane_clipboard_picker_is_open(pane->clipboard)) {
         send_engine_focus(pane, FALSE);
@@ -3995,6 +4253,7 @@ pane_clear(Pane *pane)
     g_free(pane->control_id);
     g_free(pane->active_layer);
     g_free(pane->popup_token);
+    g_free(pane->find_query);
     g_clear_pointer(&pane->main_context, g_main_context_unref);
 }
 
@@ -4022,6 +4281,18 @@ main(int argc, char **argv)
 
     g_set_prgname("mux-pane");
     signal(SIGPIPE, SIG_IGN);
+    {
+        g_autoptr(GError) scale_error = NULL;
+
+        if (!mux_engine_parse_device_scale(
+                g_getenv(MUX_DEVICE_SCALE_ENV),
+                &pane.scale_milli,
+                &scale_error)) {
+            g_printerr("mux-pane: %s\n", scale_error->message);
+            g_main_context_unref(pane.main_context);
+            return 2;
+        }
+    }
     pane.profile = g_strdup(profile_environment && *profile_environment
                                 ? profile_environment
                                 : "default");

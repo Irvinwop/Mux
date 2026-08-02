@@ -1,6 +1,7 @@
 #include "mux-engine-protocol.h"
 
 #include <errno.h>
+#include <gio/gio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -480,4 +481,68 @@ mux_engine_cursor_done(const MuxEngineCursor *cursor)
 {
     g_return_val_if_fail(cursor != NULL, FALSE);
     return cursor->offset == cursor->length;
+}
+
+gboolean
+mux_engine_parse_device_scale(const gchar *value,
+                              guint32 *scale_milli,
+                              GError **error)
+{
+    const gchar *cursor;
+    guint64 whole = 0;
+    guint32 fraction = 0;
+    guint fraction_digits = 0;
+    guint64 parsed;
+
+    g_return_val_if_fail(scale_milli != NULL, FALSE);
+    if (value == NULL) {
+        *scale_milli = MUX_ENGINE_DEFAULT_SCALE_MILLI;
+        return TRUE;
+    }
+
+    cursor = value;
+    if (!g_ascii_isdigit(*cursor))
+        goto invalid;
+    while (g_ascii_isdigit(*cursor)) {
+        whole = whole * 10u + (guint)(*cursor - '0');
+        if (whole > MUX_ENGINE_MAX_SCALE_MILLI / 1000u)
+            goto invalid;
+        cursor++;
+    }
+    if (*cursor == '.') {
+        cursor++;
+        if (!g_ascii_isdigit(*cursor))
+            goto invalid;
+        while (g_ascii_isdigit(*cursor)) {
+            if (fraction_digits == 3)
+                goto invalid;
+            fraction = fraction * 10u + (guint)(*cursor - '0');
+            fraction_digits++;
+            cursor++;
+        }
+    }
+    if (*cursor != '\0')
+        goto invalid;
+    while (fraction_digits < 3) {
+        fraction *= 10u;
+        fraction_digits++;
+    }
+    parsed = whole * 1000u + fraction;
+    if (parsed < MUX_ENGINE_MIN_SCALE_MILLI ||
+        parsed > MUX_ENGINE_MAX_SCALE_MILLI)
+        goto invalid;
+
+    *scale_milli = (guint32)parsed;
+    return TRUE;
+
+invalid:
+    g_set_error(error,
+                G_IO_ERROR,
+                G_IO_ERROR_INVALID_ARGUMENT,
+                "%s must be a decimal from %.3f through %.3f with at most "
+                "three fractional digits",
+                MUX_DEVICE_SCALE_ENV,
+                MUX_ENGINE_MIN_SCALE_MILLI / 1000.0,
+                MUX_ENGINE_MAX_SCALE_MILLI / 1000.0);
+    return FALSE;
 }

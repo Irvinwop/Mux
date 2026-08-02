@@ -43,8 +43,6 @@
 #define MUX_ENGINE_MAX_PIXELS (9u * 1024u * 1024u)
 #define MUX_ENGINE_FRAME_BUDGET_BYTES \
     ((gsize)256u * 1024u * 1024u)
-#define MUX_ENGINE_MIN_SCALE 250u
-#define MUX_ENGINE_MAX_SCALE 8000u
 #define MUX_ENGINE_MAX_LAYER_BYTES 128u
 #define MUX_ENGINE_MAX_KITTY_ID_BYTES 128u
 #define MUX_ENGINE_MAX_URI_BYTES (16u * 1024u)
@@ -69,6 +67,58 @@
 #define MUX_ENGINE_MUXD_HANDSHAKE_MS 1000U
 #define MUX_ENGINE_IDLE_EXIT_MS 5000U
 #define MUX_ENGINE_MUXD_INPUT_BYTES 4096U
+#define MUX_ENGINE_FIND_DEBOUNCE_MS 40U
+
+typedef enum {
+    ENGINE_FIND_SHORTCUT_NONE,
+    ENGINE_FIND_SHORTCUT_OPEN,
+    ENGINE_FIND_SHORTCUT_NEXT,
+    ENGINE_FIND_SHORTCUT_PREVIOUS,
+} EngineFindShortcut;
+
+static guint
+logical_dimension(guint physical, guint scale_milli)
+{
+    guint64 scaled = (guint64)physical * 1000u;
+    guint64 logical = (scaled + scale_milli / 2u) / scale_milli;
+
+    return logical ? (guint)logical : 1u;
+}
+
+static gdouble
+physical_milli_to_logical(gint32 physical_milli, guint scale_milli)
+{
+    return (gdouble)physical_milli / (gdouble)scale_milli;
+}
+
+static EngineFindShortcut
+find_shortcut(guint32 modifiers, guint32 keyval)
+{
+    const guint keyboard = WPE_MODIFIER_KEYBOARD_CONTROL |
+        WPE_MODIFIER_KEYBOARD_SHIFT |
+        WPE_MODIFIER_KEYBOARD_ALT |
+        WPE_MODIFIER_KEYBOARD_META;
+    guint key = keyval >= 'A' && keyval <= 'Z'
+        ? keyval + ('a' - 'A')
+        : keyval;
+    guint exact = modifiers & keyboard;
+    gboolean command = exact == WPE_MODIFIER_KEYBOARD_META ||
+        exact == WPE_MODIFIER_KEYBOARD_CONTROL;
+    gboolean command_shift =
+        exact == (WPE_MODIFIER_KEYBOARD_META |
+                  WPE_MODIFIER_KEYBOARD_SHIFT) ||
+        exact == (WPE_MODIFIER_KEYBOARD_CONTROL |
+                  WPE_MODIFIER_KEYBOARD_SHIFT);
+
+    /* Control is an explicit Linux compatibility alias for Command. */
+    if (key == 'f' && command)
+        return ENGINE_FIND_SHORTCUT_OPEN;
+    if (key == 'g' && command)
+        return ENGINE_FIND_SHORTCUT_NEXT;
+    if (key == 'g' && command_shift)
+        return ENGINE_FIND_SHORTCUT_PREVIOUS;
+    return ENGINE_FIND_SHORTCUT_NONE;
+}
 
 static gboolean
 engine_idle_fallback_should_arm(gboolean had_owned_views,
@@ -154,6 +204,25 @@ guint
 mux_engine_test_frame_backpressure_retry_delay_ms(guint rejection_count)
 {
     return frame_backpressure_retry_delay_ms(rejection_count);
+}
+
+guint
+mux_engine_test_logical_dimension(guint physical, guint scale_milli)
+{
+    return logical_dimension(physical, scale_milli);
+}
+
+gdouble
+mux_engine_test_physical_milli_to_logical(gint32 physical_milli,
+                                           guint scale_milli)
+{
+    return physical_milli_to_logical(physical_milli, scale_milli);
+}
+
+guint
+mux_engine_test_find_shortcut(guint32 modifiers, guint32 keyval)
+{
+    return find_shortcut(modifiers, keyval);
 }
 
 WebKitNetworkSession *
@@ -247,6 +316,14 @@ struct _EngineView {
     MuxNavigationPolicy *navigation_policy;
     MuxFileChooserBridge *file_chooser_bridge;
     MuxPopupManager *popup_manager;
+    WebKitFindController *find_controller;
+    GString *find_query;
+    guint find_timeout_id;
+    guint64 find_generation;
+    guint64 find_pending_generation;
+    MuxEngineFindStatus find_status;
+    guint find_match_count;
+    gboolean find_active;
     gboolean fullscreen;
     gchar *layer;
     guint width;
@@ -313,6 +390,7 @@ struct _Engine {
     Client *clipboard_reply_client;
     guint clipboard_tick_id;
     gsize frame_bytes;
+    guint device_scale_milli;
     EngineView *pending_view;
     WPEView *(*original_create_view)(WPEDisplay *display);
     WPEClipboard *(*original_get_clipboard)(WPEDisplay *display);
@@ -462,6 +540,8 @@ static gboolean mux_platform_render_buffer(WPEView *platform_view,
                                            GError **error);
 static void engine_view_send_frame(EngineView *view);
 static void engine_view_reset_surface(EngineView *view);
+static void engine_view_find_close(EngineView *view, gboolean notify);
+static gboolean engine_view_find_initialize(EngineView *view);
 
 G_DEFINE_TYPE(MuxPlatformView, mux_platform_view, WPE_TYPE_VIEW)
 
@@ -558,8 +638,33 @@ dimensions_are_valid(guint width, guint height, guint scale_milli)
 {
     return width > 0 && width <= MUX_ENGINE_MAX_DIMENSION &&
         height > 0 && height <= MUX_ENGINE_MAX_DIMENSION &&
-        scale_milli >= MUX_ENGINE_MIN_SCALE &&
-        scale_milli <= MUX_ENGINE_MAX_SCALE;
+        scale_milli >= MUX_ENGINE_MIN_SCALE_MILLI &&
+        scale_milli <= MUX_ENGINE_MAX_SCALE_MILLI;
+}
+
+static gboolean
+engine_view_apply_geometry(EngineView *view)
+{
+    WPEView *wpe_view = view->platform_view
+        ? view->platform_view
+        : webkit_web_view_get_wpe_view(view->web_view);
+    WPEToplevel *toplevel = wpe_view
+        ? wpe_view_get_toplevel(wpe_view)
+        : NULL;
+    WPEScreen *screen;
+    gdouble scale;
+
+    if (!toplevel)
+        return FALSE;
+    scale = view->scale_milli / 1000.0;
+    screen = wpe_toplevel_get_screen(toplevel);
+    if (screen)
+        wpe_screen_set_scale(screen, scale);
+    wpe_toplevel_scale_changed(toplevel, scale);
+    return wpe_toplevel_resize(
+        toplevel,
+        logical_dimension(view->width, view->scale_milli),
+        logical_dimension(view->height, view->scale_milli));
 }
 
 static gboolean
@@ -1652,6 +1757,14 @@ popup_create(WebKitWebView *parent,
         engine_view_free(child);
         return NULL;
     }
+    if (!engine_view_apply_geometry(child)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "related popup WPE geometry setup failed");
+        engine_view_free(child);
+        return NULL;
+    }
 
     g_hash_table_insert(engine->pending_popups,
                         child->web_view,
@@ -2490,8 +2603,10 @@ view_load_changed(WebKitWebView *web_view,
     EngineView *view = data;
 
     (void)web_view;
-    if (load_event == WEBKIT_LOAD_STARTED)
+    if (load_event == WEBKIT_LOAD_STARTED) {
         view->fullscreen = FALSE;
+        engine_view_find_close(view, TRUE);
+    }
     if (load_event == WEBKIT_LOAD_COMMITTED ||
         load_event == WEBKIT_LOAD_FINISHED)
         view_record_navigation(view);
@@ -2601,6 +2716,15 @@ engine_view_free(gpointer data)
     g_clear_pointer(&view->navigation_policy,
                     mux_navigation_policy_free);
     g_clear_pointer(&view->ui_bridge, mux_ui_engine_bridge_free);
+    if (view->find_timeout_id)
+        g_source_remove(view->find_timeout_id);
+    if (view->find_controller) {
+        webkit_find_controller_search_finish(view->find_controller);
+        g_signal_handlers_disconnect_by_data(view->find_controller, view);
+    }
+    g_clear_object(&view->find_controller);
+    if (view->find_query)
+        g_string_free(view->find_query, TRUE);
     if (view->web_view && view->input_method)
         webkit_web_view_set_input_method_context(view->web_view, NULL);
     g_clear_object(&view->input_method);
@@ -2686,7 +2810,8 @@ handle_hello(Client *client, const MuxEngineMessage *request)
         !text_is_valid(kitty_window, MUX_ENGINE_MAX_KITTY_ID_BYTES) ||
         !text_is_valid(layer, MUX_ENGINE_MAX_LAYER_BYTES) ||
         !text_is_valid(initial_uri, MUX_ENGINE_MAX_URI_BYTES) ||
-        !dimensions_are_valid(width, height, scale_milli)) {
+        !dimensions_are_valid(width, height, scale_milli) ||
+        scale_milli != client->engine->device_scale_milli) {
         client_send_error(client,
                           request,
                           MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
@@ -2831,6 +2956,7 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
                               &uri,
                               &popup_token) ||
         !dimensions_are_valid(width, height, scale_milli) ||
+        scale_milli != engine->device_scale_milli ||
         !text_is_valid(layer, MUX_ENGINE_MAX_LAYER_BYTES) ||
         !text_is_valid(uri, MUX_ENGINE_MAX_URI_BYTES) ||
         (popup_token && *popup_token &&
@@ -2951,6 +3077,15 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
         g_free(uri);
         return TRUE;
     }
+    if (!engine_view_find_initialize(view)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                          "WebView find controller construction failed");
+        engine_view_free(view);
+        g_free(uri);
+        return TRUE;
+    }
     view->input_method = mux_input_method_context_new();
     view->suppressed_text_keys =
         g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -3059,8 +3194,15 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
 
     wpe_view = webkit_web_view_get_wpe_view(view->web_view);
     toplevel = wpe_view ? wpe_view_get_toplevel(wpe_view) : NULL;
-    if (toplevel)
-        wpe_toplevel_resize(toplevel, width, height);
+    if (!toplevel || !engine_view_apply_geometry(view)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                          "WebView WPE geometry setup failed");
+        engine_view_free(view);
+        g_free(uri);
+        return TRUE;
+    }
 
     key = g_new(guint64, 1);
     *key = view->id;
@@ -3251,7 +3393,8 @@ handle_resize(Client *client, const MuxEngineMessage *request)
         !mux_engine_cursor_get_u32(&cursor, &height) ||
         !mux_engine_cursor_get_u32(&cursor, &scale_milli) ||
         !mux_engine_cursor_done(&cursor) ||
-        !dimensions_are_valid(width, height, scale_milli)) {
+        !dimensions_are_valid(width, height, scale_milli) ||
+        scale_milli != client->engine->device_scale_milli) {
         client_send_error(client,
                           request,
                           MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
@@ -3265,8 +3408,13 @@ handle_resize(Client *client, const MuxEngineMessage *request)
     engine_view_reset_surface(view);
     wpe_view = webkit_web_view_get_wpe_view(view->web_view);
     toplevel = wpe_view ? wpe_view_get_toplevel(wpe_view) : NULL;
-    if (toplevel)
-        wpe_toplevel_resize(toplevel, width, height);
+    if (!toplevel || !engine_view_apply_geometry(view)) {
+        client_send_error(client,
+                          request,
+                          MUX_ENGINE_REMOTE_ERROR_INTERNAL,
+                          "WPE resize failed");
+        return TRUE;
+    }
     client_send_ack(client, request);
     view_send_metadata(view);
     return !client->failed;
@@ -3731,6 +3879,263 @@ browser_handle_shortcut(EngineView *view,
     return TRUE;
 }
 
+static void
+engine_view_find_advance(EngineView *view)
+{
+    view->find_generation++;
+    if (!view->find_generation)
+        view->find_generation++;
+}
+
+static void
+engine_view_find_send_state(EngineView *view)
+{
+    MuxEngineBuilder builder;
+    GBytes *payload;
+
+    if (!view->owner || view->owner->failed)
+        return;
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, view->find_active);
+    mux_engine_builder_put_u32(
+        &builder,
+        view->find_active ? view->find_status : MUX_ENGINE_FIND_CLOSED);
+    mux_engine_builder_put_u32(
+        &builder,
+        view->find_active ? view->find_match_count : 0);
+    mux_engine_builder_put_u64(&builder, view->find_generation);
+    mux_engine_builder_put_string(
+        &builder,
+        view->find_active && view->find_query ? view->find_query->str : "");
+    payload = mux_engine_builder_finish(&builder);
+    client_send(view->owner,
+                MUX_ENGINE_MESSAGE_FIND_STATE,
+                MUX_ENGINE_FLAG_NONE,
+                view->id,
+                ++view->engine->next_event_serial,
+                payload);
+    g_bytes_unref(payload);
+}
+
+static void
+engine_view_find_cancel_search(EngineView *view)
+{
+    if (view->find_timeout_id) {
+        g_source_remove(view->find_timeout_id);
+        view->find_timeout_id = 0;
+    }
+    view->find_pending_generation = 0;
+    if (view->find_controller)
+        webkit_find_controller_search_finish(view->find_controller);
+}
+
+static void
+engine_view_find_found(WebKitFindController *controller,
+                       guint match_count,
+                       gpointer data)
+{
+    EngineView *view = data;
+
+    if (controller != view->find_controller || !view->find_active ||
+        !view->find_pending_generation ||
+        view->find_pending_generation != view->find_generation)
+        return;
+    view->find_pending_generation = 0;
+    view->find_status = match_count
+        ? MUX_ENGINE_FIND_FOUND
+        : MUX_ENGINE_FIND_NOT_FOUND;
+    view->find_match_count = MIN(match_count, MUX_ENGINE_MAX_FIND_MATCHES);
+    engine_view_find_send_state(view);
+}
+
+static void
+engine_view_find_failed(WebKitFindController *controller, gpointer data)
+{
+    EngineView *view = data;
+
+    if (controller != view->find_controller || !view->find_active ||
+        !view->find_pending_generation ||
+        view->find_pending_generation != view->find_generation)
+        return;
+    view->find_pending_generation = 0;
+    view->find_status = MUX_ENGINE_FIND_NOT_FOUND;
+    view->find_match_count = 0;
+    engine_view_find_send_state(view);
+}
+
+static gboolean
+engine_view_find_search(gpointer data)
+{
+    EngineView *view = data;
+
+    view->find_timeout_id = 0;
+    if (!view->find_active || !view->find_controller ||
+        !view->find_query || !view->find_query->len)
+        return G_SOURCE_REMOVE;
+    view->find_pending_generation = view->find_generation;
+    webkit_find_controller_search(
+        view->find_controller,
+        view->find_query->str,
+        WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE |
+            WEBKIT_FIND_OPTIONS_WRAP_AROUND,
+        MUX_ENGINE_MAX_FIND_MATCHES);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+engine_view_find_schedule(EngineView *view)
+{
+    engine_view_find_cancel_search(view);
+    engine_view_find_advance(view);
+    view->find_match_count = 0;
+    if (!view->find_query->len) {
+        view->find_status = MUX_ENGINE_FIND_IDLE;
+        engine_view_find_send_state(view);
+        return;
+    }
+    view->find_status = MUX_ENGINE_FIND_PENDING;
+    engine_view_find_send_state(view);
+    view->find_timeout_id = g_timeout_add(MUX_ENGINE_FIND_DEBOUNCE_MS,
+                                          engine_view_find_search,
+                                          view);
+}
+
+static gboolean
+engine_view_find_text_is_printable(const gchar *text, gsize length)
+{
+    const gchar *cursor = text;
+    const gchar *end = text + length;
+
+    while (cursor < end) {
+        gunichar character = g_utf8_get_char(cursor);
+
+        if (!g_unichar_isprint(character))
+            return FALSE;
+        cursor = g_utf8_next_char(cursor);
+    }
+    return TRUE;
+}
+
+static void
+engine_view_find_commit(EngineView *view,
+                        const gchar *text,
+                        gsize length)
+{
+    if (!view->find_active || !view->find_query || !length ||
+        length > MUX_ENGINE_MAX_FIND_TEXT_BYTES - view->find_query->len ||
+        !engine_view_find_text_is_printable(text, length))
+        return;
+    g_string_append_len(view->find_query, text, length);
+    engine_view_find_schedule(view);
+}
+
+static void
+engine_view_find_close(EngineView *view, gboolean notify)
+{
+    if (!view || !view->find_active)
+        return;
+    engine_view_find_cancel_search(view);
+    view->find_active = FALSE;
+    view->find_status = MUX_ENGINE_FIND_CLOSED;
+    view->find_match_count = 0;
+    engine_view_find_advance(view);
+    if (notify)
+        engine_view_find_send_state(view);
+}
+
+static void
+engine_view_find_open(EngineView *view, gboolean clear_query)
+{
+    engine_view_find_cancel_search(view);
+    view->find_active = TRUE;
+    if (clear_query)
+        g_string_truncate(view->find_query, 0);
+    engine_view_find_advance(view);
+    view->find_status = MUX_ENGINE_FIND_IDLE;
+    view->find_match_count = 0;
+    engine_view_find_send_state(view);
+}
+
+static gboolean
+engine_view_find_initialize(EngineView *view)
+{
+    WebKitFindController *controller;
+
+    if (view->find_controller)
+        return TRUE;
+    controller = webkit_web_view_get_find_controller(view->web_view);
+    if (!controller)
+        return FALSE;
+    view->find_controller = g_object_ref(controller);
+    view->find_query = g_string_sized_new(64);
+    g_signal_connect(view->find_controller,
+                     "found-text",
+                     G_CALLBACK(engine_view_find_found),
+                     view);
+    g_signal_connect(view->find_controller,
+                     "failed-to-find-text",
+                     G_CALLBACK(engine_view_find_failed),
+                     view);
+    return TRUE;
+}
+
+static gboolean
+engine_view_find_handle_key(EngineView *view,
+                            guint16 event_type,
+                            guint32 modifiers,
+                            guint32 keyval)
+{
+    EngineFindShortcut shortcut = find_shortcut(modifiers, keyval);
+
+    if (shortcut != ENGINE_FIND_SHORTCUT_NONE) {
+        if (event_type == MUX_ENGINE_KEY_PRESS) {
+            if (shortcut == ENGINE_FIND_SHORTCUT_OPEN) {
+                engine_view_find_open(view, TRUE);
+            } else if (!view->find_active) {
+                engine_view_find_open(view, FALSE);
+                if (view->find_query->len)
+                    engine_view_find_schedule(view);
+            } else if (view->find_query->len) {
+                if (shortcut == ENGINE_FIND_SHORTCUT_PREVIOUS)
+                    webkit_find_controller_search_previous(
+                        view->find_controller);
+                else
+                    webkit_find_controller_search_next(
+                        view->find_controller);
+            }
+        }
+        return TRUE;
+    }
+    if (!view->find_active)
+        return FALSE;
+    if (event_type == MUX_ENGINE_KEY_RELEASE)
+        return TRUE;
+    if (!(modifiers & (WPE_MODIFIER_KEYBOARD_CONTROL |
+                       WPE_MODIFIER_KEYBOARD_ALT |
+                       WPE_MODIFIER_KEYBOARD_META))) {
+        if (keyval == 0xff1bu) {
+            engine_view_find_close(view, TRUE);
+        } else if (keyval == 0xff08u && view->find_query->len) {
+            gchar *previous = g_utf8_find_prev_char(
+                view->find_query->str,
+                view->find_query->str + view->find_query->len);
+
+            g_string_truncate(view->find_query,
+                              previous
+                                  ? (gsize)(previous - view->find_query->str)
+                                  : 0);
+            engine_view_find_schedule(view);
+        } else if (keyval == 0xff0du && view->find_query->len) {
+            if (modifiers & WPE_MODIFIER_KEYBOARD_SHIFT)
+                webkit_find_controller_search_previous(
+                    view->find_controller);
+            else
+                webkit_find_controller_search_next(view->find_controller);
+        }
+    }
+    return TRUE;
+}
+
 static gboolean
 handle_input_key(Client *client, const MuxEngineMessage *request)
 {
@@ -3761,7 +4166,11 @@ handle_input_key(Client *client, const MuxEngineMessage *request)
         return TRUE;
     }
 
-    if (browser_handle_shortcut(view,
+    if (engine_view_find_handle_key(view,
+                                    event_type,
+                                    modifiers,
+                                    keyval) ||
+        browser_handle_shortcut(view,
                                 event_type,
                                 modifiers,
                                 keyval))
@@ -3821,6 +4230,11 @@ handle_text_commit(Client *client, const MuxEngineMessage *request)
                           request,
                           MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
                           "invalid TEXT_COMMIT payload");
+        return TRUE;
+    }
+
+    if (view->find_active) {
+        engine_view_find_commit(view, (const gchar *)text, text_length);
         return TRUE;
     }
 
@@ -3884,10 +4298,14 @@ handle_input_pointer(Client *client, const MuxEngineMessage *request)
         return TRUE;
     }
 
-    x = (gdouble)(gint32)encoded_x / 1000.0;
-    y = (gdouble)(gint32)encoded_y / 1000.0;
-    delta_x = (gdouble)(gint32)encoded_delta_x / 1000.0;
-    delta_y = (gdouble)(gint32)encoded_delta_y / 1000.0;
+    x = physical_milli_to_logical((gint32)encoded_x,
+                                  view->scale_milli);
+    y = physical_milli_to_logical((gint32)encoded_y,
+                                  view->scale_milli);
+    delta_x = physical_milli_to_logical((gint32)encoded_delta_x,
+                                        view->scale_milli);
+    delta_y = physical_milli_to_logical((gint32)encoded_delta_y,
+                                        view->scale_milli);
     switch (event_type) {
     case MUX_ENGINE_POINTER_MOVE:
     case MUX_ENGINE_POINTER_ENTER:
@@ -4118,6 +4536,7 @@ handle_set_focus(Client *client, const MuxEngineMessage *request)
         }
         wpe_view_focus_in(view->platform_view);
     } else {
+        engine_view_find_close(view, TRUE);
         wpe_view_focus_out(view->platform_view);
     }
     client_send_ack(client, request);
@@ -4151,6 +4570,8 @@ handle_set_visibility(Client *client, const MuxEngineMessage *request)
     }
 
     view->hidden = visible == 0;
+    if (view->hidden)
+        engine_view_find_close(view, TRUE);
     engine_view_reset_surface(view);
     wpe_view = view->platform_view
         ? view->platform_view
@@ -4171,8 +4592,8 @@ handle_set_visibility(Client *client, const MuxEngineMessage *request)
     }
     if (!view->hidden) {
         toplevel = wpe_view ? wpe_view_get_toplevel(wpe_view) : NULL;
-        if (toplevel)
-            wpe_toplevel_resize(toplevel, view->width, view->height);
+        if (toplevel && !engine_view_apply_geometry(view))
+            g_warning("restore visible WPE geometry failed");
     }
     client_send_ack(client, request);
     return !client->failed;
@@ -4870,6 +5291,15 @@ main(int argc, char **argv)
     g_free(profile_option);
     if (!profile_is_valid(engine.profile)) {
         g_printerr("mux-engine: invalid profile name\n");
+        g_free(socket_option);
+        engine_clear(&engine);
+        return 2;
+    }
+    if (!mux_engine_parse_device_scale(g_getenv(MUX_DEVICE_SCALE_ENV),
+                                       &engine.device_scale_milli,
+                                       &error)) {
+        g_printerr("mux-engine: %s\n", error->message);
+        g_clear_error(&error);
         g_free(socket_option);
         engine_clear(&engine);
         return 2;

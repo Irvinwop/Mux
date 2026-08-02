@@ -5,11 +5,17 @@
 G_BEGIN_DECLS
 
 #define MUX_ENGINE_MAGIC 0x4d555831u
-#define MUX_ENGINE_VERSION 2u
+#define MUX_ENGINE_VERSION 3u
 #define MUX_ENGINE_HEADER_SIZE 40u
 #define MUX_ENGINE_MAX_PAYLOAD (256u * 1024u)
 #define MUX_ENGINE_MAX_DAMAGE_RECTS 64u
 #define MUX_ENGINE_MAX_TEXT_BYTES (64u * 1024u)
+#define MUX_DEVICE_SCALE_ENV "MUX_DEVICE_SCALE"
+#define MUX_ENGINE_DEFAULT_SCALE_MILLI 1000u
+#define MUX_ENGINE_MIN_SCALE_MILLI 500u
+#define MUX_ENGINE_MAX_SCALE_MILLI 4000u
+#define MUX_ENGINE_MAX_FIND_TEXT_BYTES 1024u
+#define MUX_ENGINE_MAX_FIND_MATCHES 1000u
 
 typedef enum {
     MUX_ENGINE_MESSAGE_HELLO = 1,
@@ -37,6 +43,7 @@ typedef enum {
     MUX_ENGINE_MESSAGE_CANCEL_CLOSE,
     MUX_ENGINE_MESSAGE_SET_LAYER,
     MUX_ENGINE_MESSAGE_FRAME_REJECTED,
+    MUX_ENGINE_MESSAGE_FIND_STATE,
     MUX_ENGINE_MESSAGE_EXTENSION = 64,
 } MuxEngineMessageType;
 
@@ -84,6 +91,14 @@ typedef enum {
     MUX_ENGINE_KEY_REPEAT,
     MUX_ENGINE_KEY_RELEASE,
 } MuxEngineKeyEvent;
+
+typedef enum {
+    MUX_ENGINE_FIND_CLOSED = 0,
+    MUX_ENGINE_FIND_IDLE,
+    MUX_ENGINE_FIND_PENDING,
+    MUX_ENGINE_FIND_FOUND,
+    MUX_ENGINE_FIND_NOT_FOUND,
+} MuxEngineFindStatus;
 
 typedef enum {
     MUX_ENGINE_POINTER_MOVE = 1,
@@ -169,5 +184,10 @@ gboolean mux_engine_cursor_get_bytes(MuxEngineCursor *cursor,
 gboolean mux_engine_cursor_get_string(MuxEngineCursor *cursor,
                                       gchar **value);
 gboolean mux_engine_cursor_done(const MuxEngineCursor *cursor);
+
+/* NULL selects 1.0. Explicit values use strict decimal milliscale syntax. */
+gboolean mux_engine_parse_device_scale(const gchar *value,
+                                       guint32 *scale_milli,
+                                       GError **error);
 
 G_END_DECLS

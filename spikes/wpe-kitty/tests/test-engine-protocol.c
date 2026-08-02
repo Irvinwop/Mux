@@ -2,6 +2,7 @@
 #include "../src/mux-shortcuts.h"
 #include "../mux-uri.h"
 
+#include <gio/gio.h>
 #include <glib.h>
 #include <wpe/webkit.h>
 
@@ -23,6 +24,11 @@ gboolean mux_engine_test_idle_fallback_should_arm(gboolean had_owned_views,
                                                    guint active_views,
                                                    gboolean muxd_connected,
                                                    gboolean shutting_down);
+guint mux_engine_test_logical_dimension(guint physical,
+                                        guint scale_milli);
+gdouble mux_engine_test_physical_milli_to_logical(gint32 physical_milli,
+                                                   guint scale_milli);
+guint mux_engine_test_find_shortcut(guint32 modifiers, guint32 keyval);
 gboolean mux_pane_test_schedule_retry_at(gint64 now_us,
                                          gint64 *retry_us,
                                          guint *backoff_ms);
@@ -44,6 +50,10 @@ gchar *mux_pane_test_build_kitty_frame_command(gboolean image_present,
                                                 guint64 shm_size,
                                                 guint image_id,
                                                 const gchar *encoded_name);
+gchar *mux_pane_test_find_overlay_label(const gchar *query,
+                                        MuxEngineFindStatus status,
+                                        guint matches,
+                                        guint columns);
 
 static void
 put_u16(guint8 *target, guint16 value)
@@ -493,7 +503,7 @@ test_legacy_protocol_version_rejected(void)
 {
     guint8 packet[MUX_ENGINE_HEADER_SIZE];
 
-    g_assert_cmpuint(MUX_ENGINE_VERSION, ==, 2);
+    g_assert_cmpuint(MUX_ENGINE_VERSION, ==, 3);
     init_header(packet);
     put_u16(packet + 4, 1);
     assert_protocol_rejected(packet, sizeof(packet));
@@ -863,6 +873,122 @@ test_frame_backpressure_retry_is_bounded(void)
 }
 
 static void
+test_device_scale_configuration(void)
+{
+    static const struct {
+        const gchar *value;
+        guint expected;
+    } valid[] = {
+        { NULL, 1000 },
+        { "0.500", 500 },
+        { "1", 1000 },
+        { "1.25", 1250 },
+        { "2.000", 2000 },
+        { "4", 4000 },
+    };
+    static const gchar *invalid[] = {
+        "", ".5", "1.", " 1", "1 ", "+1", "-1", "1e0",
+        "0.499", "4.001", "1.0000", "nan", "inf",
+    };
+
+    for (guint index = 0; index < G_N_ELEMENTS(valid); index++) {
+        g_autoptr(GError) error = NULL;
+        guint32 parsed = 0;
+
+        g_assert_true(mux_engine_parse_device_scale(valid[index].value,
+                                                    &parsed,
+                                                    &error));
+        g_assert_no_error(error);
+        g_assert_cmpuint(parsed, ==, valid[index].expected);
+    }
+    for (guint index = 0; index < G_N_ELEMENTS(invalid); index++) {
+        g_autoptr(GError) error = NULL;
+        guint32 parsed = 0;
+
+        g_assert_false(mux_engine_parse_device_scale(invalid[index],
+                                                     &parsed,
+                                                     &error));
+        g_assert_error(error,
+                       G_IO_ERROR,
+                       G_IO_ERROR_INVALID_ARGUMENT);
+    }
+}
+
+static void
+test_device_scale_geometry(void)
+{
+    g_assert_cmpuint(mux_engine_test_logical_dimension(1920, 1000),
+                     ==,
+                     1920);
+    g_assert_cmpuint(mux_engine_test_logical_dimension(1920, 2000),
+                     ==,
+                     960);
+    g_assert_cmpuint(mux_engine_test_logical_dimension(1919, 1250),
+                     ==,
+                     1535);
+    g_assert_cmpuint(mux_engine_test_logical_dimension(1, 4000), ==, 1);
+    g_assert_cmpfloat(
+        mux_engine_test_physical_milli_to_logical(2000000, 2000),
+        ==,
+        1000.0);
+    g_assert_cmpfloat(
+        mux_engine_test_physical_milli_to_logical(-80000, 2000),
+        ==,
+        -40.0);
+}
+
+static void
+test_find_shortcuts_and_trusted_label(void)
+{
+    const guint control = WPE_MODIFIER_KEYBOARD_CONTROL;
+    const guint shift = WPE_MODIFIER_KEYBOARD_SHIFT;
+    const guint alt = WPE_MODIFIER_KEYBOARD_ALT;
+    const guint meta = WPE_MODIFIER_KEYBOARD_META;
+    g_autofree gchar *label = NULL;
+    g_autofree gchar *minimum = NULL;
+    g_autofree gchar *zero = NULL;
+
+    g_assert_cmpuint(mux_engine_test_find_shortcut(meta, 'f'), ==, 1);
+    g_assert_cmpuint(mux_engine_test_find_shortcut(control, 'F'), ==, 1);
+    g_assert_cmpuint(mux_engine_test_find_shortcut(meta, 'g'), ==, 2);
+    g_assert_cmpuint(mux_engine_test_find_shortcut(meta | shift, 'g'),
+                     ==,
+                     3);
+    g_assert_cmpuint(mux_engine_test_find_shortcut(control | shift, 'G'),
+                     ==,
+                     3);
+    g_assert_cmpuint(mux_engine_test_find_shortcut(meta | alt, 'f'),
+                     ==,
+                     0);
+    g_assert_cmpuint(mux_engine_test_find_shortcut(shift, 'g'), ==, 0);
+
+    label = mux_pane_test_find_overlay_label(
+        "site\033[31m\nquery",
+        MUX_ENGINE_FIND_FOUND,
+        2,
+        32);
+    g_assert_nonnull(strstr(label, "MUX FIND"));
+    g_assert_nonnull(strstr(label, "2 matches"));
+    g_assert_null(strchr(label, '\033'));
+    g_assert_null(strchr(label, '\n'));
+    g_assert_cmpuint(g_utf8_strlen(label, -1), <=, 32);
+    g_assert_null(strstr(label, "site?[31m?query"));
+
+    minimum = mux_pane_test_find_overlay_label(
+        "discarded before status",
+        MUX_ENGINE_FIND_FOUND,
+        2,
+        1);
+    g_assert_cmpstr(minimum, ==, "2");
+    zero = mux_pane_test_find_overlay_label(
+        "discarded before status",
+        MUX_ENGINE_FIND_NOT_FOUND,
+        0,
+        0);
+    g_assert_cmpstr(zero, ==, "");
+}
+
+static void
 test_shortcut_exact_modifier_matching(void)
 {
     const guint control = MUX_SHORTCUT_MODIFIER_CONTROL;
@@ -1032,6 +1158,12 @@ main(int argc, char **argv)
                     test_engine_idle_fallback_policy);
     g_test_add_func("/engine-runtime/graphics/backpressure-retry",
                     test_frame_backpressure_retry_is_bounded);
+    g_test_add_func("/engine-runtime/scale/configuration",
+                    test_device_scale_configuration);
+    g_test_add_func("/engine-runtime/scale/logical-geometry",
+                    test_device_scale_geometry);
+    g_test_add_func("/engine-runtime/find/shortcuts-and-trusted-label",
+                    test_find_shortcuts_and_trusted_label);
     g_test_add_func("/engine-runtime/shortcuts/exact-modifiers",
                     test_shortcut_exact_modifier_matching);
     g_test_add_func("/engine-runtime/shortcuts/lifecycle-and-forwarding",
