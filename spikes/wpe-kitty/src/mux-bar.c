@@ -173,7 +173,7 @@ static void redraw(Bar *bar)
         append_padded(
             output,
             " ",
-            "Super-D bookmark  Super-Shift-Enter split  Super-Shift-T new layer  Alt-HJKL pane  Alt-[ / ] layer",
+            "Super-D bookmark  Super-Shift-Enter right  Super-Alt-Enter down  Super-Shift-T layer  Alt-HJKL pane",
             bar->columns);
         rendered_rows = 3;
     }
@@ -301,6 +301,8 @@ static void handle_key(
         mux_shortcut_modifiers_from_kitty(encoded_modifiers);
     MuxShortcut shortcut = mux_shortcut_match_bar(modifiers, key);
 
+    if (mux_shortcut_key_is_kitty_functional(key))
+        return;
     if (shortcut != MUX_SHORTCUT_NONE) {
         if (event_type == MUX_SHORTCUT_EVENT_PRESS) {
             if (shortcut == MUX_SHORTCUT_LOCATION)

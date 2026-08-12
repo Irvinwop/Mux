@@ -3019,6 +3019,8 @@ kitty_committed_text(const gchar *field, guint32 fallback)
 {
     GString *text = g_string_new(NULL);
 
+    if (mux_shortcut_key_is_kitty_functional(fallback))
+        return g_string_free(text, FALSE);
     if (field && *field) {
         g_auto(GStrv) codepoints = g_strsplit(field, ":", -1);
         guint i;

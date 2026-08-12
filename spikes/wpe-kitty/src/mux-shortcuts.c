@@ -2,6 +2,8 @@
 
 #define MUX_SHORTCUT_KEY_LEFT 0xff51u
 #define MUX_SHORTCUT_KEY_RIGHT 0xff53u
+#define MUX_SHORTCUT_KITTY_FUNCTIONAL_FIRST 57344u
+#define MUX_SHORTCUT_KITTY_FUNCTIONAL_LAST 63743u
 
 static guint
 normalized_ascii_key(guint keyval)
@@ -47,6 +49,13 @@ mux_shortcut_modifiers_from_kitty(guint encoded_modifiers)
     if (kitty & (8 | 32))
         modifiers |= MUX_SHORTCUT_MODIFIER_META;
     return modifiers;
+}
+
+gboolean
+mux_shortcut_key_is_kitty_functional(guint keyval)
+{
+    return keyval >= MUX_SHORTCUT_KITTY_FUNCTIONAL_FIRST &&
+        keyval <= MUX_SHORTCUT_KITTY_FUNCTIONAL_LAST;
 }
 
 MuxShortcut

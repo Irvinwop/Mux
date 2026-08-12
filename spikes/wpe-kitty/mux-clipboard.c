@@ -2,6 +2,7 @@
 
 #include "mux-clipboard.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -370,7 +371,21 @@ mux_clipboard_smoke_trace(MuxClipboardTraceEvent event,
         has_text_plain,
         fields->fresh,
         fields->key_count);
-    if (length > 0 && (gsize)length < sizeof(line))
-        (void)write(fd, line, (gsize)length);
+    if (length > 0 && (gsize)length < sizeof(line)) {
+        gsize offset = 0;
+
+        while (offset < (gsize)length) {
+            ssize_t written =
+                write(fd, line + offset, (gsize)length - offset);
+
+            if (written > 0) {
+                offset += (gsize)written;
+                continue;
+            }
+            if (written < 0 && errno == EINTR)
+                continue;
+            break;
+        }
+    }
     close(fd);
 }

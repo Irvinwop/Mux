@@ -193,6 +193,7 @@
             name = "mux";
             runtimeInputs = [
               pkgs.coreutils
+              pkgs.glib-networking
               pkgs.kitty
             ];
             text = ''
@@ -202,6 +203,7 @@
               fi
 
               export PATH="${runtime}/bin:$PATH"
+              export GIO_EXTRA_MODULES="${pkgs.glib-networking}/lib/gio/modules''${GIO_EXTRA_MODULES:+:$GIO_EXTRA_MODULES}"
               if [[ -n "''${GST_PLUGIN_SYSTEM_PATH_1_0:-}" ]]; then
                 export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}:$GST_PLUGIN_SYSTEM_PATH_1_0"
               else

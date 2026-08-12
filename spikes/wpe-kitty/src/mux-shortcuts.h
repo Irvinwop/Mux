@@ -37,6 +37,7 @@ typedef enum {
 } MuxShortcutEventType;
 
 guint mux_shortcut_modifiers_from_kitty(guint encoded_modifiers);
+gboolean mux_shortcut_key_is_kitty_functional(guint keyval);
 MuxShortcut mux_shortcut_match_pane(guint modifiers, guint keyval);
 MuxShortcut mux_shortcut_match_engine(guint modifiers, guint keyval);
 MuxShortcut mux_shortcut_match_picker(guint modifiers, guint keyval);
