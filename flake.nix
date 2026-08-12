@@ -24,9 +24,46 @@
             gst-libav
           ];
           gstPluginPath = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" gstPlugins;
-          fontConfig = pkgs.makeFontsConf {
-            fontDirectories = [ pkgs.dejavu_fonts ];
+          baseFontConfig = pkgs.makeFontsConf {
+            fontDirectories = [
+              pkgs.dejavu_fonts
+              pkgs.roboto
+            ];
           };
+          fontConfig = pkgs.writeText "mux-fonts.conf" ''
+            <?xml version="1.0"?>
+            <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+            <fontconfig>
+              <include>${baseFontConfig}</include>
+              <alias binding="strong">
+                <family>sans-serif</family>
+                <prefer>
+                  <family>Roboto</family>
+                  <family>DejaVu Sans</family>
+                </prefer>
+              </alias>
+              <alias binding="strong">
+                <family>system-ui</family>
+                <prefer><family>Roboto</family></prefer>
+              </alias>
+              <alias binding="strong">
+                <family>Arial</family>
+                <prefer><family>Roboto</family></prefer>
+              </alias>
+              <alias binding="strong">
+                <family>Google Sans</family>
+                <prefer><family>Roboto</family></prefer>
+              </alias>
+              <alias binding="strong">
+                <family>serif</family>
+                <prefer><family>DejaVu Serif</family></prefer>
+              </alias>
+              <alias binding="strong">
+                <family>monospace</family>
+                <prefer><family>DejaVu Sans Mono</family></prefer>
+              </alias>
+            </fontconfig>
+          '';
 
           # nixpkgs 2.52.5 only packages the GTK port. Reuse its shared
           # WebKit compiler, patch, and native-tool policy, while replacing

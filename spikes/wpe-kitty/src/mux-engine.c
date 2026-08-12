@@ -2874,6 +2874,25 @@ view_web_process_terminated(WebKitWebView *web_view,
     if (!view->owner || view->owner->failed)
         return;
 
+    if (reason == WEBKIT_WEB_PROCESS_CRASHED &&
+        !g_object_get_data(G_OBJECT(web_view), "mux-crash-recovery-attempted") &&
+        webkit_web_view_get_uri(web_view)) {
+        g_object_set_data(G_OBJECT(web_view),
+                          "mux-crash-recovery-attempted",
+                          GUINT_TO_POINTER(1));
+        g_object_set_data(G_OBJECT(web_view),
+                          "mux-crash-recovery-pending",
+                          GUINT_TO_POINTER(1));
+        g_warning("view %" G_GUINT64_FORMAT
+                  " Web process crashed; reloading once at %s",
+                  view->id,
+                  webkit_web_view_get_uri(web_view));
+        webkit_web_view_reload(web_view);
+        return;
+    }
+
+    g_object_set_data(G_OBJECT(web_view), "mux-crash-recovery-pending", NULL);
+
     mux_engine_builder_init(&builder);
     mux_engine_builder_put_u32(&builder, MUX_ENGINE_REMOTE_ERROR_INTERNAL);
     mux_engine_builder_put_string(&builder,
@@ -2900,9 +2919,18 @@ view_web_process_load_changed(WebKitWebView *web_view,
 {
     EngineView *view = data;
 
-    if (web_view != view->web_view || load_event != WEBKIT_LOAD_STARTED)
+    if (web_view != view->web_view)
         return;
-    view->web_process_terminated = FALSE;
+
+    if (load_event == WEBKIT_LOAD_STARTED) {
+        view->web_process_terminated = FALSE;
+        if (!g_object_get_data(G_OBJECT(web_view), "mux-crash-recovery-pending"))
+            g_object_set_data(G_OBJECT(web_view),
+                              "mux-crash-recovery-attempted",
+                              NULL);
+    } else if (load_event == WEBKIT_LOAD_FINISHED) {
+        g_object_set_data(G_OBJECT(web_view), "mux-crash-recovery-pending", NULL);
+    }
 }
 
 static void
