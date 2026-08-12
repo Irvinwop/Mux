@@ -68,7 +68,7 @@ mux_shortcut_match_pane(guint modifiers, guint keyval)
         return MUX_SHORTCUT_CLIPBOARD_HISTORY;
     if (!command_modifiers_are(modifiers, 0))
         return MUX_SHORTCUT_NONE;
-    if (key == 'q')
+    if (key == 'q' || key == 'w')
         return MUX_SHORTCUT_CLOSE;
     if (key == 'l')
         return MUX_SHORTCUT_LOCATION;

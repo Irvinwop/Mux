@@ -145,7 +145,7 @@ static void redraw(Bar *bar)
         ? view->title
         : "No active page";
     gchar *header = g_strdup_printf(
-        " MUX/%s [%u]  Super-L:url  Super-Shift-P:cmd  Super-Shift-V:clip | %s",
+        " MUX/%s [%u]  Super-L:url  Super-W:close  Super-Shift-P:cmd  Super-Shift-V:clip | %s",
         bar->layer ? bar->layer : "main",
         g_hash_table_size(bar->views),
         title);

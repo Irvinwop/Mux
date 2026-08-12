@@ -55,6 +55,7 @@
 #define RECONNECT_MAX_MS 5000u
 #define ACTIVE_MAINTENANCE_MS 50
 #define IDLE_MAINTENANCE_MS 250
+#define RESIZE_DEBOUNCE_MS 50
 #define CLOSE_TIMEOUT_MS 120000
 #define KITTY_FRAME_RESPONSE_CAPACITY 32u
 #define TERMINAL_OUTPUT_CAP_BYTES (4u * 1024u * 1024u)
@@ -64,6 +65,10 @@
 #define ENGINE_ERROR_WIRE_MAX_BYTES (8u + ENGINE_ERROR_DETAIL_MAX_BYTES)
 #define KITTY_GRAPHICS_RESPONSE_MAX_BYTES 2048u
 #define KITTY_BROWSER_Z_INDEX (-1)
+#define KITTY_RETIRED_IMAGE_CAPACITY 32u
+#define KITTY_MODIFIER_KEY_FIRST 57441u
+#define KITTY_MODIFIER_KEY_LAST 57454u
+#define POINTER_SCROLL_STEP_MILLI 10000
 
 typedef enum {
     KITTY_GRAPHICS_RESPONSE_IGNORE,
@@ -448,6 +453,7 @@ typedef struct {
     guint64 close_request_serial;
     guint64 retired_close_serial;
     gint64 close_deadline_us;
+    gint64 resize_due_us;
     guint image_id;
     guint next_image_id;
     guint width;
@@ -457,6 +463,8 @@ typedef struct {
     guint find_matches;
     MuxEngineFindStatus find_status;
     guint pointer_modifiers;
+    gint pointer_x_milli;
+    gint pointer_y_milli;
     gboolean image_present;
     gboolean frame_waiting;
     gboolean engine_visibility_known;
@@ -510,6 +518,8 @@ typedef struct {
     KittyFrameResponse frame_responses[KITTY_FRAME_RESPONSE_CAPACITY];
     guint frame_response_head;
     guint frame_response_count;
+    guint retired_image_ids[KITTY_RETIRED_IMAGE_CAPACITY];
+    guint retired_image_count;
 } Pane;
 
 static volatile sig_atomic_t resize_requested;
@@ -983,16 +993,19 @@ reset_retry(gint64 *retry_us, guint *backoff_ms)
 static void
 retire_frame_responses(Pane *pane)
 {
-    for (guint offset = 0;
-         offset < pane->frame_response_count;
-         offset++) {
-        guint index = (pane->frame_response_head + offset) %
-            KITTY_FRAME_RESPONSE_CAPACITY;
-
-        pane->frame_responses[index].retired = TRUE;
-    }
+    pane->frame_response_head = 0;
+    pane->frame_response_count = 0;
     pane->frame_waiting = FALSE;
     pane->pending_frame_serial = 0;
+}
+
+static void
+advance_image_generation(Pane *pane)
+{
+    pane->next_image_id++;
+    if (!pane->next_image_id)
+        pane->next_image_id++;
+    pane->image_id = pane->next_image_id;
 }
 
 static void
@@ -1718,10 +1731,7 @@ start_view(Pane *pane, const gchar *initial_uri)
     pane->find_status = MUX_ENGINE_FIND_CLOSED;
     pane->find_matches = 0;
     g_clear_pointer(&pane->find_query, g_free);
-    pane->next_image_id++;
-    if (!pane->next_image_id)
-        pane->next_image_id++;
-    pane->image_id = pane->next_image_id;
+    advance_image_generation(pane);
     mux_engine_message_clear(&response);
     g_clear_pointer(&pane->popup_token, g_free);
     return TRUE;
@@ -1733,7 +1743,7 @@ terminal_enable(Pane *pane)
     struct termios raw;
     g_autoptr(GError) error = NULL;
     const gchar *enable =
-        "\033[?1049h\033[2J\033[H\033[?25l"
+        "\033[?1049h\033[2J\033[H\033[?25l\033]2;MUX loading\033\\"
         "\033[>31u"
         "\033[?1000h\033[?1003h\033[?1006h"
         "\033[?1016h\033[?1004h";
@@ -1780,22 +1790,62 @@ terminal_enable(Pane *pane)
     return TRUE;
 }
 
-static void
-delete_image(Pane *pane)
+static gboolean
+delete_image_id(Pane *pane, guint image_id)
 {
     gchar *command;
 
-    if (!pane->image_present)
-        return;
     command = g_strdup_printf(
         "\033_Ga=d,d=I,i=%u,q=2\033\\",
-        pane->image_id);
+        image_id);
     if (!terminal_write_critical(pane, command)) {
         g_free(command);
-        return;
+        return FALSE;
     }
     g_free(command);
+    return TRUE;
+}
+
+static void
+delete_retired_images(Pane *pane)
+{
+    guint deleted = 0;
+
+    while (deleted < pane->retired_image_count &&
+           delete_image_id(pane, pane->retired_image_ids[deleted]))
+        deleted++;
+    if (deleted && deleted < pane->retired_image_count) {
+        memmove(pane->retired_image_ids,
+                pane->retired_image_ids + deleted,
+                (pane->retired_image_count - deleted) *
+                    sizeof(pane->retired_image_ids[0]));
+    }
+    pane->retired_image_count -= deleted;
+}
+
+static void
+retire_current_image(Pane *pane)
+{
+    if (!pane->image_present)
+        return;
+    if (pane->retired_image_count == KITTY_RETIRED_IMAGE_CAPACITY) {
+        (void)delete_image_id(pane, pane->retired_image_ids[0]);
+        memmove(pane->retired_image_ids,
+                pane->retired_image_ids + 1,
+                (KITTY_RETIRED_IMAGE_CAPACITY - 1) *
+                    sizeof(pane->retired_image_ids[0]));
+        pane->retired_image_count--;
+    }
+    pane->retired_image_ids[pane->retired_image_count++] = pane->image_id;
     pane->image_present = FALSE;
+}
+
+static void
+delete_image(Pane *pane)
+{
+    if (pane->image_present && delete_image_id(pane, pane->image_id))
+        pane->image_present = FALSE;
+    delete_retired_images(pane);
 }
 
 static gboolean
@@ -2041,6 +2091,49 @@ send_pointer(Pane *pane,
     g_bytes_unref(payload);
 }
 
+static guint
+pointer_button_modifier(guint button)
+{
+    if (button == 1)
+        return WPE_MODIFIER_BUTTON1;
+    if (button == 2)
+        return WPE_MODIFIER_BUTTON2;
+    if (button == 3)
+        return WPE_MODIFIER_BUTTON3;
+    return 0;
+}
+
+static void
+release_pointer_button(Pane *pane, guint button, guint keyboard_modifiers)
+{
+    guint button_modifier = pointer_button_modifier(button);
+
+    if (!button_modifier)
+        return;
+    pane->pointer_modifiers &= ~button_modifier;
+    send_pointer(pane,
+                 MUX_ENGINE_POINTER_UP,
+                 keyboard_modifiers | pane->pointer_modifiers,
+                 button,
+                 pane->pointer_x_milli,
+                 pane->pointer_y_milli,
+                 0,
+                 0,
+                 FALSE,
+                 FALSE);
+}
+
+static void
+release_pointer_buttons(Pane *pane, guint keyboard_modifiers)
+{
+    for (guint button = 1; button <= 3; button++) {
+        guint button_modifier = pointer_button_modifier(button);
+
+        if (pane->pointer_modifiers & button_modifier)
+            release_pointer_button(pane, button, keyboard_modifiers);
+    }
+}
+
 static void
 send_navigation(Pane *pane,
                 MuxEngineNavigationAction action,
@@ -2145,6 +2238,8 @@ send_engine_layer(Pane *pane)
 static void
 send_focus(Pane *pane, gboolean focused)
 {
+    if (!focused)
+        release_pointer_buttons(pane, 0);
     pane->focused = focused;
     send_engine_focus(pane,
                       focused && pane_page_is_visible(pane));
@@ -2161,6 +2256,7 @@ send_resize(Pane *pane)
         pane->engine_fd < 0 || !pane->view_id)
         return;
     retire_frame_responses(pane);
+    advance_image_generation(pane);
     mux_engine_builder_init(&builder);
     mux_engine_builder_put_u32(&builder, pane->width);
     mux_engine_builder_put_u32(&builder, pane->height);
@@ -2333,6 +2429,7 @@ acknowledge_graphics_response(Pane *pane, guint image_id)
                    response.frame_serial);
     pane->frame_waiting = FALSE;
     pane->pending_frame_serial = 0;
+    delete_retired_images(pane);
 }
 
 static void
@@ -2403,8 +2500,6 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
     }
 
     if (!pane_page_is_visible(pane) || !pane->terminal_active) {
-        pane->width = width;
-        pane->height = height;
         send_frame_rejected(pane,
                             message->serial,
                             MUX_ENGINE_FRAME_REJECTED_NOT_VISIBLE,
@@ -2470,8 +2565,6 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
     if (!pane->image_present ||
         (message->flags & MUX_ENGINE_FLAG_FULL_DAMAGE))
         pane->image_present = TRUE;
-    pane->width = width;
-    pane->height = height;
     g_free(command);
     g_free(encoded_name);
     g_free(shm_name);
@@ -2488,7 +2581,7 @@ set_title(Pane *pane, const gchar *title)
         if ((guchar)*cursor < 0x20 || *cursor == 0x7f)
             *cursor = ' ';
     }
-    command = g_strdup_printf("\033]2;%s\033\\", safe);
+    command = g_strdup_printf("\033]2;MUX %s\033\\", safe);
     terminal_write(pane, command);
     g_free(command);
     g_free(safe);
@@ -3175,6 +3268,13 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
             event_type =
                 (guint)g_ascii_strtoull(modifier_fields[1], NULL, 10);
     }
+    if (key_number >= KITTY_MODIFIER_KEY_FIRST &&
+        key_number <= KITTY_MODIFIER_KEY_LAST) {
+        g_strfreev(modifier_fields);
+        g_strfreev(key_fields);
+        g_strfreev(fields);
+        return;
+    }
     committed_text = kitty_committed_text(
         field_count > 2 ? fields[2] : NULL,
         key_number);
@@ -3326,7 +3426,8 @@ handle_mouse(Pane *pane,
     guint encoded;
     guint x;
     guint y;
-    guint modifiers = pane->pointer_modifiers;
+    guint keyboard_modifiers = 0;
+    guint modifiers;
     guint button_code;
     guint button = 0;
     gint x_milli;
@@ -3338,22 +3439,29 @@ handle_mouse(Pane *pane,
     if (sscanf(parameters, "<%u;%u;%u", &encoded, &x, &y) != 3)
         return;
     if (encoded & 4)
-        modifiers |= WPE_MODIFIER_SHIFT;
+        keyboard_modifiers |= WPE_MODIFIER_SHIFT;
     if (encoded & 8)
-        modifiers |= WPE_MODIFIER_ALT;
+        keyboard_modifiers |= WPE_MODIFIER_ALT;
     if (encoded & 16)
-        modifiers |= WPE_MODIFIER_CONTROL;
+        keyboard_modifiers |= WPE_MODIFIER_CONTROL;
     x_milli = (gint)(x ? x - 1 : 0) * 1000;
     y_milli = (gint)(y ? y - 1 : 0) * 1000;
+    pane->pointer_x_milli = x_milli;
+    pane->pointer_y_milli = y_milli;
+    modifiers = keyboard_modifiers | pane->pointer_modifiers;
 
     if (encoded & 64) {
         gint delta_x = 0;
         gint delta_y = 0;
         button_code = encoded & 3;
         if (button_code < 2)
-            delta_y = button_code ? 40000 : -40000;
+            delta_y = button_code
+                ? POINTER_SCROLL_STEP_MILLI
+                : -POINTER_SCROLL_STEP_MILLI;
         else
-            delta_x = button_code == 2 ? -40000 : 40000;
+            delta_x = button_code == 2
+                ? -POINTER_SCROLL_STEP_MILLI
+                : POINTER_SCROLL_STEP_MILLI;
         send_pointer(pane,
                      MUX_ENGINE_POINTER_SCROLL,
                      modifiers,
@@ -3375,7 +3483,12 @@ handle_mouse(Pane *pane,
     else if (button_code == 2)
         button = 3;
 
-    if ((encoded & 32) || button_code == 3) {
+    if (final_byte == 'm') {
+        if (button_code == 3)
+            release_pointer_buttons(pane, keyboard_modifiers);
+        else
+            release_pointer_button(pane, button, keyboard_modifiers);
+    } else if ((encoded & 32) || button_code == 3) {
         send_pointer(pane,
                      MUX_ENGINE_POINTER_MOVE,
                      modifiers,
@@ -3386,12 +3499,9 @@ handle_mouse(Pane *pane,
                      0,
                      FALSE,
                      FALSE);
-    } else if (final_byte == 'M') {
-        guint button_modifier = button == 1
-            ? WPE_MODIFIER_BUTTON1
-            : button == 2
-                ? WPE_MODIFIER_BUTTON2
-                : WPE_MODIFIER_BUTTON3;
+    } else {
+        guint button_modifier = pointer_button_modifier(button);
+
         pane->pointer_modifiers |= button_modifier;
         send_pointer(pane,
                      MUX_ENGINE_POINTER_DOWN,
@@ -3403,23 +3513,6 @@ handle_mouse(Pane *pane,
                      0,
                      FALSE,
                      FALSE);
-    } else {
-        guint button_modifier = button == 1
-            ? WPE_MODIFIER_BUTTON1
-            : button == 2
-                ? WPE_MODIFIER_BUTTON2
-                : WPE_MODIFIER_BUTTON3;
-        send_pointer(pane,
-                     MUX_ENGINE_POINTER_UP,
-                     modifiers,
-                     button,
-                     x_milli,
-                     y_milli,
-                     0,
-                     0,
-                     FALSE,
-                     FALSE);
-        pane->pointer_modifiers &= ~button_modifier;
     }
 }
 
@@ -3807,7 +3900,7 @@ handle_resize(Pane *pane)
         return;
     pane->width = width;
     pane->height = height;
-    delete_image(pane);
+    retire_current_image(pane);
     send_resize(pane);
     (void)ui_update_size(pane, NULL);
     find_overlay_repaint(pane);
@@ -4053,6 +4146,9 @@ next_poll_timeout(Pane *pane, gint64 now_us)
     tighten_timeout(&timeout_ms,
                     deadline_timeout_ms(pane->close_deadline_us,
                                         now_us));
+    tighten_timeout(&timeout_ms,
+                    deadline_timeout_ms(pane->resize_due_us,
+                                        now_us));
     if (pane->clipboard != NULL) {
         if (!pane->clipboard_tick_due_us)
             tighten_timeout(&timeout_ms, 0);
@@ -4127,6 +4223,12 @@ run_pane(Pane *pane)
             retry_events(pane);
         if (resize_requested) {
             resize_requested = 0;
+            pane->resize_due_us = monotonic_us +
+                (gint64)RESIZE_DEBOUNCE_MS * 1000;
+        }
+        if (pane->resize_due_us &&
+            monotonic_us >= pane->resize_due_us) {
+            pane->resize_due_us = 0;
             handle_resize(pane);
         }
         descriptors[0].fd = pane->terminal_active

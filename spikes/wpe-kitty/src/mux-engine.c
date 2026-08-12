@@ -2646,6 +2646,8 @@ engine_view_reset_surface(EngineView *view)
     view->dirty_valid = FALSE;
     view->dirty_replaces_pending = FALSE;
     view->root_frame_sent = FALSE;
+    view->graphics_failed = FALSE;
+    view->frame_rejection_count = 0;
     view->frame_backpressure_count = 0;
 }
 
