@@ -24,6 +24,9 @@
             gst-libav
           ];
           gstPluginPath = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" gstPlugins;
+          fontConfig = pkgs.makeFontsConf {
+            fontDirectories = [ pkgs.dejavu_fonts ];
+          };
 
           # nixpkgs 2.52.5 only packages the GTK port. Reuse its shared
           # WebKit compiler, patch, and native-tool policy, while replacing
@@ -204,6 +207,8 @@
 
               export PATH="${runtime}/bin:$PATH"
               export GIO_EXTRA_MODULES="${pkgs.glib-networking}/lib/gio/modules''${GIO_EXTRA_MODULES:+:$GIO_EXTRA_MODULES}"
+              export FONTCONFIG_FILE="${fontConfig}"
+              export FONTCONFIG_PATH="${pkgs.fontconfig.out}/etc/fonts"
               if [[ -n "''${GST_PLUGIN_SYSTEM_PATH_1_0:-}" ]]; then
                 export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}:$GST_PLUGIN_SYSTEM_PATH_1_0"
               else

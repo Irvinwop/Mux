@@ -165,6 +165,31 @@ frame_backpressure_retry_delay_ms(guint rejection_count)
     return MIN(delay, MUX_ENGINE_BACKPRESSURE_RETRY_MAX_MS);
 }
 
+static gboolean
+engine_itp_enabled(void)
+{
+    const gchar *value = g_getenv("MUX_ENABLE_ITP");
+
+    return value && *value &&
+        g_ascii_strcasecmp(value, "0") != 0 &&
+        g_ascii_strcasecmp(value, "false") != 0 &&
+        g_ascii_strcasecmp(value, "no") != 0;
+}
+
+static void
+engine_network_session_configure(WebKitNetworkSession *session)
+{
+    WebKitCookieManager *cookies;
+
+    g_return_if_fail(WEBKIT_IS_NETWORK_SESSION(session));
+    webkit_network_session_set_itp_enabled(session, engine_itp_enabled());
+    cookies = webkit_network_session_get_cookie_manager(session);
+    if (cookies)
+        webkit_cookie_manager_set_accept_policy(
+            cookies,
+            WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
+}
+
 static WebKitNetworkSession *
 engine_private_network_session_new(void)
 {
@@ -172,6 +197,7 @@ engine_private_network_session_new(void)
 
     if (!session)
         return NULL;
+    engine_network_session_configure(session);
     webkit_network_session_set_itp_enabled(session, TRUE);
     webkit_network_session_set_persistent_credential_storage_enabled(session,
                                                                      FALSE);
@@ -355,6 +381,7 @@ struct _EngineView {
     guint frame_retry_id;
     gboolean close_pending;
     gboolean close_ready;
+    gboolean web_process_terminated;
     guint64 pending_close_serial;
     guint64 retired_close_serial;
 };
@@ -2828,6 +2855,80 @@ view_close(WebKitWebView *web_view, gpointer data)
     }
 }
 
+static const gchar *
+web_process_termination_name(WebKitWebProcessTerminationReason reason)
+{
+    switch (reason) {
+    case WEBKIT_WEB_PROCESS_CRASHED:
+        return "crashed";
+    case WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT:
+        return "exceeded its memory limit";
+    case WEBKIT_WEB_PROCESS_TERMINATED_BY_API:
+        return "was terminated by the browser";
+    default:
+        return "terminated for an unknown reason";
+    }
+}
+
+static void
+view_web_process_terminated(WebKitWebView *web_view,
+                            WebKitWebProcessTerminationReason reason,
+                            gpointer data)
+{
+    EngineView *view = data;
+    MuxEngineBuilder builder;
+    GBytes *payload;
+    const gchar *termination = web_process_termination_name(reason);
+
+    if (web_view != view->web_view)
+        return;
+    view->web_process_terminated = TRUE;
+    engine_view_reset_surface(view);
+    g_warning("Web process %s for view %" G_GUINT64_FORMAT " (%s)",
+              termination,
+              view->id,
+              webkit_web_view_get_uri(web_view)
+                  ? webkit_web_view_get_uri(web_view)
+                  : "no URI");
+
+    if (view->close_pending) {
+        view_close(web_view, view);
+        return;
+    }
+    if (!view->owner || view->owner->failed)
+        return;
+
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, MUX_ENGINE_REMOTE_ERROR_INTERNAL);
+    mux_engine_builder_put_string(&builder,
+                                  reason == WEBKIT_WEB_PROCESS_CRASHED
+                                      ? "The page's Web process crashed."
+                                      : reason ==
+                                                WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT
+                                          ? "The page's Web process exceeded its memory limit."
+                                          : "The page's Web process terminated.");
+    payload = mux_engine_builder_finish(&builder);
+    client_send(view->owner,
+                MUX_ENGINE_MESSAGE_ERROR,
+                MUX_ENGINE_FLAG_NONE,
+                view->id,
+                ++view->engine->next_event_serial,
+                payload);
+    g_bytes_unref(payload);
+}
+
+static void
+view_web_process_load_changed(WebKitWebView *web_view,
+                              WebKitLoadEvent load_event,
+                              gpointer data)
+{
+    EngineView *view = data;
+
+    if (web_view != view->web_view || load_event != WEBKIT_LOAD_STARTED)
+        return;
+    view->web_process_terminated = FALSE;
+}
+
 static void
 view_finish_close_cancellation(EngineView *view)
 {
@@ -3429,6 +3530,14 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
                      G_CALLBACK(view_close),
                      view);
     g_signal_connect(view->web_view,
+                     "web-process-terminated",
+                     G_CALLBACK(view_web_process_terminated),
+                     view);
+    g_signal_connect(view->web_view,
+                     "load-changed",
+                     G_CALLBACK(view_web_process_load_changed),
+                     view);
+    g_signal_connect(view->web_view,
                      "load-changed",
                      G_CALLBACK(view_load_changed),
                      view);
@@ -3497,6 +3606,13 @@ handle_request_close(Client *client, const MuxEngineMessage *request)
                           MUX_ENGINE_REMOTE_ERROR_BAD_STATE,
                           "a close request is already in progress");
         return TRUE;
+    }
+    if (view->web_process_terminated) {
+        client_send_empty(client,
+                          MUX_ENGINE_MESSAGE_CLOSE_READY,
+                          view->id,
+                          request->serial);
+        return !client->failed;
     }
 
     view->close_pending = TRUE;
@@ -5302,7 +5418,7 @@ initialize_browser(Engine *engine, GError **error)
     mux_download_manager_set_clipboard_func(engine->download_manager,
                                             download_clipboard_output);
 
-    webkit_network_session_set_itp_enabled(engine->persistent_session, TRUE);
+    engine_network_session_configure(engine->persistent_session);
     return TRUE;
 }
 
