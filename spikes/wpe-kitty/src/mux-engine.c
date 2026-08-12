@@ -4598,7 +4598,7 @@ handle_input_pointer(Client *client, const MuxEngineMessage *request)
                                            y,
                                            button,
                                            time)
-            : 1;
+            : 0;
         event = wpe_event_pointer_button_new(
             event_type == MUX_ENGINE_POINTER_DOWN
                 ? WPE_EVENT_POINTER_DOWN

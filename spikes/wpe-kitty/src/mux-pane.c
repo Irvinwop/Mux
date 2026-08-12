@@ -2145,7 +2145,6 @@ release_pointer_button(Pane *pane, guint button, guint keyboard_modifiers)
 
     if (!button_modifier)
         return;
-    pane->pointer_modifiers &= ~button_modifier;
     send_pointer(pane,
                  MUX_ENGINE_POINTER_UP,
                  keyboard_modifiers | pane->pointer_modifiers,
@@ -2156,6 +2155,7 @@ release_pointer_button(Pane *pane, guint button, guint keyboard_modifiers)
                  0,
                  FALSE,
                  FALSE);
+    pane->pointer_modifiers &= ~button_modifier;
 }
 
 static void
