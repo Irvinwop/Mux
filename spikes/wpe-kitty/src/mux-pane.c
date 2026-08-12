@@ -68,7 +68,9 @@
 #define KITTY_RETIRED_IMAGE_CAPACITY 32u
 #define KITTY_MODIFIER_KEY_FIRST 57441u
 #define KITTY_MODIFIER_KEY_LAST 57454u
-#define POINTER_SCROLL_STEP_MILLI 10000
+#define POINTER_SCROLL_BASE_STEP_MILLI 6000
+#define POINTER_SCROLL_STOP_MS 100
+#define KITTY_MOUSE_LEAVE (1u << 7)
 
 typedef enum {
     KITTY_GRAPHICS_RESPONSE_IGNORE,
@@ -465,6 +467,10 @@ typedef struct {
     guint pointer_modifiers;
     gint pointer_x_milli;
     gint pointer_y_milli;
+    gint scroll_direction_x;
+    gint scroll_direction_y;
+    gint64 last_scroll_us;
+    gint64 scroll_stop_due_us;
     gboolean image_present;
     gboolean frame_waiting;
     gboolean engine_visibility_known;
@@ -473,6 +479,7 @@ typedef struct {
     gboolean terminal_active;
     gboolean visible;
     gboolean focused;
+    gboolean pointer_inside;
     gboolean ephemeral;
     gboolean find_active;
     gboolean find_overlay_visible;
@@ -1977,6 +1984,34 @@ key_number_to_keyval(guint32 key)
         return 0xff13u;
     case 57363:
         return 0xff67u;
+    case KITTY_MODIFIER_KEY_FIRST + 0:
+        return 0xffe1u;
+    case KITTY_MODIFIER_KEY_FIRST + 1:
+        return 0xffe3u;
+    case KITTY_MODIFIER_KEY_FIRST + 2:
+        return 0xffe9u;
+    case KITTY_MODIFIER_KEY_FIRST + 3:
+        return 0xffebu;
+    case KITTY_MODIFIER_KEY_FIRST + 4:
+        return 0xffedu;
+    case KITTY_MODIFIER_KEY_FIRST + 5:
+        return 0xffe7u;
+    case KITTY_MODIFIER_KEY_FIRST + 6:
+        return 0xffe2u;
+    case KITTY_MODIFIER_KEY_FIRST + 7:
+        return 0xffe4u;
+    case KITTY_MODIFIER_KEY_FIRST + 8:
+        return 0xffeau;
+    case KITTY_MODIFIER_KEY_FIRST + 9:
+        return 0xffecu;
+    case KITTY_MODIFIER_KEY_FIRST + 10:
+        return 0xffeeu;
+    case KITTY_MODIFIER_KEY_FIRST + 11:
+        return 0xffe8u;
+    case KITTY_MODIFIER_KEY_FIRST + 12:
+        return 0xfe03u;
+    case KITTY_MODIFIER_KEY_FIRST + 13:
+        return 0xfe11u;
     default:
         if (key >= 57376 && key <= 57387)
             return KEY_F1 + 12 + (key - 57376);
@@ -2134,6 +2169,58 @@ release_pointer_buttons(Pane *pane, guint keyboard_modifiers)
     }
 }
 
+static gint
+pointer_scroll_step_milli(Pane *pane,
+                          gint direction_x,
+                          gint direction_y,
+                          gint64 now_us)
+{
+    gint step = POINTER_SCROLL_BASE_STEP_MILLI;
+
+    if (pane->last_scroll_us &&
+        pane->scroll_direction_x == direction_x &&
+        pane->scroll_direction_y == direction_y &&
+        now_us >= pane->last_scroll_us) {
+        gint64 interval_us = now_us - pane->last_scroll_us;
+
+        if (interval_us <= 16000)
+            step = 24000;
+        else if (interval_us <= 32000)
+            step = 18000;
+        else if (interval_us <= 64000)
+            step = 12000;
+        else if (interval_us <= 100000)
+            step = 8000;
+    }
+    pane->last_scroll_us = now_us;
+    pane->scroll_direction_x = direction_x;
+    pane->scroll_direction_y = direction_y;
+    pane->scroll_stop_due_us = now_us +
+        (gint64)POINTER_SCROLL_STOP_MS * 1000;
+    return step;
+}
+
+static void
+finish_pointer_scroll(Pane *pane)
+{
+    if (!pane->scroll_stop_due_us)
+        return;
+    pane->scroll_stop_due_us = 0;
+    pane->last_scroll_us = 0;
+    pane->scroll_direction_x = 0;
+    pane->scroll_direction_y = 0;
+    send_pointer(pane,
+                 MUX_ENGINE_POINTER_SCROLL,
+                 pane->pointer_modifiers,
+                 0,
+                 pane->pointer_x_milli,
+                 pane->pointer_y_milli,
+                 0,
+                 0,
+                 TRUE,
+                 TRUE);
+}
+
 static void
 send_navigation(Pane *pane,
                 MuxEngineNavigationAction action,
@@ -2197,8 +2284,6 @@ send_engine_visibility(Pane *pane)
     if (pane->engine_visibility_known &&
         pane->engine_visible == visible)
         return;
-    if (!visible)
-        retire_frame_responses(pane);
     mux_engine_builder_init(&builder);
     mux_engine_builder_put_u32(&builder, visible);
     payload = mux_engine_builder_finish(&builder);
@@ -2238,8 +2323,10 @@ send_engine_layer(Pane *pane)
 static void
 send_focus(Pane *pane, gboolean focused)
 {
-    if (!focused)
+    if (!focused) {
+        finish_pointer_scroll(pane);
         release_pointer_buttons(pane, 0);
+    }
     pane->focused = focused;
     send_engine_focus(pane,
                       focused && pane_page_is_visible(pane));
@@ -2255,7 +2342,6 @@ send_resize(Pane *pane)
     if (!pane_page_is_visible(pane) || !pane->terminal_active ||
         pane->engine_fd < 0 || !pane->view_id)
         return;
-    retire_frame_responses(pane);
     advance_image_generation(pane);
     mux_engine_builder_init(&builder);
     mux_engine_builder_put_u32(&builder, pane->width);
@@ -2324,7 +2410,6 @@ clipboard_closed(MuxPaneClipboard *clipboard, gpointer user_data)
 
     (void) clipboard;
     terminal_write(pane, "\033[H\033[2J");
-    retire_frame_responses(pane);
     send_engine_visibility(pane);
     delete_image(pane);
     send_resize(pane);
@@ -3005,7 +3090,6 @@ chooser_resume(gpointer user_data, GError **error)
         pane->width = width;
         pane->height = height;
     }
-    retire_frame_responses(pane);
     delete_image(pane);
     send_resize(pane);
     if (!ui_update_size(pane, error))
@@ -3268,13 +3352,6 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
             event_type =
                 (guint)g_ascii_strtoull(modifier_fields[1], NULL, 10);
     }
-    if (key_number >= KITTY_MODIFIER_KEY_FIRST &&
-        key_number <= KITTY_MODIFIER_KEY_LAST) {
-        g_strfreev(modifier_fields);
-        g_strfreev(key_fields);
-        g_strfreev(fields);
-        return;
-    }
     committed_text = kitty_committed_text(
         field_count > 2 ? fields[2] : NULL,
         key_number);
@@ -3444,24 +3521,64 @@ handle_mouse(Pane *pane,
         keyboard_modifiers |= WPE_MODIFIER_ALT;
     if (encoded & 16)
         keyboard_modifiers |= WPE_MODIFIER_CONTROL;
-    x_milli = (gint)(x ? x - 1 : 0) * 1000;
-    y_milli = (gint)(y ? y - 1 : 0) * 1000;
+    if (encoded & KITTY_MOUSE_LEAVE) {
+        finish_pointer_scroll(pane);
+        release_pointer_buttons(pane, 0);
+        if (pane->pointer_inside) {
+            send_pointer(pane,
+                         MUX_ENGINE_POINTER_LEAVE,
+                         0,
+                         0,
+                         pane->pointer_x_milli,
+                         pane->pointer_y_milli,
+                         0,
+                         0,
+                         FALSE,
+                         FALSE);
+            pane->pointer_inside = FALSE;
+        }
+        return;
+    }
+    x_milli = (gint)MIN(x ? x - 1 : 0,
+                        MAX(pane->width, 1u) - 1) * 1000;
+    y_milli = (gint)MIN(y ? y - 1 : 0,
+                        MAX(pane->height, 1u) - 1) * 1000;
     pane->pointer_x_milli = x_milli;
     pane->pointer_y_milli = y_milli;
+    if (!pane->pointer_inside) {
+        pane->pointer_inside = TRUE;
+        send_pointer(pane,
+                     MUX_ENGINE_POINTER_ENTER,
+                     keyboard_modifiers | pane->pointer_modifiers,
+                     0,
+                     x_milli,
+                     y_milli,
+                     0,
+                     0,
+                     FALSE,
+                     FALSE);
+    }
     modifiers = keyboard_modifiers | pane->pointer_modifiers;
 
     if (encoded & 64) {
+        gint direction_x = 0;
+        gint direction_y = 0;
         gint delta_x = 0;
         gint delta_y = 0;
+        gint step;
+        gint64 now_us = g_get_monotonic_time();
+
         button_code = encoded & 3;
         if (button_code < 2)
-            delta_y = button_code
-                ? POINTER_SCROLL_STEP_MILLI
-                : -POINTER_SCROLL_STEP_MILLI;
+            direction_y = button_code ? 1 : -1;
         else
-            delta_x = button_code == 2
-                ? -POINTER_SCROLL_STEP_MILLI
-                : POINTER_SCROLL_STEP_MILLI;
+            direction_x = button_code == 2 ? -1 : 1;
+        step = pointer_scroll_step_milli(pane,
+                                         direction_x,
+                                         direction_y,
+                                         now_us);
+        delta_x = direction_x * step;
+        delta_y = direction_y * step;
         send_pointer(pane,
                      MUX_ENGINE_POINTER_SCROLL,
                      modifiers,
@@ -3470,11 +3587,12 @@ handle_mouse(Pane *pane,
                      y_milli,
                      delta_x,
                      delta_y,
-                     FALSE,
+                     TRUE,
                      FALSE);
         return;
     }
 
+    finish_pointer_scroll(pane);
     button_code = encoded & 3;
     if (button_code == 0)
         button = 1;
@@ -3489,6 +3607,27 @@ handle_mouse(Pane *pane,
         else
             release_pointer_button(pane, button, keyboard_modifiers);
     } else if ((encoded & 32) || button_code == 3) {
+        if (button_code == 3) {
+            release_pointer_buttons(pane, keyboard_modifiers);
+        } else {
+            guint button_modifier = pointer_button_modifier(button);
+
+            if (!(pane->pointer_modifiers & button_modifier)) {
+                pane->pointer_modifiers |= button_modifier;
+                send_pointer(pane,
+                             MUX_ENGINE_POINTER_DOWN,
+                             keyboard_modifiers |
+                                 pane->pointer_modifiers,
+                             button,
+                             x_milli,
+                             y_milli,
+                             0,
+                             0,
+                             FALSE,
+                             FALSE);
+            }
+        }
+        modifiers = keyboard_modifiers | pane->pointer_modifiers;
         send_pointer(pane,
                      MUX_ENGINE_POINTER_MOVE,
                      modifiers,
@@ -3502,6 +3641,8 @@ handle_mouse(Pane *pane,
     } else {
         guint button_modifier = pointer_button_modifier(button);
 
+        if (pane->pointer_modifiers & button_modifier)
+            release_pointer_button(pane, button, keyboard_modifiers);
         pane->pointer_modifiers |= button_modifier;
         send_pointer(pane,
                      MUX_ENGINE_POINTER_DOWN,
@@ -3936,7 +4077,6 @@ set_visibility(Pane *pane, gboolean visible)
         redraw_clipboard_picker(pane);
         return;
     }
-    retire_frame_responses(pane);
     delete_image(pane);
     send_resize(pane);
     send_engine_focus(pane, pane->focused);
@@ -4149,6 +4289,9 @@ next_poll_timeout(Pane *pane, gint64 now_us)
     tighten_timeout(&timeout_ms,
                     deadline_timeout_ms(pane->resize_due_us,
                                         now_us));
+    tighten_timeout(&timeout_ms,
+                    deadline_timeout_ms(pane->scroll_stop_due_us,
+                                        now_us));
     if (pane->clipboard != NULL) {
         if (!pane->clipboard_tick_due_us)
             tighten_timeout(&timeout_ms, 0);
@@ -4168,6 +4311,9 @@ next_poll_timeout(Pane *pane, gint64 now_us)
 static void
 service_maintenance(Pane *pane, gint64 monotonic_us)
 {
+    if (pane->scroll_stop_due_us &&
+        monotonic_us >= pane->scroll_stop_due_us)
+        finish_pointer_scroll(pane);
     if (pane->close_request_serial && pane->close_deadline_us &&
         monotonic_us >= pane->close_deadline_us) {
         cancel_close_request(pane);

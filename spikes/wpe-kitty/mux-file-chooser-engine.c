@@ -1379,11 +1379,17 @@ stage_worker(gpointer data, gpointer user_data)
     g_assert_cmpuint(scheduled_jobs, >, 0);
     scheduled_jobs--;
     g_mutex_unlock(&scheduler_lock);
-    g_main_context_invoke_full(operation->bridge->context,
-                               G_PRIORITY_DEFAULT,
-                               stage_worker_dispatch,
-                               operation,
-                               (GDestroyNotify)stage_operation_unref);
+    {
+        GSource *source = g_idle_source_new();
+
+        g_source_set_priority(source, G_PRIORITY_DEFAULT);
+        g_source_set_callback(source,
+                              stage_worker_dispatch,
+                              operation,
+                              (GDestroyNotify)stage_operation_unref);
+        g_source_attach(source, operation->bridge->context);
+        g_source_unref(source);
+    }
 }
 
 static gboolean

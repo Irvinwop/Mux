@@ -165,31 +165,6 @@ frame_backpressure_retry_delay_ms(guint rejection_count)
     return MIN(delay, MUX_ENGINE_BACKPRESSURE_RETRY_MAX_MS);
 }
 
-static gboolean
-engine_itp_enabled(void)
-{
-    const gchar *value = g_getenv("MUX_ENABLE_ITP");
-
-    return value && *value &&
-        g_ascii_strcasecmp(value, "0") != 0 &&
-        g_ascii_strcasecmp(value, "false") != 0 &&
-        g_ascii_strcasecmp(value, "no") != 0;
-}
-
-static void
-engine_network_session_configure(WebKitNetworkSession *session)
-{
-    WebKitCookieManager *cookies;
-
-    g_return_if_fail(WEBKIT_IS_NETWORK_SESSION(session));
-    webkit_network_session_set_itp_enabled(session, engine_itp_enabled());
-    cookies = webkit_network_session_get_cookie_manager(session);
-    if (cookies)
-        webkit_cookie_manager_set_accept_policy(
-            cookies,
-            WEBKIT_COOKIE_POLICY_ACCEPT_ALWAYS);
-}
-
 static WebKitNetworkSession *
 engine_private_network_session_new(void)
 {
@@ -197,7 +172,6 @@ engine_private_network_session_new(void)
 
     if (!session)
         return NULL;
-    engine_network_session_configure(session);
     webkit_network_session_set_itp_enabled(session, TRUE);
     webkit_network_session_set_persistent_credential_storage_enabled(session,
                                                                      FALSE);
@@ -566,7 +540,8 @@ static gboolean mux_platform_render_buffer(WPEView *platform_view,
                                            guint damage_count,
                                            GError **error);
 static void engine_view_send_frame(EngineView *view);
-static void engine_view_reset_surface(EngineView *view);
+static void engine_view_reset_surface(EngineView *view,
+                                      gboolean clear_pending_frame);
 static void engine_view_find_close(EngineView *view, gboolean notify);
 static gboolean engine_view_find_initialize(EngineView *view);
 
@@ -2657,9 +2632,10 @@ mux_platform_render_buffer(WPEView *platform_view,
 }
 
 static void
-engine_view_reset_surface(EngineView *view)
+engine_view_reset_surface(EngineView *view, gboolean clear_pending_frame)
 {
-    engine_view_clear_pending_frame(view);
+    if (clear_pending_frame)
+        engine_view_clear_pending_frame(view);
     if (view->frame_retry_id) {
         g_source_remove(view->frame_retry_id);
         view->frame_retry_id = 0;
@@ -2883,7 +2859,7 @@ view_web_process_terminated(WebKitWebView *web_view,
     if (web_view != view->web_view)
         return;
     view->web_process_terminated = TRUE;
-    engine_view_reset_surface(view);
+    engine_view_reset_surface(view, FALSE);
     g_warning("Web process %s for view %" G_GUINT64_FORMAT " (%s)",
               termination,
               view->id,
@@ -2976,7 +2952,7 @@ engine_view_free(gpointer data)
                                              view->web_view);
     }
     g_clear_pointer(&view->download_manager, mux_download_manager_free);
-    engine_view_reset_surface(view);
+    engine_view_reset_surface(view, TRUE);
     g_clear_pointer(&view->popup_manager, mux_popup_manager_free);
     g_clear_pointer(&view->file_chooser_bridge,
                     mux_file_chooser_bridge_free);
@@ -3694,7 +3670,7 @@ handle_resize(Client *client, const MuxEngineMessage *request)
     view->width = width;
     view->height = height;
     view->scale_milli = scale_milli;
-    engine_view_reset_surface(view);
+    engine_view_reset_surface(view, FALSE);
     wpe_view = webkit_web_view_get_wpe_view(view->web_view);
     toplevel = wpe_view ? wpe_view_get_toplevel(wpe_view) : NULL;
     if (!toplevel || !engine_view_apply_geometry(view)) {
@@ -4861,7 +4837,7 @@ handle_set_visibility(Client *client, const MuxEngineMessage *request)
     view->hidden = visible == 0;
     if (view->hidden)
         engine_view_find_close(view, TRUE);
-    engine_view_reset_surface(view);
+    engine_view_reset_surface(view, FALSE);
     wpe_view = view->platform_view
         ? view->platform_view
         : webkit_web_view_get_wpe_view(view->web_view);
@@ -5418,7 +5394,7 @@ initialize_browser(Engine *engine, GError **error)
     mux_download_manager_set_clipboard_func(engine->download_manager,
                                             download_clipboard_output);
 
-    engine_network_session_configure(engine->persistent_session);
+    webkit_network_session_set_itp_enabled(engine->persistent_session, TRUE);
     return TRUE;
 }
 
