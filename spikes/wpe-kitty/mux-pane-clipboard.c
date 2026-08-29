@@ -12,6 +12,18 @@ typedef enum {
     FRESH_PASTE_SYNCING
 } FreshPasteState;
 
+typedef enum {
+    FRESH_DISPATCH_STARTED,
+    FRESH_DISPATCH_RETRY,
+    FRESH_DISPATCH_FAILED
+} FreshDispatchResult;
+
+typedef struct {
+    guint64 request_id;
+    MuxPaneClipboardFreshPasteFunc callback;
+    gpointer callback_data;
+} FreshPasteWaiter;
+
 typedef struct {
     gchar *origin;
     guint64 view_id;
@@ -50,9 +62,12 @@ struct _MuxPaneClipboard {
     gsize observation_bytes;
     FreshPasteState fresh_state;
     guint64 fresh_request_id;
-    gint64 fresh_deadline_us;
-    MuxPaneClipboardFreshPasteFunc fresh_callback;
-    gpointer fresh_callback_data;
+    gint64 fresh_dispatch_deadline_us;
+    gint64 fresh_read_deadline_us;
+    gint64 fresh_engine_deadline_us;
+    FreshPasteWaiter fresh_waiters[
+        MUX_PANE_CLIPBOARD_MAX_PENDING_PASTES];
+    guint fresh_waiter_count;
     MuxClipboardSnapshot *fresh_snapshot;
     guint64 next_fresh_wire_transaction;
     guint64 fresh_wire_transaction;
@@ -125,6 +140,7 @@ static void broker_observation_result(
     const GError *error,
     gpointer user_data);
 static gboolean connect_broker(MuxPaneClipboard *clipboard, GError **error);
+static void flush_fresh_observation(MuxPaneClipboard *clipboard);
 
 static guint32
 fresh_snapshot_flags(const MuxPaneClipboard *clipboard)
@@ -191,9 +207,12 @@ clear_fresh_paste(MuxPaneClipboard *clipboard)
         mux_kitty_clipboard_cancel_read(clipboard->fresh_kitty);
     clipboard->fresh_state = FRESH_PASTE_IDLE;
     clipboard->fresh_request_id = 0;
-    clipboard->fresh_deadline_us = 0;
-    clipboard->fresh_callback = NULL;
-    clipboard->fresh_callback_data = NULL;
+    clipboard->fresh_dispatch_deadline_us = 0;
+    clipboard->fresh_read_deadline_us = 0;
+    clipboard->fresh_engine_deadline_us = 0;
+    for (guint i = 0; i < clipboard->fresh_waiter_count; i++)
+        clipboard->fresh_waiters[i] = (FreshPasteWaiter) { 0 };
+    clipboard->fresh_waiter_count = 0;
     g_clear_pointer(&clipboard->fresh_snapshot,
                     mux_clipboard_snapshot_unref);
     clipboard->fresh_wire_transaction = 0;
@@ -206,13 +225,24 @@ clear_fresh_paste(MuxPaneClipboard *clipboard)
 static void
 finish_fresh_paste(MuxPaneClipboard *clipboard, gboolean fresh)
 {
-    MuxPaneClipboardFreshPasteFunc callback = clipboard->fresh_callback;
-    gpointer callback_data = clipboard->fresh_callback_data;
-    guint64 request_id = clipboard->fresh_request_id;
+    g_autoptr(MuxPaneClipboardOperation) operation =
+        pane_clipboard_acquire(clipboard);
+    FreshPasteWaiter waiters[MUX_PANE_CLIPBOARD_MAX_PENDING_PASTES] = {
+        0
+    };
+    guint waiter_count = clipboard->fresh_waiter_count;
+
+    for (guint i = 0; i < waiter_count; i++)
+        waiters[i] = clipboard->fresh_waiters[i];
 
     clear_fresh_paste(clipboard);
-    if (callback != NULL)
-        callback(clipboard, request_id, fresh, callback_data);
+    for (guint i = 0; i < waiter_count; i++) {
+        if (waiters[i].callback != NULL)
+            waiters[i].callback(clipboard,
+                                waiters[i].request_id,
+                                fresh,
+                                waiters[i].callback_data);
+    }
 }
 
 static void
@@ -242,8 +272,7 @@ static void
 maybe_complete_fresh_paste(MuxPaneClipboard *clipboard)
 {
     if (clipboard->fresh_state == FRESH_PASTE_SYNCING &&
-        clipboard->fresh_wire_acked &&
-        clipboard->fresh_broker_acked)
+        clipboard->fresh_wire_acked)
         finish_fresh_paste(clipboard, TRUE);
 }
 
@@ -281,6 +310,8 @@ fresh_receive(MuxKittyClipboard *kitty,
               gpointer user_data)
 {
     MuxPaneClipboard *clipboard = user_data;
+    g_autoptr(MuxPaneClipboardOperation) operation =
+        pane_clipboard_acquire(clipboard);
     g_autoptr(GError) error = NULL;
 
     (void)kitty;
@@ -300,8 +331,12 @@ fresh_receive(MuxKittyClipboard *kitty,
     }
 
     clipboard->fresh_state = FRESH_PASTE_SYNCING;
+    clipboard->fresh_read_deadline_us = 0;
+    clipboard->fresh_engine_deadline_us = g_get_monotonic_time() +
+        (gint64)MUX_PANE_CLIPBOARD_FRESH_ENGINE_TIMEOUT_MS * 1000;
     clipboard->fresh_wire_transaction =
         next_fresh_wire_transaction(clipboard);
+    flush_fresh_observation(clipboard);
     if (!mux_clipboard_wire_send_snapshot(
             clipboard->fresh_wire_transaction,
             fresh_snapshot_flags(clipboard),
@@ -314,6 +349,8 @@ fresh_receive(MuxKittyClipboard *kitty,
             clipboard,
             &error))
         fail_fresh_paste(clipboard, "fresh-paste-engine", error);
+    g_clear_pointer(&clipboard->fresh_snapshot,
+                    mux_clipboard_snapshot_unref);
 }
 
 static void
@@ -330,24 +367,36 @@ fresh_failure(MuxKittyClipboard *kitty,
                      error);
 }
 
-static gboolean
+static FreshDispatchResult
 start_fresh_read(MuxPaneClipboard *clipboard, GError **error)
 {
+    gint64 dispatch_deadline_us = clipboard->fresh_dispatch_deadline_us;
+
+    clipboard->fresh_state = FRESH_PASTE_READING;
+    clipboard->fresh_dispatch_deadline_us = 0;
+    clipboard->fresh_read_deadline_us = g_get_monotonic_time() +
+        (gint64)MUX_PANE_CLIPBOARD_FRESH_READ_TIMEOUT_MS * 1000;
     if (mux_kitty_clipboard_request_all(clipboard->fresh_kitty,
                                         MUX_OSC5522_LOCATION_CLIPBOARD,
                                         NULL,
                                         "Mux fresh paste",
                                         FALSE,
-                                        error)) {
-        clipboard->fresh_state = FRESH_PASTE_READING;
-        return TRUE;
-    }
+                                        error))
+        return FRESH_DISPATCH_STARTED;
+    if (clipboard->fresh_state != FRESH_PASTE_READING)
+        return FRESH_DISPATCH_STARTED;
     if (error != NULL && *error != NULL &&
         g_error_matches(*error, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK)) {
         g_clear_error(error);
-        return TRUE;
+        clipboard->fresh_state = FRESH_PASTE_STARTING;
+        clipboard->fresh_dispatch_deadline_us = dispatch_deadline_us;
+        clipboard->fresh_read_deadline_us = 0;
+        return FRESH_DISPATCH_RETRY;
     }
-    return FALSE;
+    clipboard->fresh_state = FRESH_PASTE_STARTING;
+    clipboard->fresh_dispatch_deadline_us = dispatch_deadline_us;
+    clipboard->fresh_read_deadline_us = 0;
+    return FRESH_DISPATCH_FAILED;
 }
 
 static void
@@ -365,14 +414,11 @@ flush_fresh_observation(MuxPaneClipboard *clipboard)
                            clipboard->view_id,
                            fresh_snapshot_flags(clipboard),
                            clipboard->fresh_snapshot,
-                           clipboard->fresh_request_id,
+                           0,
                            &error)) {
-        fail_fresh_paste(clipboard, "fresh-paste-broker", error);
-        return;
+        report_failure(clipboard, "fresh-paste-history", error);
     }
     clipboard->fresh_broker_submitted = TRUE;
-    g_clear_pointer(&clipboard->fresh_snapshot,
-                    mux_clipboard_snapshot_unref);
 }
 
 static gboolean
@@ -1108,14 +1154,28 @@ mux_pane_clipboard_handle_osc(MuxPaneClipboard *clipboard,
     g_return_val_if_fail(clipboard != NULL, FALSE);
     operation = pane_clipboard_acquire(clipboard);
     (void)operation;
-    if (clipboard->fresh_state != FRESH_PASTE_IDLE &&
-        mux_kitty_clipboard_osc_matches_pending_read(
+    if (clipboard->fresh_state != FRESH_PASTE_IDLE) {
+        gboolean probe_result = mux_kitty_clipboard_osc_matches_pending_read(
             clipboard->fresh_kitty,
             sequence,
             length,
             &matches_fresh_read,
-            &probe_error) &&
-        matches_fresh_read) {
+            &probe_error);
+
+        if (!probe_result) {
+            fail_fresh_paste(clipboard,
+                             "fresh-paste-response",
+                             probe_error);
+            if (error != NULL && *error == NULL && probe_error != NULL)
+                g_propagate_error(error, g_steal_pointer(&probe_error));
+            complete_failed_fresh_paste(clipboard);
+            return FALSE;
+        }
+    }
+    if (matches_fresh_read) {
+        if (clipboard->fresh_state == FRESH_PASTE_READING)
+            clipboard->fresh_read_deadline_us = g_get_monotonic_time() +
+                (gint64)MUX_PANE_CLIPBOARD_FRESH_READ_TIMEOUT_MS * 1000;
         if (!mux_kitty_clipboard_handle_osc(clipboard->fresh_kitty,
                                             sequence,
                                             length,
@@ -1150,10 +1210,19 @@ mux_pane_clipboard_handle_engine_packet(MuxPaneClipboard *clipboard,
     operation = pane_clipboard_acquire(clipboard);
     (void)operation;
     if (clipboard->fresh_state == FRESH_PASTE_SYNCING &&
-        mux_clipboard_wire_record_decode(packet,
-                                         packet_length,
-                                         &record,
-                                         &probe_error) &&
+        !mux_clipboard_wire_record_decode(packet,
+                                          packet_length,
+                                          &record,
+                                          &probe_error)) {
+        fail_fresh_paste(clipboard,
+                         "fresh-paste-engine-response",
+                         probe_error);
+        if (error != NULL && *error == NULL && probe_error != NULL)
+            g_propagate_error(error, g_steal_pointer(&probe_error));
+        complete_failed_fresh_paste(clipboard);
+        return FALSE;
+    }
+    if (clipboard->fresh_state == FRESH_PASTE_SYNCING &&
         record.transaction_id == clipboard->fresh_wire_transaction &&
         (record.type == MUX_CLIPBOARD_WIRE_ACK ||
          record.type == MUX_CLIPBOARD_WIRE_REMOTE_ERROR)) {
@@ -1188,6 +1257,7 @@ mux_pane_clipboard_request_fresh_paste(
     GError **error)
 {
     g_autoptr(MuxPaneClipboardOperation) operation = NULL;
+    FreshDispatchResult dispatch_result = FRESH_DISPATCH_RETRY;
 
     g_return_val_if_fail(clipboard != NULL, FALSE);
     operation = pane_clipboard_acquire(clipboard);
@@ -1199,22 +1269,43 @@ mux_pane_clipboard_request_fresh_paste(
                             "fresh paste request requires an id and callback");
         return FALSE;
     }
-    if (clipboard->fresh_state != FRESH_PASTE_IDLE) {
+    for (guint i = 0; i < clipboard->fresh_waiter_count; i++) {
+        if (clipboard->fresh_waiters[i].request_id == request_id) {
+            if (clipboard->fresh_waiters[i].callback == callback &&
+                clipboard->fresh_waiters[i].callback_data == callback_data)
+                return TRUE;
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_ARGUMENT,
+                                "fresh paste request id is already in use");
+            return FALSE;
+        }
+    }
+    if (clipboard->fresh_waiter_count >=
+        MUX_PANE_CLIPBOARD_MAX_PENDING_PASTES) {
         g_set_error_literal(error,
                             G_IO_ERROR,
-                            G_IO_ERROR_PENDING,
-                            "a fresh clipboard paste is already pending");
+                            G_IO_ERROR_NO_SPACE,
+                            "fresh paste request queue is full");
         return FALSE;
     }
 
+    clipboard->fresh_waiters[clipboard->fresh_waiter_count++] =
+        (FreshPasteWaiter) {
+            .request_id = request_id,
+            .callback = callback,
+            .callback_data = callback_data,
+        };
+    if (clipboard->fresh_state != FRESH_PASTE_IDLE)
+        return TRUE;
+
     clipboard->fresh_state = FRESH_PASTE_STARTING;
     clipboard->fresh_request_id = request_id;
-    clipboard->fresh_deadline_us = g_get_monotonic_time() +
-        (gint64)MUX_PANE_CLIPBOARD_FRESH_PASTE_TIMEOUT_MS * 1000;
-    clipboard->fresh_callback = callback;
-    clipboard->fresh_callback_data = callback_data;
-    if (!mux_clipboard_pane_link_write_pending(clipboard->link) &&
-        !start_fresh_read(clipboard, error)) {
+    clipboard->fresh_dispatch_deadline_us = g_get_monotonic_time() +
+        (gint64)MUX_PANE_CLIPBOARD_FRESH_DISPATCH_TIMEOUT_MS * 1000;
+    if (!mux_clipboard_pane_link_write_pending(clipboard->link))
+        dispatch_result = start_fresh_read(clipboard, error);
+    if (dispatch_result == FRESH_DISPATCH_FAILED) {
         clear_fresh_paste(clipboard);
         return FALSE;
     }
@@ -1300,27 +1391,23 @@ mux_pane_clipboard_tick(MuxPaneClipboard *clipboard, gint64 monotonic_us)
 {
     g_autoptr(MuxPaneClipboardOperation) operation = NULL;
     g_autoptr(GError) error = NULL;
+    FreshDispatchResult dispatch_result = FRESH_DISPATCH_RETRY;
+    const gchar *timeout_operation = NULL;
+    const gchar *timeout_message = NULL;
 
     g_return_if_fail(clipboard != NULL);
     operation = pane_clipboard_acquire(clipboard);
     (void)operation;
     mux_clipboard_pane_link_tick(clipboard->link, monotonic_us);
     if (clipboard->fresh_state == FRESH_PASTE_STARTING &&
-        !mux_clipboard_pane_link_write_pending(clipboard->link) &&
-        !start_fresh_read(clipboard, &error))
-        fail_fresh_paste(clipboard, "fresh-paste-read", error);
-    mux_kitty_clipboard_tick(clipboard->fresh_kitty, monotonic_us);
-    if (clipboard->fresh_error != NULL) {
-        complete_failed_fresh_paste(clipboard);
-    } else if (clipboard->fresh_state != FRESH_PASTE_IDLE &&
-               monotonic_us >= clipboard->fresh_deadline_us) {
-        error = g_error_new_literal(G_IO_ERROR,
-                                    G_IO_ERROR_TIMED_OUT,
-                                    "fresh clipboard paste timed out");
-        fail_fresh_paste(clipboard, "fresh-paste-timeout", error);
-        complete_failed_fresh_paste(clipboard);
-        g_clear_error(&error);
+        !mux_clipboard_pane_link_write_pending(clipboard->link)) {
+        dispatch_result = start_fresh_read(clipboard, &error);
+        if (dispatch_result == FRESH_DISPATCH_FAILED) {
+            fail_fresh_paste(clipboard, "fresh-paste-dispatch", error);
+            g_clear_error(&error);
+        }
     }
+    mux_kitty_clipboard_tick(clipboard->fresh_kitty, monotonic_us);
     if (clipboard->transport != NULL &&
         !mux_clipboard_broker_transport_is_open(clipboard->transport)) {
         mux_clipboard_broker_transport_unref(clipboard->transport);
@@ -1338,4 +1425,29 @@ mux_pane_clipboard_tick(MuxPaneClipboard *clipboard, gint64 monotonic_us)
     }
     flush_fresh_observation(clipboard);
     flush_observation(clipboard);
+
+    if (clipboard->fresh_state == FRESH_PASTE_STARTING &&
+        clipboard->fresh_dispatch_deadline_us != 0 &&
+        monotonic_us >= clipboard->fresh_dispatch_deadline_us) {
+        timeout_operation = "fresh-paste-dispatch-timeout";
+        timeout_message = "fresh clipboard dispatch timed out";
+    } else if (clipboard->fresh_state == FRESH_PASTE_READING &&
+               clipboard->fresh_read_deadline_us != 0 &&
+               monotonic_us >= clipboard->fresh_read_deadline_us) {
+        timeout_operation = "fresh-paste-read-timeout";
+        timeout_message = "fresh clipboard read timed out";
+    } else if (clipboard->fresh_state == FRESH_PASTE_SYNCING &&
+               clipboard->fresh_engine_deadline_us != 0 &&
+               monotonic_us >= clipboard->fresh_engine_deadline_us) {
+        timeout_operation = "fresh-paste-engine-timeout";
+        timeout_message = "fresh clipboard engine delivery timed out";
+    }
+    if (timeout_operation != NULL) {
+        error = g_error_new_literal(G_IO_ERROR,
+                                    G_IO_ERROR_TIMED_OUT,
+                                    timeout_message);
+        fail_fresh_paste(clipboard, timeout_operation, error);
+        g_clear_error(&error);
+    }
+    complete_failed_fresh_paste(clipboard);
 }

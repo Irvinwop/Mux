@@ -158,8 +158,10 @@ build_osc(const gchar *metadata, const gchar *payload, GError **error)
 {
     GByteArray *wire;
     gsize metadata_length = strlen(metadata);
-    gsize payload_length = strlen(payload);
-    gsize total = sizeof(OSC_PREFIX) - 1 + metadata_length + 1 +
+    gboolean payload_present = payload != NULL;
+    gsize payload_length = payload_present ? strlen(payload) : 0;
+    gsize total = sizeof(OSC_PREFIX) - 1 + metadata_length +
+                  (payload_present ? 1 : 0) +
                   payload_length + sizeof(OSC_SUFFIX) - 1;
 
     if (total > MUX_OSC5522_MAX_SEQUENCE) {
@@ -170,8 +172,11 @@ build_osc(const gchar *metadata, const gchar *payload, GError **error)
     wire = g_byte_array_sized_new(total);
     g_byte_array_append(wire, (const guint8 *)OSC_PREFIX, sizeof(OSC_PREFIX) - 1);
     g_byte_array_append(wire, (const guint8 *)metadata, metadata_length);
-    g_byte_array_append(wire, (const guint8 *)";", 1);
-    g_byte_array_append(wire, (const guint8 *)payload, payload_length);
+    if (payload_present) {
+        g_byte_array_append(wire, (const guint8 *)";", 1);
+        if (payload_length != 0)
+            g_byte_array_append(wire, (const guint8 *)payload, payload_length);
+    }
     g_byte_array_append(wire, (const guint8 *)OSC_SUFFIX, sizeof(OSC_SUFFIX) - 1);
     return g_byte_array_free_to_bytes(wire);
 }
@@ -276,9 +281,8 @@ mux_osc5522_read_request(const gchar *id,
     }
 
     if (mimes->len == 0)
-        payload = g_strdup(".");
-    else
-        payload = g_base64_encode((const guchar *)mimes->str, mimes->len);
+        g_string_append_c(mimes, '.');
+    payload = g_base64_encode((const guchar *)mimes->str, mimes->len);
 
     result = build_osc(metadata->str, payload, error);
 
@@ -297,19 +301,17 @@ mux_osc5522_read_mime_request(const gchar *id,
                               const gchar *human_name,
                               GError **error)
 {
-    GString *metadata = g_string_new("type=read");
-    GBytes *result = NULL;
+    const gchar *mime_types[] = { mime, NULL };
 
-    if (!validate_mime(mime, error) ||
-        !append_common(metadata, id, location, password, human_name, error))
-        goto out;
+    if (!validate_mime(mime, error))
+        return NULL;
 
-    append_base64_field(metadata, "mime", mime);
-    result = build_osc(metadata->str, "", error);
-
-out:
-    g_string_free(metadata, TRUE);
-    return result;
+    return mux_osc5522_read_request(id,
+                                    location,
+                                    mime_types,
+                                    password,
+                                    human_name,
+                                    error);
 }
 
 GBytes *
@@ -323,7 +325,7 @@ mux_osc5522_write_begin(const gchar *id,
     GBytes *result = NULL;
 
     if (append_common(metadata, id, location, password, human_name, error))
-        result = build_osc(metadata->str, "", error);
+        result = build_osc(metadata->str, NULL, error);
 
     g_string_free(metadata, TRUE);
     return result;
@@ -363,7 +365,7 @@ out:
 GBytes *
 mux_osc5522_write_end(GError **error)
 {
-    return build_osc("type=wdata", "", error);
+    return build_osc("type=wdata", NULL, error);
 }
 
 static gboolean
@@ -501,6 +503,7 @@ mux_osc5522_parse(const guint8 *sequence,
     gsize body_length;
     gsize metadata_length;
     gsize payload_length;
+    gboolean payload_present;
     gchar *metadata = NULL;
     gchar *payload = NULL;
     gchar **fields = NULL;
@@ -541,16 +544,20 @@ mux_osc5522_parse(const guint8 *sequence,
         return set_invalid(error, "OSC 5522 sequence contains a NUL byte");
 
     separator = memchr(body, ';', body_length);
-    if (separator == NULL)
-        return set_invalid(error, "OSC 5522 sequence has no payload separator");
-
-    metadata_length = separator - body;
-    payload_length = body_length - metadata_length - 1;
+    payload_present = separator != NULL;
+    if (payload_present) {
+        metadata_length = separator - body;
+        payload_length = body_length - metadata_length - 1;
+    } else {
+        metadata_length = body_length;
+        payload_length = 0;
+    }
     if (metadata_length == 0)
         return set_invalid(error, "OSC 5522 metadata is empty");
 
     metadata = g_strndup((const gchar *)body, metadata_length);
-    payload = g_strndup((const gchar *)separator + 1, payload_length);
+    if (payload_present)
+        payload = g_strndup((const gchar *)separator + 1, payload_length);
     fields = g_strsplit(metadata, ":", -1);
 
     for (i = 0; fields[i] != NULL; i++) {
@@ -647,6 +654,10 @@ mux_osc5522_parse(const guint8 *sequence,
     } else if (g_str_equal(type, "read") && g_str_equal(status, "DATA")) {
         if (mime == NULL) {
             set_invalid(error, "OSC 5522 data response lacks a MIME type");
+            goto out;
+        }
+        if (!payload_present) {
+            set_invalid(error, "OSC 5522 data response lacks a payload");
             goto out;
         }
         event->data = decode_bytes(payload, MUX_OSC5522_MAX_CHUNK, error);
