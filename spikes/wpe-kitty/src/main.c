@@ -348,7 +348,8 @@ static gboolean present_buffer(
         return FALSE;
 
     GError *error = NULL;
-    GBytes *bytes = wpe_buffer_import_to_pixels(buffer, &error);
+    g_autoptr(GBytes) bytes =
+        wpe_buffer_import_to_pixels(buffer, &error);
     if (!bytes) {
         g_warning("WPE buffer import failed: %s", error ? error->message : "unknown error");
         g_clear_error(&error);

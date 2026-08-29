@@ -68,6 +68,10 @@
 #define MUX_ENGINE_IDLE_EXIT_MS 5000U
 #define MUX_ENGINE_MUXD_INPUT_BYTES 4096U
 #define MUX_ENGINE_FIND_DEBOUNCE_MS 40U
+#define MUX_ENGINE_CLIENT_OUTPUT_MAX_PACKETS 256U
+#define MUX_ENGINE_CLIENT_OUTPUT_MAX_BYTES ((gsize)4U * 1024U * 1024U)
+#define MUX_ENGINE_RECOVERY_TIMEOUT_SECONDS 8U
+#define MUX_ENGINE_MAX_FRAME_TIMEOUTS 3U
 
 typedef enum {
     ENGINE_FIND_SHORTCUT_NONE,
@@ -284,6 +288,19 @@ typedef struct {
     guint height;
 } DamageRect;
 
+typedef enum {
+    ENGINE_WEB_PROCESS_ALIVE,
+    ENGINE_WEB_PROCESS_RECOVERING,
+    ENGINE_WEB_PROCESS_TERMINATED,
+} EngineWebProcessState;
+
+typedef struct {
+    GBytes *packet;
+    guint16 type;
+    guint64 view_id;
+    guint64 serial;
+} ClientOutputPacket;
+
 struct _Client {
     Engine *engine;
     int fd;
@@ -299,6 +316,9 @@ struct _Client {
     guint width;
     guint height;
     guint scale_milli;
+    GQueue output_packets;
+    gsize output_bytes;
+    gboolean watching_output;
 };
 
 struct _EngineView {
@@ -329,6 +349,7 @@ struct _EngineView {
     guint width;
     guint height;
     guint scale_milli;
+    guint64 geometry_generation;
     gboolean ephemeral;
     gboolean focused;
     gboolean hidden;
@@ -353,9 +374,20 @@ struct _EngineView {
     gsize pending_shm_size;
     guint frame_timeout_id;
     guint frame_retry_id;
+    guint frame_timeout_count;
     gboolean close_pending;
     gboolean close_ready;
-    gboolean web_process_terminated;
+    EngineWebProcessState web_process_state;
+    guint64 navigation_generation;
+    guint64 recovery_generation;
+    guint recovery_attempts;
+    guint recovery_idle_id;
+    guint recovery_timeout_id;
+    gboolean recovery_load_active;
+    gboolean recovery_committed;
+    gboolean process_error_sent;
+    gchar *recovery_uri;
+    gchar *last_committed_uri;
     guint64 pending_close_serial;
     guint64 retired_close_serial;
 };
@@ -544,6 +576,7 @@ static void engine_view_reset_surface(EngineView *view,
                                       gboolean clear_pending_frame);
 static void engine_view_find_close(EngineView *view, gboolean notify);
 static gboolean engine_view_find_initialize(EngineView *view);
+static void view_web_process_frame_ready(EngineView *view);
 
 G_DEFINE_TYPE(MuxPlatformView, mux_platform_view, WPE_TYPE_VIEW)
 
@@ -645,7 +678,10 @@ dimensions_are_valid(guint width, guint height, guint scale_milli)
 }
 
 static gboolean
-engine_view_apply_geometry(EngineView *view)
+engine_view_apply_geometry_values(EngineView *view,
+                                  guint width,
+                                  guint height,
+                                  guint scale_milli)
 {
     WPEView *wpe_view = view->platform_view
         ? view->platform_view
@@ -662,9 +698,9 @@ engine_view_apply_geometry(EngineView *view)
 
     if (!toplevel)
         return FALSE;
-    scale = view->scale_milli / 1000.0;
-    logical_width = logical_dimension(view->width, view->scale_milli);
-    logical_height = logical_dimension(view->height, view->scale_milli);
+    scale = scale_milli / 1000.0;
+    logical_width = logical_dimension(width, scale_milli);
+    logical_height = logical_dimension(height, scale_milli);
     screen = wpe_toplevel_get_screen(toplevel);
     if (screen)
         wpe_screen_set_scale(screen, scale);
@@ -674,6 +710,15 @@ engine_view_apply_geometry(EngineView *view)
         current_height == (int)logical_height)
         return TRUE;
     return wpe_toplevel_resize(toplevel, logical_width, logical_height);
+}
+
+static gboolean
+engine_view_apply_geometry(EngineView *view)
+{
+    return engine_view_apply_geometry_values(view,
+                                             view->width,
+                                             view->height,
+                                             view->scale_milli);
 }
 
 static gboolean
@@ -1365,6 +1410,117 @@ wait_for_engine_listener(const gchar *socket_path,
     return FALSE;
 }
 
+static void
+client_output_packet_free(gpointer data)
+{
+    ClientOutputPacket *packet = data;
+
+    if (!packet)
+        return;
+    g_clear_pointer(&packet->packet, g_bytes_unref);
+    g_free(packet);
+}
+
+static void
+client_update_watch(Client *client)
+{
+    gboolean watching_output = !g_queue_is_empty(&client->output_packets);
+    GIOCondition condition = G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL;
+
+    if (watching_output)
+        condition |= G_IO_OUT;
+    if (client->watch_id &&
+        client->watching_output == watching_output)
+        return;
+    if (client->watch_id) {
+        guint watch_id = client->watch_id;
+
+        client->watch_id = 0;
+        g_source_remove(watch_id);
+    }
+    client->watching_output = watching_output;
+    if (client->fd < 0 || client->failed)
+        return;
+    client->watch_id = g_unix_fd_add_full(G_PRIORITY_DEFAULT,
+                                          client->fd,
+                                          condition,
+                                          client_ready,
+                                          client,
+                                          NULL);
+}
+
+static gboolean
+client_flush_output(Client *client, GError **error)
+{
+    while (!g_queue_is_empty(&client->output_packets)) {
+        ClientOutputPacket *packet =
+            g_queue_peek_head(&client->output_packets);
+        gsize length;
+        gconstpointer data = g_bytes_get_data(packet->packet, &length);
+        ssize_t sent;
+
+        do {
+            sent = send(client->fd,
+                        data,
+                        length,
+                        MSG_NOSIGNAL | MSG_DONTWAIT);
+        } while (sent < 0 && errno == EINTR);
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            client_update_watch(client);
+            return TRUE;
+        }
+        if (sent < 0) {
+            g_set_error(error,
+                        MUX_ENGINE_ERROR,
+                        MUX_ENGINE_ERROR_IO,
+                        "send engine packet: %s",
+                        g_strerror(errno));
+            return FALSE;
+        }
+        if ((gsize)sent != length) {
+            g_set_error(error,
+                        MUX_ENGINE_ERROR,
+                        MUX_ENGINE_ERROR_IO,
+                        "short SOCK_SEQPACKET write: sent %zd of %"
+                        G_GSIZE_FORMAT,
+                        sent,
+                        length);
+            return FALSE;
+        }
+        g_queue_pop_head(&client->output_packets);
+        client->output_bytes -= length;
+        client_output_packet_free(packet);
+    }
+    client_update_watch(client);
+    return TRUE;
+}
+
+static void
+client_remove_queued_frame(Client *client,
+                           guint64 view_id,
+                           guint64 serial)
+{
+    GList *link = client ? client->output_packets.head : NULL;
+
+    while (link) {
+        GList *next = link->next;
+        ClientOutputPacket *packet = link->data;
+
+        if (packet->type == MUX_ENGINE_MESSAGE_FRAME &&
+            packet->view_id == view_id && packet->serial == serial) {
+            gsize size = g_bytes_get_size(packet->packet);
+
+            g_queue_delete_link(&client->output_packets, link);
+            client->output_bytes -= size;
+            client_output_packet_free(packet);
+            break;
+        }
+        link = next;
+    }
+    if (client)
+        client_update_watch(client);
+}
+
 static gboolean
 client_send(Client *client,
             guint16 type,
@@ -1380,17 +1536,59 @@ client_send(Client *client,
         .serial = serial,
         .payload = payload,
     };
-    GError *error = NULL;
+    g_autoptr(GError) error = NULL;
+    GBytes *wire_packet;
+    ClientOutputPacket *queued;
+    gsize wire_size;
+    GList *link;
 
     if (client->failed)
         return FALSE;
-    if (mux_engine_send_message(client->fd, &message, &error))
+    wire_packet = mux_engine_serialize_message(&message, &error);
+    if (!wire_packet)
+        goto failed;
+    wire_size = g_bytes_get_size(wire_packet);
+
+    if (type == MUX_ENGINE_MESSAGE_METADATA) {
+        for (link = client->output_packets.tail; link; link = link->prev) {
+            ClientOutputPacket *existing = link->data;
+
+            if (existing->type == type && existing->view_id == view_id) {
+                client->output_bytes -=
+                    g_bytes_get_size(existing->packet);
+                g_queue_delete_link(&client->output_packets, link);
+                client_output_packet_free(existing);
+                break;
+            }
+        }
+    }
+    if (g_queue_get_length(&client->output_packets) >=
+            MUX_ENGINE_CLIENT_OUTPUT_MAX_PACKETS ||
+        wire_size > MUX_ENGINE_CLIENT_OUTPUT_MAX_BYTES ||
+        client->output_bytes >
+            MUX_ENGINE_CLIENT_OUTPUT_MAX_BYTES - wire_size) {
+        g_set_error_literal(&error,
+                            MUX_ENGINE_ERROR,
+                            MUX_ENGINE_ERROR_TOO_LARGE,
+                            "engine client output queue exceeded its bound");
+        g_bytes_unref(wire_packet);
+        goto failed;
+    }
+
+    queued = g_new0(ClientOutputPacket, 1);
+    queued->packet = wire_packet;
+    queued->type = type;
+    queued->view_id = view_id;
+    queued->serial = serial;
+    g_queue_push_tail(&client->output_packets, queued);
+    client->output_bytes += wire_size;
+    if (client_flush_output(client, &error))
         return TRUE;
 
+failed:
     g_warning("engine client %ld send failed: %s",
               (long)client->peer_pid,
-              error->message);
-    g_clear_error(&error);
+              error ? error->message : "unknown error");
     client->failed = TRUE;
     shutdown(client->fd, SHUT_RDWR);
     return FALSE;
@@ -2261,6 +2459,10 @@ engine_frame_bytes_reserve(Engine *engine, gsize bytes)
 static void
 engine_view_clear_pending_frame(EngineView *view)
 {
+    if (view->frame_pending && view->owner)
+        client_remove_queued_frame(view->owner,
+                                   view->id,
+                                   view->pending_frame_serial);
     if (view->frame_pending &&
         view->pending_frame_serial > view->retired_frame_serial)
         view->retired_frame_serial = view->pending_frame_serial;
@@ -2283,6 +2485,8 @@ engine_view_clear_pending_frame(EngineView *view)
     view->pending_frame_serial = 0;
 }
 
+static void engine_view_schedule_frame_retry(EngineView *view);
+
 static gboolean
 frame_timeout(gpointer data)
 {
@@ -2296,8 +2500,24 @@ frame_timeout(gpointer data)
                   " for view %" G_GUINT64_FORMAT,
                   serial,
                   view->id);
-        view->owner->failed = TRUE;
-        shutdown(view->owner->fd, SHUT_RDWR);
+        if (view->frame_timeout_count < G_MAXUINT)
+            view->frame_timeout_count++;
+        if (view->frame_timeout_count >= MUX_ENGINE_MAX_FRAME_TIMEOUTS) {
+            view->graphics_failed = TRUE;
+            view->dirty_valid = FALSE;
+            g_warning("disabling graphics for view %" G_GUINT64_FORMAT
+                      " after %u unacknowledged frames",
+                      view->id,
+                      view->frame_timeout_count);
+        } else if (view->pixels && view->surface_width &&
+                   view->surface_height) {
+            view->root_frame_sent = FALSE;
+            view->dirty = damage_full(view->surface_width,
+                                      view->surface_height);
+            view->dirty_valid = TRUE;
+            view->dirty_replaces_pending = FALSE;
+            engine_view_schedule_frame_retry(view);
+        }
     }
     return G_SOURCE_REMOVE;
 }
@@ -2419,6 +2639,7 @@ engine_view_send_frame(EngineView *view)
     mux_engine_builder_put_u32(&builder, rectangle.height);
     mux_engine_builder_put_u64(&builder, shm_size);
     mux_engine_builder_put_string(&builder, shm_name);
+    mux_engine_builder_put_u64(&builder, view->geometry_generation);
     payload = mux_engine_builder_finish(&builder);
     serial = ++view->engine->next_event_serial;
     if (!client_send(view->owner,
@@ -2512,7 +2733,7 @@ engine_view_update_pixels(EngineView *view,
                           guint damage_count)
 {
     GError *error = NULL;
-    GBytes *bytes = NULL;
+    g_autoptr(GBytes) bytes = NULL;
     const guint8 *source;
     gsize source_size;
     guint source_stride;
@@ -2527,7 +2748,8 @@ engine_view_update_pixels(EngineView *view,
     if (!width || !height ||
         width > MUX_ENGINE_MAX_DIMENSION ||
         height > MUX_ENGINE_MAX_DIMENSION ||
-        (guint64)width * height > MUX_ENGINE_MAX_PIXELS)
+        (guint64)width * height > MUX_ENGINE_MAX_PIXELS ||
+        width != view->width || height != view->height)
         return FALSE;
 
     bytes = wpe_buffer_import_to_pixels(buffer, &error);
@@ -2605,6 +2827,7 @@ engine_view_update_pixels(EngineView *view,
     }
     if (view->frame_pending)
         view->dirty_replaces_pending = TRUE;
+    view_web_process_frame_ready(view);
     engine_view_send_frame(view);
     return TRUE;
 }
@@ -2652,6 +2875,7 @@ engine_view_reset_surface(EngineView *view, gboolean clear_pending_frame)
     view->graphics_failed = FALSE;
     view->frame_rejection_count = 0;
     view->frame_backpressure_count = 0;
+    view->frame_timeout_count = 0;
 }
 
 static void
@@ -2831,6 +3055,131 @@ view_close(WebKitWebView *web_view, gpointer data)
     }
 }
 
+static gboolean
+recovery_uri_is_safe(const gchar *uri)
+{
+    g_autoptr(GUri) parsed = NULL;
+    const gchar *scheme;
+
+    if (!uri || !*uri)
+        return FALSE;
+    parsed = g_uri_parse(uri, G_URI_FLAGS_PARSE_RELAXED, NULL);
+    if (!parsed)
+        return FALSE;
+    scheme = g_uri_get_scheme(parsed);
+    return scheme &&
+        (g_ascii_strcasecmp(scheme, "http") == 0 ||
+         g_ascii_strcasecmp(scheme, "https") == 0);
+}
+
+static gchar *
+view_recovery_target_uri(EngineView *view)
+{
+    const gchar *active = webkit_web_view_get_uri(view->web_view);
+
+    if (recovery_uri_is_safe(active))
+        return g_strdup(active);
+    if (recovery_uri_is_safe(view->last_committed_uri))
+        return g_strdup(view->last_committed_uri);
+    return NULL;
+}
+
+static void
+view_recovery_cancel_sources(EngineView *view)
+{
+    if (view->recovery_idle_id) {
+        g_source_remove(view->recovery_idle_id);
+        view->recovery_idle_id = 0;
+    }
+    if (view->recovery_timeout_id) {
+        g_source_remove(view->recovery_timeout_id);
+        view->recovery_timeout_id = 0;
+    }
+    view->recovery_load_active = FALSE;
+    view->recovery_committed = FALSE;
+    g_clear_pointer(&view->recovery_uri, g_free);
+}
+
+static void
+view_send_process_error(EngineView *view, const gchar *detail)
+{
+    MuxEngineBuilder builder;
+    GBytes *payload;
+
+    if (view->process_error_sent || !view->owner || view->owner->failed)
+        return;
+    view->process_error_sent = TRUE;
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, MUX_ENGINE_REMOTE_ERROR_INTERNAL);
+    mux_engine_builder_put_string(&builder, detail);
+    payload = mux_engine_builder_finish(&builder);
+    client_send(view->owner,
+                MUX_ENGINE_MESSAGE_ERROR,
+                MUX_ENGINE_FLAG_NONE,
+                view->id,
+                ++view->engine->next_event_serial,
+                payload);
+    g_bytes_unref(payload);
+}
+
+static void
+view_recovery_fail(EngineView *view, const gchar *detail)
+{
+    view_recovery_cancel_sources(view);
+    view->web_process_state = ENGINE_WEB_PROCESS_TERMINATED;
+    if (view->close_pending)
+        view_close(view->web_view, view);
+    else
+        view_send_process_error(view, detail);
+}
+
+static gboolean
+view_recovery_timeout(gpointer data)
+{
+    EngineView *view = data;
+
+    view->recovery_timeout_id = 0;
+    view_recovery_fail(view,
+                       "The page's Web process did not recover in time.");
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean
+view_recovery_load(gpointer data)
+{
+    EngineView *view = data;
+
+    view->recovery_idle_id = 0;
+    if (view->web_process_state != ENGINE_WEB_PROCESS_RECOVERING ||
+        !view->recovery_load_active || !view->recovery_uri ||
+        !view->web_view || !view->owner || view->owner->failed)
+        return G_SOURCE_REMOVE;
+    webkit_web_view_load_uri(view->web_view, view->recovery_uri);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+view_prepare_explicit_navigation(EngineView *view)
+{
+    EngineWebProcessState previous = view->web_process_state;
+
+    view_recovery_cancel_sources(view);
+    view->process_error_sent = FALSE;
+    if (previous != ENGINE_WEB_PROCESS_ALIVE)
+        view->web_process_state = ENGINE_WEB_PROCESS_RECOVERING;
+}
+
+static void
+view_web_process_frame_ready(EngineView *view)
+{
+    if (view->web_process_state != ENGINE_WEB_PROCESS_RECOVERING ||
+        !view->recovery_committed)
+        return;
+    view->web_process_state = ENGINE_WEB_PROCESS_ALIVE;
+    view->process_error_sent = FALSE;
+    view_recovery_cancel_sources(view);
+}
+
 static const gchar *
 web_process_termination_name(WebKitWebProcessTerminationReason reason)
 {
@@ -2852,14 +3201,14 @@ view_web_process_terminated(WebKitWebView *web_view,
                             gpointer data)
 {
     EngineView *view = data;
-    MuxEngineBuilder builder;
-    GBytes *payload;
     const gchar *termination = web_process_termination_name(reason);
+    g_autofree gchar *target_uri = NULL;
 
     if (web_view != view->web_view)
         return;
-    view->web_process_terminated = TRUE;
-    engine_view_reset_surface(view, FALSE);
+    view_recovery_cancel_sources(view);
+    view->web_process_state = ENGINE_WEB_PROCESS_TERMINATED;
+    engine_view_reset_surface(view, TRUE);
     g_warning("Web process %s for view %" G_GUINT64_FORMAT " (%s)",
               termination,
               view->id,
@@ -2874,42 +3223,35 @@ view_web_process_terminated(WebKitWebView *web_view,
     if (!view->owner || view->owner->failed)
         return;
 
-    if (reason == WEBKIT_WEB_PROCESS_CRASHED &&
-        !g_object_get_data(G_OBJECT(web_view), "mux-crash-recovery-attempted") &&
-        webkit_web_view_get_uri(web_view)) {
-        g_object_set_data(G_OBJECT(web_view),
-                          "mux-crash-recovery-attempted",
-                          GUINT_TO_POINTER(1));
-        g_object_set_data(G_OBJECT(web_view),
-                          "mux-crash-recovery-pending",
-                          GUINT_TO_POINTER(1));
+    target_uri = view_recovery_target_uri(view);
+    if (reason == WEBKIT_WEB_PROCESS_CRASHED && target_uri &&
+        (view->recovery_generation != view->navigation_generation ||
+         view->recovery_attempts == 0)) {
+        view->recovery_generation = view->navigation_generation;
+        view->recovery_attempts = 1;
+        view->web_process_state = ENGINE_WEB_PROCESS_RECOVERING;
+        view->recovery_load_active = TRUE;
+        view->recovery_uri = g_steal_pointer(&target_uri);
+        view->process_error_sent = FALSE;
         g_warning("view %" G_GUINT64_FORMAT
-                  " Web process crashed; reloading once at %s",
+                  " Web process crashed; loading a clean GET once at %s",
                   view->id,
-                  webkit_web_view_get_uri(web_view));
-        webkit_web_view_reload(web_view);
+                  view->recovery_uri);
+        view->recovery_idle_id = g_idle_add(view_recovery_load, view);
+        view->recovery_timeout_id =
+            g_timeout_add_seconds(MUX_ENGINE_RECOVERY_TIMEOUT_SECONDS,
+                                  view_recovery_timeout,
+                                  view);
         return;
     }
 
-    g_object_set_data(G_OBJECT(web_view), "mux-crash-recovery-pending", NULL);
-
-    mux_engine_builder_init(&builder);
-    mux_engine_builder_put_u32(&builder, MUX_ENGINE_REMOTE_ERROR_INTERNAL);
-    mux_engine_builder_put_string(&builder,
-                                  reason == WEBKIT_WEB_PROCESS_CRASHED
-                                      ? "The page's Web process crashed."
-                                      : reason ==
-                                                WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT
-                                          ? "The page's Web process exceeded its memory limit."
-                                          : "The page's Web process terminated.");
-    payload = mux_engine_builder_finish(&builder);
-    client_send(view->owner,
-                MUX_ENGINE_MESSAGE_ERROR,
-                MUX_ENGINE_FLAG_NONE,
-                view->id,
-                ++view->engine->next_event_serial,
-                payload);
-    g_bytes_unref(payload);
+    view_recovery_fail(view,
+                       reason == WEBKIT_WEB_PROCESS_CRASHED
+                           ? "The page's Web process crashed."
+                           : reason ==
+                                     WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT
+                               ? "The page's Web process exceeded its memory limit."
+                               : "The page's Web process terminated.");
 }
 
 static void
@@ -2923,14 +3265,46 @@ view_web_process_load_changed(WebKitWebView *web_view,
         return;
 
     if (load_event == WEBKIT_LOAD_STARTED) {
-        view->web_process_terminated = FALSE;
-        if (!g_object_get_data(G_OBJECT(web_view), "mux-crash-recovery-pending"))
-            g_object_set_data(G_OBJECT(web_view),
-                              "mux-crash-recovery-attempted",
-                              NULL);
-    } else if (load_event == WEBKIT_LOAD_FINISHED) {
-        g_object_set_data(G_OBJECT(web_view), "mux-crash-recovery-pending", NULL);
+        view->recovery_committed = FALSE;
+        if (!view->recovery_load_active) {
+            view->navigation_generation++;
+            view->recovery_generation = 0;
+            view->recovery_attempts = 0;
+            view->process_error_sent = FALSE;
+        }
+    } else if (load_event == WEBKIT_LOAD_COMMITTED) {
+        g_free(view->last_committed_uri);
+        view->last_committed_uri =
+            g_strdup(webkit_web_view_get_uri(web_view));
+        if (view->web_process_state == ENGINE_WEB_PROCESS_RECOVERING)
+            view->recovery_committed = TRUE;
     }
+}
+
+static gboolean
+view_web_process_load_failed(WebKitWebView *web_view,
+                             WebKitLoadEvent load_event,
+                             const gchar *failing_uri,
+                             GError *error,
+                             gpointer data)
+{
+    EngineView *view = data;
+
+    (void)load_event;
+    (void)failing_uri;
+    (void)error;
+    if (web_view != view->web_view)
+        return FALSE;
+    if (view->web_process_state == ENGINE_WEB_PROCESS_RECOVERING) {
+        if (view->recovery_load_active)
+            view_recovery_fail(view,
+                               "The page's Web process recovery load failed.");
+        else {
+            view->web_process_state = ENGINE_WEB_PROCESS_ALIVE;
+            view->recovery_committed = FALSE;
+        }
+    }
+    return FALSE;
 }
 
 static void
@@ -2964,6 +3338,19 @@ engine_view_free(gpointer data)
 
     if (!view)
         return;
+    view_recovery_cancel_sources(view);
+    if (view->web_view)
+        g_signal_handlers_disconnect_by_data(view->web_view, view);
+    if (view->platform_view &&
+        G_TYPE_CHECK_INSTANCE_TYPE(view->platform_view,
+                                   MUX_TYPE_PLATFORM_VIEW)) {
+        MuxPlatformView *platform_view =
+            (MuxPlatformView *)view->platform_view;
+
+        if (platform_view->engine_view == view)
+            platform_view->engine_view = NULL;
+    }
+    view->platform_view = NULL;
     if (view->owner && view->owner->view_count)
         view->owner->view_count--;
     if (!view->ephemeral && view->engine &&
@@ -3006,6 +3393,7 @@ engine_view_free(gpointer data)
     g_clear_pointer(&view->suppressed_text_keys, g_hash_table_unref);
     g_clear_object(&view->web_view);
     g_clear_object(&view->network_session);
+    g_clear_pointer(&view->last_committed_uri, g_free);
     g_free(view->layer);
     g_free(view);
 }
@@ -3545,6 +3933,10 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
                      "load-changed",
                      G_CALLBACK(view_load_changed),
                      view);
+    g_signal_connect(view->web_view,
+                     "load-failed",
+                     G_CALLBACK(view_web_process_load_failed),
+                     view);
     view_record_navigation(view);
 
     mux_engine_builder_init(&builder);
@@ -3611,7 +4003,7 @@ handle_request_close(Client *client, const MuxEngineMessage *request)
                           "a close request is already in progress");
         return TRUE;
     }
-    if (view->web_process_terminated) {
+    if (view->web_process_state != ENGINE_WEB_PROCESS_ALIVE) {
         client_send_empty(client,
                           MUX_ENGINE_MESSAGE_CLOSE_READY,
                           view->id,
@@ -3676,6 +4068,7 @@ handle_resize(Client *client, const MuxEngineMessage *request)
     guint32 width;
     guint32 height;
     guint32 scale_milli;
+    guint64 geometry_generation;
     WPEView *wpe_view;
     WPEToplevel *toplevel;
 
@@ -3685,9 +4078,11 @@ handle_resize(Client *client, const MuxEngineMessage *request)
     if (!mux_engine_cursor_get_u32(&cursor, &width) ||
         !mux_engine_cursor_get_u32(&cursor, &height) ||
         !mux_engine_cursor_get_u32(&cursor, &scale_milli) ||
+        !mux_engine_cursor_get_u64(&cursor, &geometry_generation) ||
         !mux_engine_cursor_done(&cursor) ||
         !dimensions_are_valid(width, height, scale_milli) ||
-        scale_milli != client->engine->device_scale_milli) {
+        scale_milli != client->engine->device_scale_milli ||
+        !geometry_generation) {
         client_send_error(client,
                           request,
                           MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
@@ -3695,19 +4090,44 @@ handle_resize(Client *client, const MuxEngineMessage *request)
         return TRUE;
     }
 
-    view->width = width;
-    view->height = height;
-    view->scale_milli = scale_milli;
-    engine_view_reset_surface(view, FALSE);
+    if (geometry_generation < view->geometry_generation) {
+        client_send_ack(client, request);
+        return !client->failed;
+    }
+    if (geometry_generation == view->geometry_generation) {
+        if (width != view->width || height != view->height ||
+            scale_milli != view->scale_milli)
+            client_send_error(client,
+                              request,
+                              MUX_ENGINE_REMOTE_ERROR_BAD_STATE,
+                              "RESIZE generation conflicts with current geometry");
+        else
+            client_send_ack(client, request);
+        return !client->failed;
+    }
+
     wpe_view = webkit_web_view_get_wpe_view(view->web_view);
     toplevel = wpe_view ? wpe_view_get_toplevel(wpe_view) : NULL;
-    if (!toplevel || !engine_view_apply_geometry(view)) {
+    if (!toplevel ||
+        !engine_view_apply_geometry_values(view,
+                                           width,
+                                           height,
+                                           scale_milli)) {
+        (void)engine_view_apply_geometry_values(view,
+                                                view->width,
+                                                view->height,
+                                                view->scale_milli);
         client_send_error(client,
                           request,
                           MUX_ENGINE_REMOTE_ERROR_INTERNAL,
                           "WPE resize failed");
         return TRUE;
     }
+    view->width = width;
+    view->height = height;
+    view->scale_milli = scale_milli;
+    view->geometry_generation = geometry_generation;
+    engine_view_reset_surface(view, TRUE);
     client_send_ack(client, request);
     view_send_metadata(view);
     return !client->failed;
@@ -3758,6 +4178,7 @@ handle_navigate(Client *client, const MuxEngineMessage *request)
             g_free(uri);
             return TRUE;
         }
+        view_prepare_explicit_navigation(view);
         webkit_web_view_load_uri(view->web_view, normalized_uri);
         g_free(normalized_uri);
         g_free(uri);
@@ -3771,17 +4192,23 @@ handle_navigate(Client *client, const MuxEngineMessage *request)
         }
         switch (action) {
         case MUX_ENGINE_NAVIGATE_BACK:
-            if (webkit_web_view_can_go_back(view->web_view))
+            if (webkit_web_view_can_go_back(view->web_view)) {
+                view_prepare_explicit_navigation(view);
                 webkit_web_view_go_back(view->web_view);
+            }
             break;
         case MUX_ENGINE_NAVIGATE_FORWARD:
-            if (webkit_web_view_can_go_forward(view->web_view))
+            if (webkit_web_view_can_go_forward(view->web_view)) {
+                view_prepare_explicit_navigation(view);
                 webkit_web_view_go_forward(view->web_view);
+            }
             break;
         case MUX_ENGINE_NAVIGATE_RELOAD:
+            view_prepare_explicit_navigation(view);
             webkit_web_view_reload(view->web_view);
             break;
         case MUX_ENGINE_NAVIGATE_STOP:
+            view_recovery_cancel_sources(view);
             webkit_web_view_stop_loading(view->web_view);
             break;
         default:
@@ -4595,10 +5022,15 @@ handle_input_pointer(Client *client, const MuxEngineMessage *request)
                                   view->scale_milli);
     y = physical_milli_to_logical((gint32)encoded_y,
                                   view->scale_milli);
-    delta_x = physical_milli_to_logical((gint32)encoded_delta_x,
-                                        view->scale_milli);
-    delta_y = physical_milli_to_logical((gint32)encoded_delta_y,
-                                        view->scale_milli);
+    if (event_type == MUX_ENGINE_POINTER_SCROLL && !precise) {
+        delta_x = (gdouble)(gint32)encoded_delta_x / 1000.0;
+        delta_y = (gdouble)(gint32)encoded_delta_y / 1000.0;
+    } else {
+        delta_x = physical_milli_to_logical((gint32)encoded_delta_x,
+                                            view->scale_milli);
+        delta_y = physical_milli_to_logical((gint32)encoded_delta_y,
+                                            view->scale_milli);
+    }
     switch (event_type) {
     case MUX_ENGINE_POINTER_MOVE:
     case MUX_ENGINE_POINTER_ENTER:
@@ -4695,6 +5127,7 @@ handle_frame_ack(Client *client, const MuxEngineMessage *request)
     engine_view_clear_pending_frame(view);
     view->frame_rejection_count = 0;
     view->frame_backpressure_count = 0;
+    view->frame_timeout_count = 0;
     view->graphics_failed = FALSE;
     engine_view_send_frame(view);
     return TRUE;
@@ -5132,6 +5565,8 @@ drop_client(Client *client)
 {
     Engine *engine = client->engine;
 
+    client->failed = TRUE;
+    client->watching_output = FALSE;
     client->watch_id = 0;
     remove_client_views(client);
     for (guint i = 0; i < engine->clients->len; i++) {
@@ -5146,37 +5581,57 @@ static gboolean
 client_ready(gint fd, GIOCondition condition, gpointer data)
 {
     Client *client = data;
-    MuxEngineMessage message = { 0 };
-    GError *error = NULL;
-    gboolean keep;
+    guint source_id = g_source_get_id(g_main_current_source());
+    gboolean terminal_condition =
+        condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL);
 
     (void)fd;
-    if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
-        drop_client(client);
-        return G_SOURCE_REMOVE;
-    }
-    if (!(condition & G_IO_IN))
-        return G_SOURCE_CONTINUE;
+    if (condition & G_IO_IN) {
+        for (;;) {
+            MuxEngineMessage message = { 0 };
+            g_autoptr(GError) error = NULL;
+            MuxEngineReceiveResult received =
+                mux_engine_receive_message(client->fd, &message, &error);
+            gboolean keep;
 
-    if (!mux_engine_receive_message(client->fd, &message, &error)) {
-        if (!g_error_matches(error,
-                             MUX_ENGINE_ERROR,
-                             MUX_ENGINE_ERROR_CLOSED))
-            g_warning("engine client %ld receive failed: %s",
+            if (received == MUX_ENGINE_RECEIVE_WOULD_BLOCK)
+                break;
+            if (received == MUX_ENGINE_RECEIVE_ERROR) {
+                if (!g_error_matches(error,
+                                     MUX_ENGINE_ERROR,
+                                     MUX_ENGINE_ERROR_CLOSED))
+                    g_warning("engine client %ld receive failed: %s",
+                              (long)client->peer_pid,
+                              error ? error->message : "unknown error");
+                drop_client(client);
+                return G_SOURCE_REMOVE;
+            }
+            keep = handle_message(client, &message);
+            mux_engine_message_clear(&message);
+            if (!keep || client->failed) {
+                drop_client(client);
+                return G_SOURCE_REMOVE;
+            }
+        }
+    }
+    if ((condition & G_IO_OUT) && !client->failed) {
+        g_autoptr(GError) error = NULL;
+
+        if (!client_flush_output(client, &error)) {
+            g_warning("engine client %ld output flush failed: %s",
                       (long)client->peer_pid,
-                      error->message);
-        g_clear_error(&error);
+                      error ? error->message : "unknown error");
+            client->failed = TRUE;
+            shutdown(client->fd, SHUT_RDWR);
+        }
+    }
+    if (client->failed || terminal_condition) {
         drop_client(client);
         return G_SOURCE_REMOVE;
     }
-
-    keep = handle_message(client, &message);
-    mux_engine_message_clear(&message);
-    if (!keep || client->failed) {
-        drop_client(client);
-        return G_SOURCE_REMOVE;
-    }
-    return G_SOURCE_CONTINUE;
+    return client->watch_id == source_id
+        ? G_SOURCE_CONTINUE
+        : G_SOURCE_REMOVE;
 }
 
 static void
@@ -5190,6 +5645,8 @@ client_free(gpointer data)
         g_source_remove(client->watch_id);
     if (client->fd >= 0)
         close(client->fd);
+    g_queue_clear_full(&client->output_packets,
+                       client_output_packet_free);
     g_free(client->kitty_window);
     g_free(client->layer);
     g_free(client->initial_uri);
@@ -5247,13 +5704,7 @@ listener_ready(gint fd, GIOCondition condition, gpointer data)
         client->peer_pid = credentials.pid;
         client->peer_uid = credentials.uid;
         g_ptr_array_add(engine->clients, client);
-        client->watch_id = g_unix_fd_add_full(
-            G_PRIORITY_DEFAULT,
-            client_fd,
-            G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
-            client_ready,
-            client,
-            NULL);
+        client_update_watch(client);
     }
     return G_SOURCE_CONTINUE;
 }

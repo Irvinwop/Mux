@@ -5,7 +5,7 @@
 G_BEGIN_DECLS
 
 #define MUX_ENGINE_MAGIC 0x4d555831u
-#define MUX_ENGINE_VERSION 3u
+#define MUX_ENGINE_VERSION 4u
 #define MUX_ENGINE_HEADER_SIZE 40u
 #define MUX_ENGINE_MAX_PAYLOAD (256u * 1024u)
 #define MUX_ENGINE_MAX_DAMAGE_RECTS 64u
@@ -126,6 +126,12 @@ typedef enum {
     MUX_ENGINE_ERROR_TOO_LARGE,
 } MuxEngineError;
 
+typedef enum {
+    MUX_ENGINE_RECEIVE_ERROR = -1,
+    MUX_ENGINE_RECEIVE_WOULD_BLOCK = 0,
+    MUX_ENGINE_RECEIVE_MESSAGE = 1,
+} MuxEngineReceiveResult;
+
 #define MUX_ENGINE_ERROR (mux_engine_error_quark())
 GQuark mux_engine_error_quark(void);
 
@@ -158,9 +164,11 @@ void mux_engine_message_clear(MuxEngineMessage *message);
 gboolean mux_engine_send_message(int fd,
                                  const MuxEngineMessage *message,
                                  GError **error);
-gboolean mux_engine_receive_message(int fd,
-                                    MuxEngineMessage *message,
-                                    GError **error);
+GBytes *mux_engine_serialize_message(const MuxEngineMessage *message,
+                                     GError **error);
+MuxEngineReceiveResult mux_engine_receive_message(int fd,
+                                                  MuxEngineMessage *message,
+                                                  GError **error);
 
 void mux_engine_builder_init(MuxEngineBuilder *builder);
 void mux_engine_builder_clear(MuxEngineBuilder *builder);
