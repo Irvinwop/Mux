@@ -9,6 +9,7 @@ typedef struct _MuxSessionState MuxSessionState;
 
 typedef struct {
     guint64 id;
+    gchar *profile;
     gchar *layer;
     gchar *uri;
     gchar *title;
@@ -50,6 +51,13 @@ gboolean mux_session_state_upsert_view(MuxSessionState *state,
                                        const gchar *layer,
                                        const gchar *uri,
                                        const gchar *title);
+gboolean mux_session_state_upsert_view_with_profile(
+    MuxSessionState *state,
+    guint64 id,
+    const gchar *profile,
+    const gchar *layer,
+    const gchar *uri,
+    const gchar *title);
 gboolean mux_session_state_remove_view(MuxSessionState *state, guint64 id);
 guint mux_session_state_get_view_count(const MuxSessionState *state);
 const MuxSessionView *mux_session_state_get_view(

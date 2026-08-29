@@ -47,6 +47,7 @@ typedef struct {
     gchar *id;
     gchar *kitty_window;
     gchar *kitty_socket;
+    gchar *profile;
     gchar *layer;
     gchar *uri;
     gchar *title;
@@ -324,15 +325,37 @@ static gboolean encoded_layer_is_valid(const gchar *encoded)
     return layer != NULL;
 }
 
-static gboolean peer_ephemeral_status(pid_t pid, gboolean *ephemeral)
+static gboolean profile_is_valid(const gchar *profile)
+{
+    gsize length;
+
+    if (!profile)
+        return FALSE;
+    length = strlen(profile);
+    if (length == 0 || length > 64)
+        return FALSE;
+    for (const guchar *cursor = (const guchar *)profile;
+         *cursor != '\0';
+         cursor++) {
+        if (!g_ascii_isalnum(*cursor) && *cursor != '.' &&
+            *cursor != '_' && *cursor != '-')
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean peer_view_environment(pid_t pid,
+                                      gboolean *ephemeral,
+                                      gchar **profile)
 {
     g_autofree gchar *path = NULL;
     g_autofree gchar *contents = NULL;
     gsize length = 0;
     gsize offset = 0;
 
-    g_return_val_if_fail(ephemeral != NULL, FALSE);
+    g_return_val_if_fail(ephemeral != NULL && profile != NULL, FALSE);
     *ephemeral = TRUE;
+    *profile = g_strdup("default");
     if (pid <= 0)
         return FALSE;
 
@@ -349,15 +372,30 @@ static gboolean peer_ephemeral_status(pid_t pid, gboolean *ephemeral)
         gsize entry_length = terminator
             ? (gsize)(terminator - entry)
             : remaining;
-        const gchar prefix[] = "MUX_EPHEMERAL=";
+        const gchar ephemeral_prefix[] = "MUX_EPHEMERAL=";
+        const gchar profile_prefix[] = "MUX_PROFILE=";
 
-        if (entry_length >= sizeof(prefix) - 1 &&
-            memcmp(entry, prefix, sizeof(prefix) - 1) == 0) {
-            const gchar *value = entry + sizeof(prefix) - 1;
-            gsize value_length = entry_length - (sizeof(prefix) - 1);
+        if (entry_length >= sizeof(ephemeral_prefix) - 1 &&
+            memcmp(entry,
+                   ephemeral_prefix,
+                   sizeof(ephemeral_prefix) - 1) == 0) {
+            const gchar *value = entry + sizeof(ephemeral_prefix) - 1;
+            gsize value_length =
+                entry_length - (sizeof(ephemeral_prefix) - 1);
 
             *ephemeral = !(value_length == 1 && value[0] == '0');
-            return TRUE;
+        } else if (entry_length >= sizeof(profile_prefix) - 1 &&
+                   memcmp(entry,
+                          profile_prefix,
+                          sizeof(profile_prefix) - 1) == 0) {
+            g_autofree gchar *candidate = g_strndup(
+                entry + sizeof(profile_prefix) - 1,
+                entry_length - (sizeof(profile_prefix) - 1));
+
+            if (!profile_is_valid(candidate))
+                return FALSE;
+            g_free(*profile);
+            *profile = g_steal_pointer(&candidate);
         }
         offset += entry_length + (terminator != NULL ? 1 : 0);
     }
@@ -434,11 +472,13 @@ static void update_persisted_view(Server *server, Client *client)
 {
     if (!client->persistable || client->session_view_id == 0)
         return;
-    if (mux_session_state_upsert_view(server->session,
-                                      client->session_view_id,
-                                      client->layer,
-                                      client->uri ? client->uri : "",
-                                      client->title ? client->title : ""))
+    if (mux_session_state_upsert_view_with_profile(
+            server->session,
+            client->session_view_id,
+            client->profile ? client->profile : "default",
+            client->layer,
+            client->uri ? client->uri : "",
+            client->title ? client->title : ""))
         schedule_session_write(server);
 }
 
@@ -456,12 +496,18 @@ static gboolean session_contains_view_id(Server *server, guint64 view_id)
     return FALSE;
 }
 
+static gboolean view_is_live(const Client *client)
+{
+    return client != NULL && client->kind == CLIENT_VIEW &&
+        !client->closing && client->fd >= 0;
+}
+
 static gboolean session_view_id_is_live(Server *server, guint64 view_id)
 {
     for (guint i = 0; i < server->clients->len; i++) {
         Client *client = g_ptr_array_index(server->clients, i);
 
-        if (client->kind == CLIENT_VIEW &&
+        if (view_is_live(client) &&
             client->session_view_id == view_id)
             return TRUE;
     }
@@ -667,6 +713,7 @@ static void client_free(gpointer data)
     g_free(client->id);
     g_free(client->kitty_window);
     g_free(client->kitty_socket);
+    g_free(client->profile);
     g_free(client->layer);
     g_free(client->uri);
     g_free(client->title);
@@ -679,7 +726,7 @@ static Client *find_view(Server *server, const gchar *id)
         id = server->active_id;
     for (guint i = 0; i < server->clients->len; i++) {
         Client *client = g_ptr_array_index(server->clients, i);
-        if (client->kind == CLIENT_VIEW && g_strcmp0(client->id, id) == 0)
+        if (view_is_live(client) && g_strcmp0(client->id, id) == 0)
             return client;
     }
     return NULL;
@@ -691,7 +738,8 @@ static Client *find_bar(Server *server, Client *view)
         Client *client = g_ptr_array_index(server->clients, i);
         if (client->kind == CLIENT_BAR &&
             g_strcmp0(client->kitty_socket, view->kitty_socket) == 0 &&
-            g_strcmp0(client->layer, view->layer) == 0) {
+            g_strcmp0(client->layer, view->layer) == 0 &&
+            g_strcmp0(client->profile, view->profile) == 0) {
             return client;
         }
     }
@@ -702,11 +750,33 @@ static Client *find_layer_view(Server *server, const gchar *layer)
 {
     for (guint i = 0; i < server->clients->len; i++) {
         Client *client = g_ptr_array_index(server->clients, i);
-        if (client->kind == CLIENT_VIEW &&
-            !client->closing && client->fd >= 0 &&
+        if (view_is_live(client) &&
             g_strcmp0(client->layer, layer) == 0) {
             return client;
         }
+    }
+    return NULL;
+}
+
+static gboolean view_matches_bar(const Client *view, const Client *bar)
+{
+    return view != NULL && bar != NULL && bar->kind == CLIENT_BAR &&
+        g_strcmp0(view->kitty_socket, bar->kitty_socket) == 0 &&
+        g_strcmp0(view->layer, bar->layer) == 0 &&
+        g_strcmp0(view->profile, bar->profile) == 0;
+}
+
+static Client *find_bar_active_view(Server *server, Client *bar)
+{
+    Client *active = find_view(server, server->active_id);
+
+    if (view_matches_bar(active, bar))
+        return active;
+    for (guint i = 0; i < server->clients->len; i++) {
+        Client *candidate = g_ptr_array_index(server->clients, i);
+
+        if (view_is_live(candidate) && view_matches_bar(candidate, bar))
+            return candidate;
     }
     return NULL;
 }
@@ -1021,17 +1091,31 @@ static gboolean kitty_focus(Client *client)
         NULL,
     };
 
-    return g_spawn_async(NULL,
-                         argv,
-                         NULL,
-                         G_SPAWN_SEARCH_PATH |
-                             G_SPAWN_STDIN_FROM_DEV_NULL |
-                             G_SPAWN_STDOUT_TO_DEV_NULL |
-                             G_SPAWN_STDERR_TO_DEV_NULL,
-                         NULL,
-                         NULL,
-                         NULL,
-                         NULL);
+    g_autofree gchar *standard_output = NULL;
+    g_autofree gchar *standard_error = NULL;
+    g_autoptr(GError) error = NULL;
+    gint status = 0;
+
+    if (!g_spawn_sync(NULL,
+                      argv,
+                      NULL,
+                      G_SPAWN_SEARCH_PATH,
+                      NULL,
+                      NULL,
+                      &standard_output,
+                      &standard_error,
+                      &status,
+                      &error) ||
+        !g_spawn_check_wait_status(status, &error)) {
+        g_warning("Kitty focus-window failed: %s%s%s",
+                  error ? error->message : "unknown failure",
+                  standard_error && *standard_error ? ": " : "",
+                  standard_error && *standard_error
+                      ? g_strstrip(standard_error)
+                      : "");
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static guint view_count(Server *server)
@@ -1039,7 +1123,7 @@ static guint view_count(Server *server)
     guint count = 0;
     for (guint i = 0; i < server->clients->len; i++) {
         Client *client = g_ptr_array_index(server->clients, i);
-        if (client->kind == CLIENT_VIEW)
+        if (view_is_live(client))
             count++;
     }
     return count;
@@ -1068,8 +1152,7 @@ static void broadcast_line(Server *server, const gchar *line)
 {
     for (guint i = 0; i < server->clients->len; i++) {
         Client *client = g_ptr_array_index(server->clients, i);
-        if ((client->kind == CLIENT_SUBSCRIBER ||
-             client->kind == CLIENT_BAR) &&
+        if (client->kind == CLIENT_SUBSCRIBER &&
             !client_queue_line(client, line)) {
             client->closing = TRUE;
         }
@@ -1095,7 +1178,15 @@ static void broadcast_view(Server *server, Client *view, const gchar *event)
         view->focused ? 1 : 0,
         kitty,
         view->pid);
-    broadcast_line(server, line);
+    for (guint i = 0; i < server->clients->len; i++) {
+        Client *recipient = g_ptr_array_index(server->clients, i);
+
+        if ((recipient->kind == CLIENT_SUBSCRIBER ||
+             (recipient->kind == CLIENT_BAR &&
+              view_matches_bar(view, recipient))) &&
+            !client_queue_line(recipient, line))
+            recipient->closing = TRUE;
+    }
     g_free(line);
     g_free(kitty);
     g_free(title);
@@ -1107,14 +1198,26 @@ static void broadcast_view(Server *server, Client *view, const gchar *event)
 static void broadcast_active(Server *server)
 {
     server->revision++;
-    gchar *active = mux_encode(server->active_id);
-    gchar *line = g_strdup_printf(
-        "EVENT\t%" G_GUINT64_FORMAT "\tACTIVE\t%s",
-        server->revision,
-        active);
-    broadcast_line(server, line);
-    g_free(line);
-    g_free(active);
+    for (guint i = 0; i < server->clients->len; i++) {
+        Client *recipient = g_ptr_array_index(server->clients, i);
+        Client *active_view;
+        g_autofree gchar *active = NULL;
+        g_autofree gchar *line = NULL;
+
+        if (recipient->kind != CLIENT_SUBSCRIBER &&
+            recipient->kind != CLIENT_BAR)
+            continue;
+        active_view = recipient->kind == CLIENT_BAR
+            ? find_bar_active_view(server, recipient)
+            : find_view(server, server->active_id);
+        active = mux_encode(active_view ? active_view->id : NULL);
+        line = g_strdup_printf(
+            "EVENT\t%" G_GUINT64_FORMAT "\tACTIVE\t%s",
+            server->revision,
+            active);
+        if (!client_queue_line(recipient, line))
+            recipient->closing = TRUE;
+    }
 }
 
 static void broadcast_layer(Server *server)
@@ -1148,8 +1251,7 @@ static void set_active(Server *server, Client *view)
 
 static gboolean view_is_live_in_current_layer(Server *server, Client *view)
 {
-    return view != NULL && view->kind == CLIENT_VIEW && !view->closing &&
-           view->fd >= 0 &&
+    return view_is_live(view) &&
            g_strcmp0(view->layer, server->current_layer) == 0;
 }
 
@@ -1167,7 +1269,7 @@ static void reconcile_active(Server *server, Client *preferred)
         Client *candidate = g_ptr_array_index(server->clients, i);
         gboolean focused;
 
-        if (candidate->kind != CLIENT_VIEW || candidate->closing)
+        if (!view_is_live(candidate))
             continue;
         focused = candidate == selected;
         if (candidate->focused != focused) {
@@ -1187,8 +1289,13 @@ static void reconcile_active(Server *server, Client *preferred)
 static void send_snapshot(Server *server, Client *client)
 {
     gboolean complete;
-    gchar *active = mux_encode(server->active_id);
-    gchar *layer = mux_encode(server->current_layer);
+    Client *snapshot_active = client->kind == CLIENT_BAR
+        ? find_bar_active_view(server, client)
+        : find_view(server, server->active_id);
+    gchar *active = mux_encode(snapshot_active ? snapshot_active->id : NULL);
+    gchar *layer = mux_encode(client->kind == CLIENT_BAR
+                                  ? client->layer
+                                  : server->current_layer);
     complete = send_snapshot_line(
         client,
         "BEGIN\t%" G_GUINT64_FORMAT "\t%s\t%s",
@@ -1200,7 +1307,8 @@ static void send_snapshot(Server *server, Client *client)
 
     for (guint i = 0; i < server->clients->len; i++) {
         Client *view = g_ptr_array_index(server->clients, i);
-        if (!complete || view->kind != CLIENT_VIEW)
+        if (!complete || !view_is_live(view) ||
+            (client->kind == CLIENT_BAR && !view_matches_bar(view, client)))
             continue;
 
         gchar *id = mux_encode(view->id);
@@ -1684,7 +1792,7 @@ static void handle_bar(
     guint field_count)
 {
     if (g_strcmp0(fields[0], "OPEN") == 0 && field_count >= 2) {
-        Client *view = find_view(server, server->active_id);
+        Client *view = find_bar_active_view(server, client);
         if (view) {
             client_send_line(view, "DO\tOPEN\t%s", fields[1]);
             kitty_focus(view);
@@ -1692,9 +1800,16 @@ static void handle_bar(
         return;
     }
     if (g_strcmp0(fields[0], "CANCEL") == 0) {
-        Client *view = find_view(server, server->active_id);
+        Client *view = find_bar_active_view(server, client);
         if (view)
             kitty_focus(view);
+        return;
+    }
+    if (g_strcmp0(fields[0], "CLOSE") == 0) {
+        Client *view = find_bar_active_view(server, client);
+
+        if (view && !client_send_line(view, "DO\tQUIT\t"))
+            view->closing = TRUE;
         return;
     }
     if (g_strcmp0(fields[0], "BYE") == 0)
@@ -1733,6 +1848,7 @@ static void handle_line(Server *server, Client *client, const gchar *line)
         g_strcmp0(fields[0], "VIEW") == 0 &&
         field_count >= 7 && encoded_layer_is_valid(fields[5])) {
         g_autofree gchar *proposed_id = mux_decode(fields[1]);
+        g_autofree gchar *peer_profile = NULL;
         guint64 proposed_session_view_id = 0;
         gboolean ephemeral;
 
@@ -1743,9 +1859,19 @@ static void handle_line(Server *server, Client *client, const gchar *line)
         client->layer = mux_decode(fields[5]);
         client->uri = mux_decode(fields[6]);
         client->title = g_strdup("");
-        client->persistable =
-            peer_ephemeral_status(client->peer_pid, &ephemeral) &&
+        client->persistable = peer_view_environment(client->peer_pid,
+                                                    &ephemeral,
+                                                    &peer_profile) &&
             !ephemeral;
+        client->profile = g_steal_pointer(&peer_profile);
+        if (!client->profile)
+            client->profile = g_strdup("default");
+        Client *duplicate = find_view(server, proposed_id);
+        if (duplicate && duplicate != client &&
+            duplicate->peer_pid == client->peer_pid &&
+            g_strcmp0(duplicate->kitty_window, client->kitty_window) == 0 &&
+            g_strcmp0(duplicate->kitty_socket, client->kitty_socket) == 0)
+            duplicate->closing = TRUE;
         if (client->persistable &&
             parse_persistent_view_id(proposed_id,
                                      &proposed_session_view_id) &&
@@ -1784,9 +1910,14 @@ static void handle_line(Server *server, Client *client, const gchar *line)
         client->kitty_window = mux_decode(fields[3]);
         client->kitty_socket = mux_decode(fields[4]);
         client->layer = mux_decode(fields[5]);
+        client->profile = field_count >= 7
+            ? mux_decode(fields[6])
+            : g_strdup("default");
         client->uri = g_strdup("");
         client->title = g_strdup("");
-        if (client_send_line(client,
+        if (!profile_is_valid(client->profile)) {
+            client->closing = TRUE;
+        } else if (client_send_line(client,
                              "OK\t%d",
                              MUX_PROTOCOL_VERSION))
             send_snapshot(server, client);
@@ -1887,13 +2018,16 @@ static void remove_closed_clients(Server *server)
             server->stop_client = NULL;
 
         if (client->kind == CLIENT_VIEW) {
-            if (!server->stopping && client->graceful_bye &&
+            Client *replacement = find_view(server, client->id);
+
+            if (!replacement && !server->stopping && client->graceful_bye &&
                 client->persistable &&
                 client->session_view_id != 0 &&
                 mux_session_state_remove_view(server->session,
                                               client->session_view_id))
                 schedule_session_write(server);
-            broadcast_view(server, client, "REMOVE");
+            if (!replacement)
+                broadcast_view(server, client, "REMOVE");
             reconcile_active(server, NULL);
         }
         if (client->kind == CLIENT_ENGINE && client->engine &&

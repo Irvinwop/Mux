@@ -35,7 +35,10 @@ typedef struct {
     gboolean replace_on_type;
     guint columns;
     guint rows;
+    gboolean saw_view;
 } Bar;
+
+#define BAR_STARTUP_TIMEOUT_MS 10000
 
 static volatile sig_atomic_t stop_requested;
 static Bar *global_bar;
@@ -104,6 +107,17 @@ static BarView *active_view(Bar *bar)
     return bar->active_id
         ? g_hash_table_lookup(bar->views, bar->active_id)
         : NULL;
+}
+
+static void select_fallback_view(Bar *bar)
+{
+    GHashTableIter iterator;
+    gpointer key;
+
+    g_clear_pointer(&bar->active_id, g_free);
+    g_hash_table_iter_init(&iterator, bar->views);
+    if (g_hash_table_iter_next(&iterator, &key, NULL))
+        bar->active_id = g_strdup(key);
 }
 
 static guint append_padded(
@@ -207,7 +221,8 @@ static gboolean terminal_enable(Bar *bar)
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) < 0)
         return FALSE;
     bar->terminal_active = TRUE;
-    output_text("\033[?1049h\033[2J\033[H\033[?25l\033[>31u");
+    output_text("\033[?1049h\033[2J\033[H\033[?25l"
+                "\033]2;MUX-BAR\033\\\033[>31u");
     return TRUE;
 }
 
@@ -299,10 +314,17 @@ static void handle_key(
 {
     guint modifiers =
         mux_shortcut_modifiers_from_kitty(encoded_modifiers);
+    MuxShortcut pane_shortcut =
+        mux_shortcut_match_pane(modifiers, key);
     MuxShortcut shortcut = mux_shortcut_match_bar(modifiers, key);
 
     if (mux_shortcut_key_is_kitty_functional(key))
         return;
+    if (pane_shortcut == MUX_SHORTCUT_CLOSE) {
+        if (event_type == MUX_SHORTCUT_EVENT_PRESS)
+            mux_send_line(bar->daemon_fd, "CLOSE");
+        return;
+    }
     if (shortcut != MUX_SHORTCUT_NONE) {
         if (event_type == MUX_SHORTCUT_EVENT_PRESS) {
             if (shortcut == MUX_SHORTCUT_LOCATION)
@@ -419,6 +441,7 @@ static void upsert_view(
         view = g_new0(BarView, 1);
         g_hash_table_insert(bar->views, g_strdup(id), view);
     }
+    bar->saw_view = TRUE;
     g_free(view->layer);
     g_free(view->uri);
     g_free(view->title);
@@ -435,9 +458,7 @@ static void handle_daemon_line(Bar *bar, const gchar *line)
 
     if (count >= 4 && g_strcmp0(fields[0], "BEGIN") == 0) {
         g_free(bar->active_id);
-        g_free(bar->layer);
         bar->active_id = mux_decode(fields[2]);
-        bar->layer = mux_decode(fields[3]);
     } else if (count >= 8 && g_strcmp0(fields[0], "VIEW") == 0) {
         upsert_view(bar, fields[1], fields[2], fields[3], fields[4]);
     } else if (count >= 10 && g_strcmp0(fields[0], "EVENT") == 0 &&
@@ -447,15 +468,22 @@ static void handle_daemon_line(Bar *bar, const gchar *line)
                g_strcmp0(fields[2], "REMOVE") == 0) {
         gchar *id = mux_decode(fields[3]);
         g_hash_table_remove(bar->views, id);
+        if (g_strcmp0(bar->active_id, id) == 0)
+            select_fallback_view(bar);
         g_free(id);
+        if (bar->saw_view && g_hash_table_size(bar->views) == 0)
+            stop_requested = 1;
     } else if (count >= 4 && g_strcmp0(fields[0], "EVENT") == 0 &&
                g_strcmp0(fields[2], "ACTIVE") == 0) {
-        g_free(bar->active_id);
-        bar->active_id = mux_decode(fields[3]);
-    } else if (count >= 4 && g_strcmp0(fields[0], "EVENT") == 0 &&
-               g_strcmp0(fields[2], "LAYER") == 0) {
-        g_free(bar->layer);
-        bar->layer = mux_decode(fields[3]);
+        g_autofree gchar *candidate = mux_decode(fields[3]);
+
+        if (!candidate || !*candidate ||
+            g_hash_table_contains(bar->views, candidate)) {
+            g_free(bar->active_id);
+            bar->active_id = g_steal_pointer(&candidate);
+        } else {
+            select_fallback_view(bar);
+        }
     } else if (count >= 2 && g_strcmp0(fields[0], "DO") == 0 &&
                g_strcmp0(fields[1], "EDIT") == 0) {
         begin_edit(bar);
@@ -493,14 +521,19 @@ static gboolean register_bar(Bar *bar)
     gchar *window = mux_encode(g_getenv("KITTY_WINDOW_ID"));
     gchar *socket = mux_encode(g_getenv("KITTY_LISTEN_ON"));
     gchar *layer = mux_encode(g_getenv("MUX_LAYER"));
+    gchar *profile = mux_encode(g_getenv("MUX_PROFILE")
+                                    ? g_getenv("MUX_PROFILE")
+                                    : "default");
     gboolean result = mux_send_line(
         bar->daemon_fd,
-        "BAR\t%s\t%ld\t%s\t%s\t%s",
+        "BAR\t%s\t%ld\t%s\t%s\t%s\t%s",
         id,
         (long)getpid(),
         window,
         socket,
-        layer);
+        layer,
+        profile);
+    g_free(profile);
     g_free(layer);
     g_free(socket);
     g_free(window);
@@ -520,6 +553,8 @@ int main(void)
         .edit = g_string_new(NULL),
     };
     global_bar = &bar;
+    gint64 startup_deadline_us = g_get_monotonic_time() +
+        (gint64)BAR_STARTUP_TIMEOUT_MS * 1000;
     atexit(restore_at_exit);
     signal(SIGINT, stop_signal);
     signal(SIGTERM, stop_signal);
@@ -551,9 +586,21 @@ int main(void)
             { .fd = STDIN_FILENO, .events = POLLIN },
         };
         int result;
+        gint timeout_ms = -1;
+
+        if (!bar.saw_view) {
+            gint64 remaining_us = startup_deadline_us - g_get_monotonic_time();
+
+            timeout_ms = remaining_us <= 0
+                ? 0
+                : (gint)MIN((remaining_us + 999) / 1000,
+                            (gint64)G_MAXINT);
+        }
         do {
-            result = poll(poll_fds, 2, -1);
+            result = poll(poll_fds, 2, timeout_ms);
         } while (result < 0 && errno == EINTR && !stop_requested);
+        if (result == 0 && !bar.saw_view)
+            break;
         if (result <= 0)
             continue;
 

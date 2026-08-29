@@ -11,11 +11,13 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define SESSION_VERSION 1
+#define SESSION_VERSION 2
+#define MIN_SESSION_VERSION 1
 #define MAX_STATE_BYTES (4u * 1024u * 1024u)
 #define MAX_LAYERS 512u
 #define MAX_VIEWS 4096u
 #define MAX_LAYER_BYTES 128u
+#define MAX_PROFILE_BYTES 64u
 #define MAX_URI_BYTES (64u * 1024u)
 #define MAX_TITLE_BYTES (8u * 1024u)
 
@@ -33,6 +35,7 @@ session_view_free(gpointer data)
 
     if (view == NULL)
         return;
+    g_free(view->profile);
     g_free(view->layer);
     g_free(view->uri);
     g_free(view->title);
@@ -75,6 +78,26 @@ valid_text(const gchar *text, gsize maximum)
 {
     return text != NULL && strlen(text) <= maximum &&
            g_utf8_validate(text, -1, NULL);
+}
+
+static gboolean
+valid_profile(const gchar *profile)
+{
+    gsize length;
+
+    if (profile == NULL)
+        return FALSE;
+    length = strlen(profile);
+    if (length == 0 || length > MAX_PROFILE_BYTES)
+        return FALSE;
+    for (const guchar *cursor = (const guchar *)profile;
+         *cursor != '\0';
+         cursor++) {
+        if (!g_ascii_isalnum(*cursor) && *cursor != '.' &&
+            *cursor != '_' && *cursor != '-')
+            return FALSE;
+    }
+    return TRUE;
 }
 
 static gboolean
@@ -220,16 +243,17 @@ mux_session_state_get_layer(const MuxSessionState *state, guint index)
 }
 
 gboolean
-mux_session_state_upsert_view(MuxSessionState *state,
-                              guint64 id,
-                              const gchar *layer,
-                              const gchar *uri,
-                              const gchar *title)
+mux_session_state_upsert_view_with_profile(MuxSessionState *state,
+                                           guint64 id,
+                                           const gchar *profile,
+                                           const gchar *layer,
+                                           const gchar *uri,
+                                           const gchar *title)
 {
     MuxSessionView *view;
 
     g_return_val_if_fail(state != NULL, FALSE);
-    if (id == 0 || !valid_layer(layer) ||
+    if (id == 0 || !valid_profile(profile) || !valid_layer(layer) ||
         !valid_text(uri, MAX_URI_BYTES) ||
         !valid_text(title, MAX_TITLE_BYTES))
         return FALSE;
@@ -245,13 +269,30 @@ mux_session_state_upsert_view(MuxSessionState *state,
         view->id = id;
         g_ptr_array_add(state->views, view);
     }
+    g_free(view->profile);
     g_free(view->layer);
     g_free(view->uri);
     g_free(view->title);
+    view->profile = g_strdup(profile);
     view->layer = g_strdup(layer);
     view->uri = g_strdup(uri);
     view->title = g_strdup(title);
     return TRUE;
+}
+
+gboolean
+mux_session_state_upsert_view(MuxSessionState *state,
+                              guint64 id,
+                              const gchar *layer,
+                              const gchar *uri,
+                              const gchar *title)
+{
+    return mux_session_state_upsert_view_with_profile(state,
+                                                      id,
+                                                      "default",
+                                                      layer,
+                                                      uri,
+                                                      title);
 }
 
 gboolean
@@ -338,7 +379,8 @@ mux_session_state_serialize(const MuxSessionState *state,
         const MuxSessionView *view = g_ptr_array_index(state->views, i);
         g_autofree gchar *group = g_strdup_printf("view %u", i);
 
-        if (view->id == 0 || !state_has_layer(state, view->layer) ||
+        if (view->id == 0 || !valid_profile(view->profile) ||
+            !state_has_layer(state, view->layer) ||
             !valid_text(view->uri, MAX_URI_BYTES) ||
             !valid_text(view->title, MAX_TITLE_BYTES)) {
             set_invalid_data(error, "session contains an invalid view");
@@ -350,6 +392,7 @@ mux_session_state_serialize(const MuxSessionState *state,
         }
         greatest_view_id = MAX(greatest_view_id, view->id);
         g_key_file_set_uint64(key_file, group, "id", view->id);
+        g_key_file_set_string(key_file, group, "profile", view->profile);
         g_key_file_set_string(key_file, group, "layer", view->layer);
         g_key_file_set_string(key_file, group, "uri", view->uri);
         g_key_file_set_string(key_file, group, "title", view->title);
@@ -392,7 +435,8 @@ mux_session_state_deserialize(const gchar *data,
                                      "session",
                                      "version",
                                      &local_error);
-    if (local_error != NULL || version != SESSION_VERSION) {
+    if (local_error != NULL || version < MIN_SESSION_VERSION ||
+        version > SESSION_VERSION) {
         g_clear_error(&local_error);
         set_invalid_data(error, "unsupported session state version");
         return NULL;
@@ -461,6 +505,7 @@ mux_session_state_deserialize(const gchar *data,
 
     for (gint i = 0; i < view_count; i++) {
         g_autofree gchar *group = g_strdup_printf("view %d", i);
+        g_autofree gchar *profile = NULL;
         g_autofree gchar *layer = NULL;
         g_autofree gchar *uri = NULL;
         g_autofree gchar *title = NULL;
@@ -469,6 +514,13 @@ mux_session_state_deserialize(const gchar *data,
                                            "id",
                                            &local_error);
 
+        if (local_error == NULL && version >= 2)
+            profile = g_key_file_get_string(key_file,
+                                            group,
+                                            "profile",
+                                            &local_error);
+        else if (local_error == NULL)
+            profile = g_strdup("default");
         if (local_error == NULL)
             layer = g_key_file_get_string(key_file,
                                           group,
@@ -484,7 +536,7 @@ mux_session_state_deserialize(const gchar *data,
                                           group,
                                           "title",
                                           &local_error);
-        if (local_error != NULL || id == 0 ||
+        if (local_error != NULL || id == 0 || !valid_profile(profile) ||
             !state_has_layer(state, layer) ||
             !valid_text(uri, MAX_URI_BYTES) ||
             !valid_text(title, MAX_TITLE_BYTES) ||
@@ -493,11 +545,12 @@ mux_session_state_deserialize(const gchar *data,
             set_invalid_data(error, "session view entry is invalid");
             return NULL;
         }
-        if (!mux_session_state_upsert_view(state,
-                                           id,
-                                           layer,
-                                           uri,
-                                           title)) {
+        if (!mux_session_state_upsert_view_with_profile(state,
+                                                        id,
+                                                        profile,
+                                                        layer,
+                                                        uri,
+                                                        title)) {
             set_invalid_data(error, "session view entry cannot be stored");
             return NULL;
         }
