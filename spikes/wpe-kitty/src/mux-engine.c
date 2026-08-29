@@ -2048,6 +2048,41 @@ engine_view_prepare_private_network(EngineView *view, GError **error)
 }
 
 static gboolean
+engine_view_inherit_private_network(EngineView *view,
+                                    EngineView *parent,
+                                    GError **error)
+{
+    g_return_val_if_fail(view != NULL, FALSE);
+    g_return_val_if_fail(parent != NULL, FALSE);
+    g_return_val_if_fail(view->ephemeral, FALSE);
+
+    if (!parent->network_session) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_CONNECTED,
+                            "private popup parent has no network session");
+        return FALSE;
+    }
+
+    view->network_session = g_object_ref(parent->network_session);
+    view->download_manager = mux_download_manager_new(view->network_session,
+                                                      download_output,
+                                                      NULL,
+                                                      view->engine,
+                                                      NULL);
+    if (!view->download_manager) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "private popup download manager construction failed");
+        return FALSE;
+    }
+    mux_download_manager_set_clipboard_func(view->download_manager,
+                                            download_clipboard_output);
+    return TRUE;
+}
+
+static gboolean
 popup_token_valid(const gchar *token)
 {
     if (!token || strlen(token) != MUX_POPUP_TOKEN_LENGTH)
@@ -2090,18 +2125,41 @@ popup_launch_finished(GObject *source,
 {
     PopupLaunch *launch = data;
     g_autoptr(GError) error = NULL;
+    g_autofree gchar *failure_detail = NULL;
+    gboolean succeeded;
 
     if (launch->timeout_id) {
         g_source_remove(launch->timeout_id);
         launch->timeout_id = 0;
     }
-    if (!g_subprocess_wait_check_finish(G_SUBPROCESS(source),
-                                        result,
-                                        &error) &&
-        !launch->timed_out) {
-        g_warning("popup launcher failed for token %.8s: %s",
+    succeeded = g_subprocess_wait_check_finish(G_SUBPROCESS(source),
+                                               result,
+                                               &error);
+    if (!succeeded && !launch->timed_out) {
+        GInputStream *stream = g_subprocess_get_stderr_pipe(
+            G_SUBPROCESS(source));
+
+        if (stream) {
+            gchar buffer[4097];
+            gssize length = g_input_stream_read(stream,
+                                                buffer,
+                                                sizeof(buffer) - 1,
+                                                NULL,
+                                                NULL);
+
+            if (length > 0) {
+                buffer[length] = '\0';
+                failure_detail = g_utf8_make_valid(buffer, length);
+                g_strstrip(failure_detail);
+                if (!*failure_detail)
+                    g_clear_pointer(&failure_detail, g_free);
+            }
+        }
+        g_warning("popup launcher failed for token %.8s: %s%s%s",
                   launch->token,
-                  error ? error->message : "unknown error");
+                  error ? error->message : "unknown error",
+                  failure_detail ? "; stderr: " : "",
+                  failure_detail ? failure_detail : "");
     }
     popup_launch_free(launch);
 }
@@ -2115,6 +2173,7 @@ popup_create(WebKitWebView *parent,
     EngineView *parent_view = data;
     Engine *engine = parent_view->engine;
     EngineView *child = g_new0(EngineView, 1);
+    EngineView *previous_pending_view = engine->pending_view;
 
     (void)navigation_action;
     if (!engine_view_capacity_available(
@@ -2135,28 +2194,27 @@ popup_create(WebKitWebView *parent,
     child->scale_milli = parent_view->scale_milli;
     child->ephemeral = parent_view->ephemeral;
 
+    if (previous_pending_view) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_BUSY,
+                            "nested popup WebView construction is unsupported");
+        engine_view_free(child);
+        return NULL;
+    }
     if (child->ephemeral &&
-        !engine_view_prepare_private_network(child, error)) {
+        !engine_view_inherit_private_network(child, parent_view, error)) {
         engine_view_free(child);
         return NULL;
     }
 
     engine->pending_view = child;
-    if (child->ephemeral) {
-        child->web_view = WEBKIT_WEB_VIEW(
-            g_object_new(WEBKIT_TYPE_WEB_VIEW,
-                         "web-context", engine->web_context,
-                         "network-session", child->network_session,
-                         "display", engine->display,
-                         NULL));
-    } else {
-        child->web_view = WEBKIT_WEB_VIEW(
-            g_object_new(WEBKIT_TYPE_WEB_VIEW,
-                         "related-view", parent,
-                         "display", engine->display,
-                         NULL));
-    }
-    engine->pending_view = NULL;
+    child->web_view = WEBKIT_WEB_VIEW(
+        g_object_new(WEBKIT_TYPE_WEB_VIEW,
+                     "related-view", parent,
+                     "display", engine->display,
+                     NULL));
+    engine->pending_view = previous_pending_view;
     if (!child->web_view || !child->platform_view) {
         g_set_error_literal(error,
                             G_IO_ERROR,
@@ -2259,7 +2317,7 @@ popup_offer(WebKitWebView *parent,
     process = g_subprocess_newv(
         (const gchar * const *)arguments->pdata,
         G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
-            G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+            G_SUBPROCESS_FLAGS_STDERR_PIPE,
         error);
     if (!process)
         return FALSE;
@@ -4213,7 +4271,8 @@ handle_navigate(Client *client, const MuxEngineMessage *request)
             client_send_error(client,
                               request,
                               MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
-                              uri_error->message);
+                              uri_error ? uri_error->message
+                                        : "invalid navigation URI");
             g_clear_error(&uri_error);
             g_free(uri);
             return TRUE;
