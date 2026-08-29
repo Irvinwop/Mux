@@ -56,7 +56,9 @@
 #define ACTIVE_MAINTENANCE_MS 50
 #define IDLE_MAINTENANCE_MS 250
 #define RESIZE_DEBOUNCE_MS 50
-#define CLOSE_TIMEOUT_MS 120000
+#define CLOSE_TIMEOUT_MS 2000
+#define ENGINE_STARTUP_TIMEOUT_MS 5000
+#define CHOOSER_SHUTDOWN_TIMEOUT_MS 1000
 #define KITTY_FRAME_RESPONSE_CAPACITY 32u
 #define TERMINAL_OUTPUT_CAP_BYTES (4u * 1024u * 1024u)
 #define TERMINAL_OUTPUT_FRAME_RESERVE_BYTES (128u * 1024u)
@@ -68,7 +70,6 @@
 #define KITTY_RETIRED_IMAGE_CAPACITY 32u
 #define KITTY_MODIFIER_KEY_FIRST 57441u
 #define KITTY_MODIFIER_KEY_LAST 57454u
-#define POINTER_SCROLL_BASE_STEP_MILLI 6000
 #define POINTER_SCROLL_STOP_MS 100
 #define KITTY_MOUSE_LEAVE (1u << 7)
 
@@ -461,15 +462,13 @@ typedef struct {
     guint width;
     guint height;
     guint scale_milli;
+    guint64 geometry_generation;
     guint64 find_generation;
     guint find_matches;
     MuxEngineFindStatus find_status;
     guint pointer_modifiers;
     gint pointer_x_milli;
     gint pointer_y_milli;
-    gint scroll_direction_x;
-    gint scroll_direction_y;
-    gint64 last_scroll_us;
     gint64 scroll_stop_due_us;
     gboolean image_present;
     gboolean frame_waiting;
@@ -484,6 +483,8 @@ typedef struct {
     gboolean find_active;
     gboolean find_overlay_visible;
     gboolean shutting_down;
+    gboolean explicit_close_requested;
+    gboolean engine_fatal;
     gboolean quit;
     struct termios saved_terminal;
     int saved_terminal_output_flags;
@@ -544,6 +545,10 @@ static void acknowledge_graphics_response(Pane *pane, guint image_id);
 static void redraw_clipboard_picker(Pane *pane);
 static void disconnect_engine(Pane *pane);
 static void retire_close_request(Pane *pane);
+static void retire_pending_frame(Pane *pane, const gchar *detail);
+static void cancel_pointer_interaction(Pane *pane,
+                                       gboolean notify_engine);
+static void request_close(Pane *pane);
 static void handle_runtime_engine_error(Pane *pane,
                                         const MuxEngineMessage *message);
 
@@ -1031,6 +1036,8 @@ handle_runtime_engine_error(Pane *pane,
     g_autofree gchar *safe_detail = NULL;
     guint32 code = 0;
     gboolean state_lost;
+    gboolean close_failed = message->serial &&
+        message->serial == pane->close_request_serial;
 
     if (!decode_engine_error_message(message, &code, &safe_detail)) {
         code = MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE;
@@ -1042,10 +1049,13 @@ handle_runtime_engine_error(Pane *pane,
             code == MUX_ENGINE_REMOTE_ERROR_NOT_FOUND ||
             code == MUX_ENGINE_REMOTE_ERROR_NOT_OWNER;
     }
-    if (message->serial &&
-        message->serial == pane->close_request_serial)
+    if (close_failed)
         retire_close_request(pane);
     show_engine_diagnostic(pane, code, safe_detail, state_lost);
+    if (close_failed && pane->explicit_close_requested) {
+        pane->quit = TRUE;
+        return;
+    }
     if (state_lost)
         disconnect_engine(pane);
 }
@@ -1053,6 +1063,7 @@ handle_runtime_engine_error(Pane *pane,
 static void
 disconnect_engine(Pane *pane)
 {
+    cancel_pointer_interaction(pane, FALSE);
     find_overlay_hide(pane);
     pane->find_active = FALSE;
     pane->find_generation = 0;
@@ -1068,9 +1079,12 @@ disconnect_engine(Pane *pane)
     retire_frame_responses(pane);
     delete_image(pane);
     retire_close_request(pane);
-    if (!pane->shutting_down)
+    if (pane->explicit_close_requested) {
+        pane->quit = TRUE;
+    } else if (!pane->shutting_down && !pane->engine_fatal) {
         queue_retry(&pane->engine_retry_us,
                     &pane->engine_backoff_ms);
+    }
 }
 
 static void
@@ -1201,6 +1215,16 @@ ensure_engine(Pane *pane)
     g_free(binary);
     g_free(directory);
     g_free(self);
+    return TRUE;
+}
+
+static gboolean
+connect_engine_fresh(Pane *pane)
+{
+    if (connect_engine(pane))
+        return TRUE;
+    if (!ensure_engine(pane))
+        return FALSE;
     return connect_engine(pane);
 }
 
@@ -1416,7 +1440,7 @@ handle_control_line(Pane *pane, gchar *line)
         else if (g_strcmp0(fields[1], "RELOAD") == 0)
             send_navigation(pane, MUX_ENGINE_NAVIGATE_RELOAD, NULL);
         else if (g_strcmp0(fields[1], "QUIT") == 0)
-            pane->quit = TRUE;
+            request_close(pane);
     }
     g_strfreev(fields);
 }
@@ -1535,6 +1559,7 @@ request_close(Pane *pane)
 {
     guint64 serial;
 
+    pane->explicit_close_requested = TRUE;
     if (pane->close_request_serial) {
         pane->quit = TRUE;
         return;
@@ -1560,28 +1585,28 @@ request_close(Pane *pane)
 }
 
 static void
-cancel_close_request(Pane *pane)
+force_close_request(Pane *pane)
 {
     MuxEngineBuilder builder;
     GBytes *payload;
     guint64 close_serial = pane->close_request_serial;
 
-    if (!close_serial)
-        return;
-    retire_close_request(pane);
-    if (pane->engine_fd < 0 || !pane->view_id)
-        return;
-
-    mux_engine_builder_init(&builder);
-    mux_engine_builder_put_u64(&builder, close_serial);
-    payload = mux_engine_builder_finish(&builder);
-    send_message(pane,
-                 MUX_ENGINE_MESSAGE_CANCEL_CLOSE,
-                 MUX_ENGINE_FLAG_NONE,
-                 pane->view_id,
-                 ++pane->next_serial,
-                 payload);
-    g_bytes_unref(payload);
+    if (close_serial) {
+        retire_close_request(pane);
+        if (pane->engine_fd >= 0 && pane->view_id) {
+            mux_engine_builder_init(&builder);
+            mux_engine_builder_put_u64(&builder, close_serial);
+            payload = mux_engine_builder_finish(&builder);
+            send_message(pane,
+                         MUX_ENGINE_MESSAGE_CANCEL_CLOSE,
+                         MUX_ENGINE_FLAG_NONE,
+                         pane->view_id,
+                         ++pane->next_serial,
+                         payload);
+            g_bytes_unref(payload);
+        }
+    }
+    pane->quit = TRUE;
 }
 
 static gboolean
@@ -1612,39 +1637,59 @@ send_hello(Pane *pane, const gchar *initial_uri)
     return result;
 }
 
-static gboolean
+static MuxEngineReceiveResult
 receive_message(Pane *pane, MuxEngineMessage *message)
 {
     GError *error = NULL;
+    MuxEngineReceiveResult result = MUX_ENGINE_RECEIVE_ERROR;
 
-    if (pane->engine_fd >= 0 &&
-        mux_engine_receive_message(pane->engine_fd,
-                                   message,
-                                   &error))
-        return TRUE;
-    if (!pane->engine_handshake_complete &&
+    if (pane->engine_fd >= 0)
+        result = mux_engine_receive_message(pane->engine_fd,
+                                            message,
+                                            &error);
+    if (result != MUX_ENGINE_RECEIVE_ERROR)
+        return result;
+    if (error != NULL && !pane->engine_handshake_complete &&
         g_error_matches(error,
                         MUX_ENGINE_ERROR,
                         MUX_ENGINE_ERROR_PROTOCOL)) {
         g_printerr("mux-pane: incompatible mux-engine protocol; expected v%u\n",
                    MUX_ENGINE_VERSION);
-        pane->quit = TRUE;
+        pane->engine_fatal = TRUE;
     }
     g_printerr("mux-pane: engine connection lost: %s\n",
                error ? error->message : "disconnected");
     g_clear_error(&error);
     disconnect_engine(pane);
-    return FALSE;
+    return MUX_ENGINE_RECEIVE_ERROR;
 }
 
 static gboolean
 wait_for_message(Pane *pane,
                   guint16 expected,
                   guint64 expected_serial,
-                  MuxEngineMessage *message)
+    MuxEngineMessage *message)
 {
     for (;;) {
-        if (!receive_message(pane, message))
+        MuxEngineReceiveResult result = receive_message(pane, message);
+
+        if (result == MUX_ENGINE_RECEIVE_WOULD_BLOCK) {
+            struct pollfd descriptor = {
+                .fd = pane->engine_fd,
+                .events = POLLIN,
+            };
+            int ready;
+
+            do {
+                ready = poll(&descriptor, 1, ENGINE_STARTUP_TIMEOUT_MS);
+            } while (ready < 0 && errno == EINTR);
+            if (ready > 0 && descriptor.revents & POLLIN)
+                continue;
+            g_printerr("mux-pane: engine startup response timed out\n");
+            disconnect_engine(pane);
+            return FALSE;
+        }
+        if (result != MUX_ENGINE_RECEIVE_MESSAGE)
             return FALSE;
         if (message->type == expected) {
             if (message->serial == expected_serial)
@@ -1733,6 +1778,7 @@ start_view(Pane *pane, const gchar *initial_uri)
         return FALSE;
     }
     pane->view_id = response.view_id;
+    pane->engine_fatal = FALSE;
     pane->find_generation = 0;
     pane->find_active = FALSE;
     pane->find_status = MUX_ENGINE_FIND_CLOSED;
@@ -2145,6 +2191,7 @@ release_pointer_button(Pane *pane, guint button, guint keyboard_modifiers)
 
     if (!button_modifier)
         return;
+    pane->pointer_modifiers &= ~button_modifier;
     send_pointer(pane,
                  MUX_ENGINE_POINTER_UP,
                  keyboard_modifiers | pane->pointer_modifiers,
@@ -2155,7 +2202,6 @@ release_pointer_button(Pane *pane, guint button, guint keyboard_modifiers)
                  0,
                  FALSE,
                  FALSE);
-    pane->pointer_modifiers &= ~button_modifier;
 }
 
 static void
@@ -2169,46 +2215,12 @@ release_pointer_buttons(Pane *pane, guint keyboard_modifiers)
     }
 }
 
-static gint
-pointer_scroll_step_milli(Pane *pane,
-                          gint direction_x,
-                          gint direction_y,
-                          gint64 now_us)
-{
-    gint step = POINTER_SCROLL_BASE_STEP_MILLI;
-
-    if (pane->last_scroll_us &&
-        pane->scroll_direction_x == direction_x &&
-        pane->scroll_direction_y == direction_y &&
-        now_us >= pane->last_scroll_us) {
-        gint64 interval_us = now_us - pane->last_scroll_us;
-
-        if (interval_us <= 16000)
-            step = 24000;
-        else if (interval_us <= 32000)
-            step = 18000;
-        else if (interval_us <= 64000)
-            step = 12000;
-        else if (interval_us <= 100000)
-            step = 8000;
-    }
-    pane->last_scroll_us = now_us;
-    pane->scroll_direction_x = direction_x;
-    pane->scroll_direction_y = direction_y;
-    pane->scroll_stop_due_us = now_us +
-        (gint64)POINTER_SCROLL_STOP_MS * 1000;
-    return step;
-}
-
 static void
 finish_pointer_scroll(Pane *pane)
 {
     if (!pane->scroll_stop_due_us)
         return;
     pane->scroll_stop_due_us = 0;
-    pane->last_scroll_us = 0;
-    pane->scroll_direction_x = 0;
-    pane->scroll_direction_y = 0;
     send_pointer(pane,
                  MUX_ENGINE_POINTER_SCROLL,
                  pane->pointer_modifiers,
@@ -2217,8 +2229,33 @@ finish_pointer_scroll(Pane *pane)
                  pane->pointer_y_milli,
                  0,
                  0,
-                 TRUE,
+                 FALSE,
                  TRUE);
+}
+
+static void
+cancel_pointer_interaction(Pane *pane, gboolean notify_engine)
+{
+    if (notify_engine && pane->engine_fd >= 0 && pane->view_id) {
+        finish_pointer_scroll(pane);
+        release_pointer_buttons(pane, 0);
+        if (pane->pointer_inside) {
+            send_pointer(pane,
+                         MUX_ENGINE_POINTER_LEAVE,
+                         0,
+                         0,
+                         pane->pointer_x_milli,
+                         pane->pointer_y_milli,
+                         0,
+                         0,
+                         FALSE,
+                         FALSE);
+        }
+    } else {
+        pane->scroll_stop_due_us = 0;
+        pane->pointer_modifiers = 0;
+    }
+    pane->pointer_inside = FALSE;
 }
 
 static void
@@ -2323,10 +2360,8 @@ send_engine_layer(Pane *pane)
 static void
 send_focus(Pane *pane, gboolean focused)
 {
-    if (!focused) {
-        finish_pointer_scroll(pane);
-        release_pointer_buttons(pane, 0);
-    }
+    if (!focused)
+        cancel_pointer_interaction(pane, TRUE);
     pane->focused = focused;
     send_engine_focus(pane,
                       focused && pane_page_is_visible(pane));
@@ -2342,11 +2377,17 @@ send_resize(Pane *pane)
     if (!pane_page_is_visible(pane) || !pane->terminal_active ||
         pane->engine_fd < 0 || !pane->view_id)
         return;
+    retire_pending_frame(pane, "pane geometry changed");
+    retire_current_image(pane);
+    pane->geometry_generation++;
+    if (!pane->geometry_generation)
+        pane->geometry_generation++;
     advance_image_generation(pane);
     mux_engine_builder_init(&builder);
     mux_engine_builder_put_u32(&builder, pane->width);
     mux_engine_builder_put_u32(&builder, pane->height);
     mux_engine_builder_put_u32(&builder, pane->scale_milli);
+    mux_engine_builder_put_u64(&builder, pane->geometry_generation);
     payload = mux_engine_builder_finish(&builder);
     send_message(pane,
                  MUX_ENGINE_MESSAGE_RESIZE,
@@ -2397,6 +2438,8 @@ clipboard_changed(MuxPaneClipboard *clipboard, gpointer user_data)
     Pane *pane = user_data;
 
     (void) clipboard;
+    if (!pane_page_is_visible(pane))
+        cancel_pointer_interaction(pane, TRUE);
     send_engine_visibility(pane);
     send_engine_focus(pane,
                       pane->focused && pane_page_is_visible(pane));
@@ -2478,6 +2521,31 @@ send_frame_rejected(Pane *pane,
     g_bytes_unref(payload);
 }
 
+static void
+retire_pending_frame(Pane *pane, const gchar *detail)
+{
+    guint64 frame_serial;
+
+    if (!pane->frame_waiting)
+        return;
+    frame_serial = pane->pending_frame_serial;
+    for (guint offset = 0; offset < pane->frame_response_count; offset++) {
+        guint index = (pane->frame_response_head + offset) %
+            KITTY_FRAME_RESPONSE_CAPACITY;
+
+        if (pane->frame_responses[index].frame_serial == frame_serial) {
+            pane->frame_responses[index].retired = TRUE;
+            break;
+        }
+    }
+    pane->frame_waiting = FALSE;
+    pane->pending_frame_serial = 0;
+    send_frame_rejected(pane,
+                        frame_serial,
+                        MUX_ENGINE_FRAME_REJECTED_BACKPRESSURE,
+                        detail);
+}
+
 static gboolean
 take_graphics_response(Pane *pane,
                        guint image_id,
@@ -2554,6 +2622,7 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
     guint32 rectangle_width;
     guint32 rectangle_height;
     guint64 shm_size;
+    guint64 geometry_generation;
     gchar *shm_name = NULL;
     gchar *encoded_name;
     gchar *command;
@@ -2571,6 +2640,7 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
         !mux_engine_cursor_get_u32(&cursor, &rectangle_height) ||
         !mux_engine_cursor_get_u64(&cursor, &shm_size) ||
         !mux_engine_cursor_get_string(&cursor, &shm_name) ||
+        !mux_engine_cursor_get_u64(&cursor, &geometry_generation) ||
         !mux_engine_cursor_done(&cursor) ||
         format != MUX_ENGINE_PIXEL_RGBA8888 ||
         !rectangle_width || !rectangle_height ||
@@ -2584,6 +2654,15 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
         return FALSE;
     }
 
+    if (geometry_generation != pane->geometry_generation) {
+        send_frame_rejected(pane,
+                            message->serial,
+                            MUX_ENGINE_FRAME_REJECTED_BACKPRESSURE,
+                            "stale pane geometry generation");
+        g_free(shm_name);
+        return TRUE;
+    }
+
     if (!pane_page_is_visible(pane) || !pane->terminal_active) {
         send_frame_rejected(pane,
                             message->serial,
@@ -2594,9 +2673,12 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
     }
 
     if (pane->frame_waiting) {
-        g_printerr("mux-pane: FRAME arrived while Kitty response is pending\n");
+        send_frame_rejected(pane,
+                            message->serial,
+                            MUX_ENGINE_FRAME_REJECTED_BACKPRESSURE,
+                            "Kitty response is pending");
         g_free(shm_name);
-        return FALSE;
+        return TRUE;
     }
     if (pane->frame_response_count >= KITTY_FRAME_RESPONSE_CAPACITY) {
         send_frame_rejected(pane,
@@ -2620,6 +2702,16 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
                                         shm_size,
                                         pane->image_id,
                                         encoded_name);
+    if (!queue_frame_response(pane, message->serial)) {
+        send_frame_rejected(pane,
+                            message->serial,
+                            MUX_ENGINE_FRAME_REJECTED_BACKPRESSURE,
+                            "Kitty response queue is full");
+        g_free(command);
+        g_free(encoded_name);
+        g_free(shm_name);
+        return TRUE;
+    }
     {
         g_autoptr(GError) output_error = NULL;
         GBytes *command_bytes = g_bytes_new(command, strlen(command));
@@ -2637,15 +2729,15 @@ handle_frame(Pane *pane, const MuxEngineMessage *message)
             g_free(command);
             g_free(encoded_name);
             g_free(shm_name);
-            return FALSE;
+            pane->frame_response_count--;
+            pane->frame_waiting = FALSE;
+            pane->pending_frame_serial = 0;
+            send_frame_rejected(pane,
+                                message->serial,
+                                MUX_ENGINE_FRAME_REJECTED_BACKPRESSURE,
+                                "terminal output queue is full");
+            return TRUE;
         }
-    }
-    if (!queue_frame_response(pane, message->serial)) {
-        g_printerr("mux-pane: could not track Kitty FRAME response\n");
-        g_free(command);
-        g_free(encoded_name);
-        g_free(shm_name);
-        return FALSE;
     }
     if (!pane->image_present ||
         (message->flags & MUX_ENGINE_FLAG_FULL_DAMAGE))
@@ -2860,23 +2952,24 @@ handle_chooser_payload(Pane *pane,
     return TRUE;
 }
 
-static void
+static gboolean
 handle_engine_message(Pane *pane)
 {
     MuxEngineMessage message = { 0 };
+    MuxEngineReceiveResult result = receive_message(pane, &message);
 
-    if (!receive_message(pane, &message))
-        return;
+    if (result != MUX_ENGINE_RECEIVE_MESSAGE)
+        return FALSE;
     if (message.type != MUX_ENGINE_MESSAGE_ERROR &&
         message.view_id && message.view_id != pane->view_id) {
         mux_engine_message_clear(&message);
-        return;
+        return TRUE;
     }
 
     switch (message.type) {
     case MUX_ENGINE_MESSAGE_FRAME:
         if (!handle_frame(pane, &message))
-            pane->quit = TRUE;
+            disconnect_engine(pane);
         break;
     case MUX_ENGINE_MESSAGE_METADATA:
         handle_metadata(pane, &message);
@@ -2919,6 +3012,7 @@ handle_engine_message(Pane *pane)
             disconnect_engine(pane);
         } else {
             retire_close_request(pane);
+            pane->explicit_close_requested = FALSE;
         }
         break;
     case MUX_ENGINE_MESSAGE_EXTENSION: {
@@ -2928,6 +3022,8 @@ handle_engine_message(Pane *pane)
         g_autoptr(GError) error = NULL;
         g_autoptr(GError) probe_error = NULL;
         MuxUiRecordType record_type;
+        gboolean ui_was_active = pane->ui_bridge != NULL &&
+            mux_ui_pane_bridge_is_active(pane->ui_bridge);
 
         if ((pane->ui_bridge != NULL || pane->notifications != NULL) &&
             mux_ui_record_type(packet,
@@ -2962,8 +3058,11 @@ handle_engine_message(Pane *pane)
                 g_warning("pane UI payload rejected: %s",
                           error ? error->message : "unknown error");
             if (pane->ui_bridge &&
-                mux_ui_pane_bridge_is_active(pane->ui_bridge))
+                mux_ui_pane_bridge_is_active(pane->ui_bridge)) {
+                if (!ui_was_active)
+                    cancel_pointer_interaction(pane, TRUE);
                 pane->find_overlay_visible = FALSE;
+            }
         } else if (pane->clipboard != NULL &&
                    !mux_pane_clipboard_handle_engine_packet(
                        pane->clipboard,
@@ -2984,6 +3083,7 @@ handle_engine_message(Pane *pane)
         break;
     }
     mux_engine_message_clear(&message);
+    return TRUE;
 }
 
 static gboolean
@@ -3063,6 +3163,7 @@ chooser_suspend(gpointer user_data, GError **error)
                             "pane terminal is already suspended");
         return FALSE;
     }
+    cancel_pointer_interaction(pane, TRUE);
     find_overlay_hide(pane);
     g_byte_array_set_size(pane->input, 0);
     return terminal_disable(pane, error);
@@ -3387,6 +3488,7 @@ handle_kitty_key(Pane *pane, const gchar *parameters)
     } else if (pane->clipboard != NULL &&
                owned_shortcut == MUX_SHORTCUT_CLIPBOARD_HISTORY) {
         if (execute_owned_shortcut) {
+            cancel_pointer_interaction(pane, TRUE);
             mux_pane_clipboard_open_picker(pane->clipboard);
             send_engine_visibility(pane);
             send_engine_focus(pane,
@@ -3565,7 +3667,6 @@ handle_mouse(Pane *pane,
         gint direction_y = 0;
         gint delta_x = 0;
         gint delta_y = 0;
-        gint step;
         gint64 now_us = g_get_monotonic_time();
 
         button_code = encoded & 3;
@@ -3573,12 +3674,10 @@ handle_mouse(Pane *pane,
             direction_y = button_code ? 1 : -1;
         else
             direction_x = button_code == 2 ? -1 : 1;
-        step = pointer_scroll_step_milli(pane,
-                                         direction_x,
-                                         direction_y,
-                                         now_us);
-        delta_x = direction_x * step;
-        delta_y = direction_y * step;
+        pane->scroll_stop_due_us = now_us +
+            (gint64)POINTER_SCROLL_STOP_MS * 1000;
+        delta_x = direction_x * 1000;
+        delta_y = direction_y * 1000;
         send_pointer(pane,
                      MUX_ENGINE_POINTER_SCROLL,
                      modifiers,
@@ -3587,7 +3686,7 @@ handle_mouse(Pane *pane,
                      y_milli,
                      delta_x,
                      delta_y,
-                     TRUE,
+                     FALSE,
                      FALSE);
         return;
     }
@@ -3609,23 +3708,6 @@ handle_mouse(Pane *pane,
     } else if ((encoded & 32) || button_code == 3) {
         if (button_code == 3) {
             release_pointer_buttons(pane, keyboard_modifiers);
-        } else {
-            guint button_modifier = pointer_button_modifier(button);
-
-            if (!(pane->pointer_modifiers & button_modifier)) {
-                pane->pointer_modifiers |= button_modifier;
-                send_pointer(pane,
-                             MUX_ENGINE_POINTER_DOWN,
-                             keyboard_modifiers |
-                                 pane->pointer_modifiers,
-                             button,
-                             x_milli,
-                             y_milli,
-                             0,
-                             0,
-                             FALSE,
-                             FALSE);
-            }
         }
         modifiers = keyboard_modifiers | pane->pointer_modifiers;
         send_pointer(pane,
@@ -4039,9 +4121,9 @@ handle_resize(Pane *pane)
     if (!read_window_size(&width, &height) ||
         (width == pane->width && height == pane->height))
         return;
+    cancel_pointer_interaction(pane, TRUE);
     pane->width = width;
     pane->height = height;
-    retire_current_image(pane);
     send_resize(pane);
     (void)ui_update_size(pane, NULL);
     find_overlay_repaint(pane);
@@ -4055,6 +4137,10 @@ set_visibility(Pane *pane, gboolean visible)
 
     if (pane->visible == visible)
         return;
+    if (!visible) {
+        cancel_pointer_interaction(pane, TRUE);
+        retire_pending_frame(pane, "pane became invisible");
+    }
     pane->visible = visible;
     if (!visible)
         find_overlay_hide(pane);
@@ -4189,7 +4275,7 @@ retry_engine(Pane *pane)
         : "about:blank";
 
     pane->engine_retry_us = 0;
-    if ((!connect_engine(pane) && !ensure_engine(pane)) ||
+    if (!connect_engine_fresh(pane) ||
         !start_view(pane, uri)) {
         disconnect_engine(pane);
         return;
@@ -4316,7 +4402,7 @@ service_maintenance(Pane *pane, gint64 monotonic_us)
         finish_pointer_scroll(pane);
     if (pane->close_request_serial && pane->close_deadline_us &&
         monotonic_us >= pane->close_deadline_us) {
-        cancel_close_request(pane);
+        force_close_request(pane);
     }
     while (g_main_context_iteration(pane->main_context, FALSE))
         ;
@@ -4425,8 +4511,11 @@ run_pane(Pane *pane)
         if (descriptors[0].revents & POLLIN)
             read_terminal(pane);
         if (pane->engine_fd >= 0 &&
-            descriptors[1].revents & POLLIN)
-            handle_engine_message(pane);
+            descriptors[1].revents & POLLIN) {
+            while (pane->engine_fd >= 0 &&
+                   handle_engine_message(pane))
+                ;
+        }
         if (pane->control_fd >= 0 &&
             descriptors[2].revents & POLLIN)
             read_control(pane);
@@ -4442,7 +4531,7 @@ run_pane(Pane *pane)
             descriptors[3].revents &
                 (POLLHUP | POLLERR | POLLNVAL))
             disconnect_events(pane);
-        if (descriptors[1].revents &
+        if (pane->engine_fd >= 0 && descriptors[1].revents &
             (POLLHUP | POLLERR | POLLNVAL))
             disconnect_engine(pane);
         if (descriptors[0].revents & (POLLHUP | POLLERR | POLLNVAL))
@@ -4461,11 +4550,22 @@ run_pane(Pane *pane)
 static void
 chooser_clear(Pane *pane)
 {
+    gint64 deadline_us;
+
     if (pane->chooser == NULL)
         return;
     mux_kitty_chooser_cancel_all(pane->chooser);
-    while (mux_kitty_chooser_is_busy(pane->chooser))
-        g_main_context_iteration(pane->main_context, TRUE);
+    deadline_us = g_get_monotonic_time() +
+        (gint64)CHOOSER_SHUTDOWN_TIMEOUT_MS * 1000;
+    while (mux_kitty_chooser_is_busy(pane->chooser) &&
+           g_get_monotonic_time() < deadline_us) {
+        while (g_main_context_iteration(pane->main_context, FALSE))
+            ;
+        if (mux_kitty_chooser_is_busy(pane->chooser))
+            g_usleep(1000);
+    }
+    if (mux_kitty_chooser_is_busy(pane->chooser))
+        g_warning("Kitty chooser did not stop before shutdown deadline");
     g_clear_pointer(&pane->chooser, mux_kitty_chooser_free);
 }
 
@@ -4486,7 +4586,8 @@ pane_clear(Pane *pane)
                       ? terminal_error->message
                       : "unknown error");
     if (pane->control_fd >= 0) {
-        control_write(pane, "BYE");
+        if (pane->explicit_close_requested)
+            control_write(pane, "BYE");
         if (pane->control_fd >= 0)
             close(pane->control_fd);
         pane->control_fd = -1;
@@ -4530,7 +4631,7 @@ main(int argc, char **argv)
     const gchar *popup_environment = g_getenv("MUX_POPUP_TOKEN");
     const gchar *initial_uri = argc > 1
         ? argv[1]
-        : "https://wpewebkit.org";
+        : "about:blank";
     Pane pane = {
         .engine_fd = -1,
         .control_fd = -1,
@@ -4577,7 +4678,7 @@ main(int argc, char **argv)
         pane_clear(&pane);
         return 1;
     }
-    if (!connect_engine(&pane) && !ensure_engine(&pane)) {
+    if (!connect_engine_fresh(&pane)) {
         g_printerr("mux-pane: connect %s: %s\n",
                    pane.socket_path,
                    g_strerror(errno));
