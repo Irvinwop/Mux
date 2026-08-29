@@ -7,10 +7,23 @@
 G_BEGIN_DECLS
 
 #define MUX_KITTY_CLIPBOARD_TIMEOUT_MS 10000U
+#define MUX_KITTY_CLIPBOARD_WRITE_PACKETS_PER_TICK 16U
+#define MUX_KITTY_CLIPBOARD_WRITE_BYTES_PER_TICK (96U * 1024U)
+#define MUX_KITTY_CLIPBOARD_MAX_QUEUED_WRITES 1U
+
+/*
+ * Writes retain one active snapshot and one replacement snapshot. If another
+ * snapshot is published while that replacement is queued, the newer snapshot
+ * replaces it. Snapshot byte and MIME limits remain those in mux-clipboard.h.
+ */
 
 typedef struct _MuxKittyClipboard MuxKittyClipboard;
 
-/* packet is borrowed and must be written atomically to the pane TTY. */
+/*
+ * packet is borrowed and must be accepted atomically. Returning
+ * G_IO_ERROR_WOULD_BLOCK means that no bytes were accepted and the complete
+ * packet will be retried by a later tick.
+ */
 typedef gboolean (*MuxKittyClipboardOutputFunc)(MuxKittyClipboard *clipboard,
                                                 GBytes *packet,
                                                 gpointer user_data,
@@ -50,6 +63,17 @@ gboolean mux_kitty_clipboard_request(MuxKittyClipboard *clipboard,
                                      gboolean is_paste,
                                      GError **error);
 
+/* Discovers and reads every MIME type currently advertised by Kitty. */
+gboolean mux_kitty_clipboard_request_all(MuxKittyClipboard *clipboard,
+                                         MuxOsc5522Location location,
+                                         const gchar *password,
+                                         const gchar *human_name,
+                                         gboolean is_paste,
+                                         GError **error);
+
+/* Cancels only the current read transaction; late responses are ignored. */
+void mux_kitty_clipboard_cancel_read(MuxKittyClipboard *clipboard);
+
 gboolean mux_kitty_clipboard_publish(MuxKittyClipboard *clipboard,
                                      MuxOsc5522Location location,
                                      const MuxClipboardSnapshot *snapshot,
@@ -64,7 +88,18 @@ gboolean mux_kitty_clipboard_handle_osc(MuxKittyClipboard *clipboard,
                                         const guint8 *sequence,
                                         gsize length,
                                         GError **error);
+gboolean mux_kitty_clipboard_osc_matches_pending_read(
+    const MuxKittyClipboard *clipboard,
+    const guint8 *sequence,
+    gsize length,
+    gboolean *matches,
+    GError **error);
 
+/*
+ * Expires stale transactions and advances an active write by at most
+ * MUX_KITTY_CLIPBOARD_WRITE_PACKETS_PER_TICK packets and
+ * MUX_KITTY_CLIPBOARD_WRITE_BYTES_PER_TICK encoded bytes.
+ */
 guint mux_kitty_clipboard_tick(MuxKittyClipboard *clipboard,
                                gint64 monotonic_us);
 

@@ -11,6 +11,13 @@ typedef enum {
     PENDING_BYE
 } PendingKind;
 
+typedef struct {
+    guint64 transaction_id;
+    gint64 deadline_us;
+} PendingObservation;
+
+#define MUX_CLIPBOARD_BROKER_CLIENT_MAX_TOMBSTONES 128U
+
 struct _MuxClipboardBrokerClient {
     gint reference_count;
     gchar *profile;
@@ -22,6 +29,8 @@ struct _MuxClipboardBrokerClient {
     MuxClipboardBrokerClientSelectFunc select_func;
     MuxClipboardBrokerClientMutationFunc mutation_func;
     MuxClipboardBrokerClientFailureFunc failure_func;
+    MuxClipboardBrokerClientObservationFunc observation_func;
+    gpointer observation_data;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     MuxClipboardWireAssembler *assembler;
@@ -35,7 +44,16 @@ struct _MuxClipboardBrokerClient {
     gint64 pending_deadline_us;
     GPtrArray *pending_summaries;
     MuxClipboardSnapshot *pending_snapshot;
+    GHashTable *pending_observations;
+    GHashTable *expired_request_ids;
+    GHashTable *expired_observation_ids;
 };
+
+static void
+pending_observation_free(PendingObservation *pending)
+{
+    g_free(pending);
+}
 
 static void
 summary_free(MuxClipboardControlSummary *summary)
@@ -44,6 +62,35 @@ summary_free(MuxClipboardControlSummary *summary)
         return;
     mux_clipboard_control_summary_clear(summary);
     g_free(summary);
+}
+
+static GHashTable *
+id_set_new(void)
+{
+    return g_hash_table_new_full(g_int64_hash,
+                                 g_int64_equal,
+                                 g_free,
+                                 NULL);
+}
+
+static void
+remember_id(GHashTable *ids, guint64 id)
+{
+    GHashTableIter iterator;
+    gpointer old_key;
+    guint64 *key;
+
+    if (id == 0 || g_hash_table_contains(ids, &id))
+        return;
+    if (g_hash_table_size(ids) >=
+        MUX_CLIPBOARD_BROKER_CLIENT_MAX_TOMBSTONES) {
+        g_hash_table_iter_init(&iterator, ids);
+        if (g_hash_table_iter_next(&iterator, &old_key, NULL))
+            g_hash_table_iter_remove(&iterator);
+    }
+    key = g_new(guint64, 1);
+    *key = id;
+    g_hash_table_add(ids, key);
 }
 
 static guint64
@@ -223,6 +270,13 @@ mux_clipboard_broker_client_new(
     client->user_data = user_data;
     client->user_data_destroy = user_data_destroy;
     client->assembler = mux_clipboard_wire_assembler_new(0);
+    client->pending_observations = g_hash_table_new_full(
+        g_int64_hash,
+        g_int64_equal,
+        g_free,
+        (GDestroyNotify)pending_observation_free);
+    client->expired_request_ids = id_set_new();
+    client->expired_observation_ids = id_set_new();
     client->next_request_id =
         ((guint64)g_random_int() << 32) | g_random_int();
     client->next_transaction_id =
@@ -251,20 +305,37 @@ mux_clipboard_broker_client_unref(MuxClipboardBrokerClient *client)
 
     clear_pending(client);
     mux_clipboard_wire_assembler_free(client->assembler);
+    g_hash_table_unref(client->pending_observations);
+    g_hash_table_unref(client->expired_request_ids);
+    g_hash_table_unref(client->expired_observation_ids);
     if (client->user_data_destroy != NULL)
         client->user_data_destroy(client->user_data);
     g_free(client->profile);
     g_free(client);
 }
 
+void
+mux_clipboard_broker_client_set_observation_func(
+    MuxClipboardBrokerClient *client,
+    MuxClipboardBrokerClientObservationFunc observation_func,
+    gpointer observation_data)
+{
+    g_return_if_fail(client != NULL);
+    client->observation_func = observation_func;
+    client->observation_data = observation_data;
+}
+
 gboolean
 mux_clipboard_broker_client_start(MuxClipboardBrokerClient *client,
                                   GError **error)
 {
+    MuxClipboardBrokerClient *guard;
     MuxClipboardControlRecord record = { 0 };
     GBytes *profile;
+    gboolean result = FALSE;
 
     g_return_val_if_fail(client != NULL, FALSE);
+    guard = mux_clipboard_broker_client_ref(client);
     if (client->state != MUX_CLIPBOARD_BROKER_CLIENT_NEW ||
         !begin_request(client,
                        PENDING_HELLO,
@@ -277,7 +348,7 @@ mux_clipboard_broker_client_start(MuxClipboardBrokerClient *client,
                                 G_IO_ERROR,
                                 G_IO_ERROR_PENDING,
                                 "clipboard broker client already started");
-        return FALSE;
+        goto out;
     }
 
     record.type = MUX_CLIPBOARD_CONTROL_HELLO;
@@ -291,12 +362,18 @@ mux_clipboard_broker_client_start(MuxClipboardBrokerClient *client,
     client->state = MUX_CLIPBOARD_BROKER_CLIENT_HELLO_PENDING;
     if (!send_control(client, &record, error)) {
         client->state = MUX_CLIPBOARD_BROKER_CLIENT_NEW;
+        remember_id(client->expired_request_ids,
+                    client->pending_request_id);
         clear_pending(client);
         g_bytes_unref(profile);
-        return FALSE;
+        goto out;
     }
     g_bytes_unref(profile);
-    return TRUE;
+    result = TRUE;
+
+out:
+    mux_clipboard_broker_client_unref(guard);
+    return result;
 }
 
 gboolean
@@ -308,14 +385,59 @@ mux_clipboard_broker_client_observe(
     const MuxClipboardSnapshot *snapshot,
     GError **error)
 {
+    return mux_clipboard_broker_client_observe_full(client,
+                                                    flags,
+                                                    source_origin,
+                                                    source_view_id,
+                                                    snapshot,
+                                                    NULL,
+                                                    error);
+}
+
+gboolean
+mux_clipboard_broker_client_observe_full(
+    MuxClipboardBrokerClient *client,
+    guint32 flags,
+    const gchar *source_origin,
+    guint64 source_view_id,
+    const MuxClipboardSnapshot *snapshot,
+    guint64 *transaction_id,
+    GError **error)
+{
+    MuxClipboardBrokerClient *guard;
+    PendingObservation *pending;
+    guint64 *key;
+    guint64 id;
+    gboolean result = FALSE;
+
     g_return_val_if_fail(client != NULL, FALSE);
     g_return_val_if_fail(snapshot != NULL, FALSE);
+    guard = mux_clipboard_broker_client_ref(client);
     if (!require_ready(client, error))
-        return FALSE;
+        goto out;
+    if (g_hash_table_size(client->pending_observations) >=
+        MUX_CLIPBOARD_BROKER_CLIENT_MAX_OBSERVATIONS) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_WOULD_BLOCK,
+                            "too many clipboard observations are pending");
+        goto out;
+    }
     if (client->mode == MUX_CLIPBOARD_HISTORY_EPHEMERAL)
         flags |= MUX_CLIPBOARD_WIRE_FLAG_EPHEMERAL;
-    return mux_clipboard_wire_send_snapshot(
-        next_nonzero(&client->next_transaction_id),
+
+    id = next_nonzero(&client->next_transaction_id);
+    if (transaction_id != NULL)
+        *transaction_id = id;
+    key = g_new(guint64, 1);
+    *key = id;
+    pending = g_new0(PendingObservation, 1);
+    pending->transaction_id = id;
+    pending->deadline_us = request_deadline();
+    g_hash_table_insert(client->pending_observations, key, pending);
+
+    result = mux_clipboard_wire_send_snapshot(
+        id,
         flags | MUX_CLIPBOARD_WIRE_FLAG_CURRENT,
         client->profile,
         source_origin,
@@ -325,6 +447,12 @@ mux_clipboard_broker_client_observe(
         output_wire,
         client,
         error);
+    if (!result)
+        g_hash_table_remove(client->pending_observations, &id);
+
+out:
+    mux_clipboard_broker_client_unref(guard);
+    return result;
 }
 
 static gboolean
@@ -337,6 +465,9 @@ send_simple_request(MuxClipboardBrokerClient *client,
                     GError **error)
 {
     MuxClipboardControlRecord record = { 0 };
+    MuxClipboardBrokerClient *guard =
+        mux_clipboard_broker_client_ref(client);
+    gboolean result = FALSE;
 
     if (!require_ready(client, error) ||
         !begin_request(client,
@@ -345,7 +476,7 @@ send_simple_request(MuxClipboardBrokerClient *client,
                        entry_id,
                        paste,
                        error))
-        return FALSE;
+        goto out;
 
     if (kind == PENDING_LIST)
         client->pending_summaries = g_ptr_array_new_with_free_func(
@@ -356,8 +487,47 @@ send_simple_request(MuxClipboardBrokerClient *client,
     record.request_id = client->pending_request_id;
     record.entry_id = entry_id;
     if (!send_control(client, &record, error)) {
+        remember_id(client->expired_request_ids,
+                    client->pending_request_id);
         clear_pending(client);
+        goto out;
+    }
+    result = TRUE;
+
+out:
+    mux_clipboard_broker_client_unref(guard);
+    return result;
+}
+
+static gboolean
+complete_observation(MuxClipboardBrokerClient *client,
+                     guint64 transaction_id,
+                     MuxClipboardBrokerObservationResult result,
+                     const GError *cause,
+                     GError **error)
+{
+    if (!g_hash_table_contains(client->pending_observations,
+                               &transaction_id)) {
+        if (g_hash_table_contains(client->expired_observation_ids,
+                                  &transaction_id))
+            return TRUE;
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_DATA,
+                            "clipboard observation result has no matching transaction");
         return FALSE;
+    }
+
+    remember_id(client->expired_observation_ids, transaction_id);
+    g_hash_table_remove(client->pending_observations, &transaction_id);
+    if (client->observation_func != NULL) {
+        client->observation_func(client,
+                                 transaction_id,
+                                 result,
+                                 cause,
+                                 client->observation_data);
+    } else if (result == MUX_CLIPBOARD_BROKER_OBSERVATION_REJECTED) {
+        report_failure(client, "clipboard-observe", cause);
     }
     return TRUE;
 }
@@ -514,6 +684,8 @@ handle_ok(MuxClipboardBrokerClient *client,
     }
 
     if (kind == PENDING_HELLO) {
+        remember_id(client->expired_request_ids,
+                    client->pending_request_id);
         clear_pending(client);
         client->state = MUX_CLIPBOARD_BROKER_CLIENT_READY;
         if (client->ready_func != NULL)
@@ -522,6 +694,8 @@ handle_ok(MuxClipboardBrokerClient *client,
         MuxClipboardSnapshot *snapshot = client->pending_snapshot;
 
         client->pending_snapshot = NULL;
+        remember_id(client->expired_request_ids,
+                    client->pending_request_id);
         clear_pending(client);
         if (client->select_func != NULL)
             client->select_func(client,
@@ -533,6 +707,8 @@ handle_ok(MuxClipboardBrokerClient *client,
     } else if (kind == PENDING_MUTATION) {
         guint64 value = record->entry_id;
 
+        remember_id(client->expired_request_ids,
+                    client->pending_request_id);
         clear_pending(client);
         if (client->mutation_func != NULL)
             client->mutation_func(client,
@@ -540,6 +716,8 @@ handle_ok(MuxClipboardBrokerClient *client,
                                   value,
                                   client->user_data);
     } else if (kind == PENDING_BYE) {
+        remember_id(client->expired_request_ids,
+                    client->pending_request_id);
         clear_pending(client);
         client->state = MUX_CLIPBOARD_BROKER_CLIENT_CLOSED;
     } else {
@@ -566,6 +744,11 @@ handle_control(MuxClipboardBrokerClient *client,
         return FALSE;
     if (client->pending_kind == PENDING_NONE ||
         record.request_id != client->pending_request_id) {
+        if (g_hash_table_contains(client->expired_request_ids,
+                                  &record.request_id)) {
+            result = TRUE;
+            goto out;
+        }
         g_set_error_literal(error,
                             G_IO_ERROR,
                             G_IO_ERROR_INVALID_DATA,
@@ -599,6 +782,8 @@ handle_control(MuxClipboardBrokerClient *client,
             GPtrArray *summaries = client->pending_summaries;
 
             client->pending_summaries = NULL;
+            remember_id(client->expired_request_ids,
+                        client->pending_request_id);
             clear_pending(client);
             if (client->list_func != NULL)
                 client->list_func(client,
@@ -628,6 +813,8 @@ handle_control(MuxClipboardBrokerClient *client,
                                            message);
         if (client->pending_kind == PENDING_HELLO)
             client->state = MUX_CLIPBOARD_BROKER_CLIENT_NEW;
+        remember_id(client->expired_request_ids,
+                    client->pending_request_id);
         clear_pending(client);
         report_failure(client, operation, remote_error);
         result = TRUE;
@@ -690,20 +877,57 @@ handle_snapshot(MuxClipboardBrokerClient *client,
     gsize length;
     guint32 flags;
     guint64 transaction_id;
+    guint64 record_transaction_id;
 
     data = g_bytes_get_data(payload, &length);
     if (!mux_clipboard_wire_record_decode(data, length, &record, error))
         return FALSE;
+    record_transaction_id = record.transaction_id;
     if (record.type == MUX_CLIPBOARD_WIRE_ACK) {
+        guint64 id = record.transaction_id;
+        MuxClipboardBrokerObservationResult result;
+
+        if (record.flags &
+            ~MUX_CLIPBOARD_WIRE_FLAG_HISTORY_DEGRADED) {
+            mux_clipboard_wire_record_clear(&record);
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_DATA,
+                                "clipboard observation ACK has invalid flags");
+            return FALSE;
+        }
+        result = record.flags & MUX_CLIPBOARD_WIRE_FLAG_HISTORY_DEGRADED
+                     ? MUX_CLIPBOARD_BROKER_OBSERVATION_DEGRADED
+                     : MUX_CLIPBOARD_BROKER_OBSERVATION_ACCEPTED;
         mux_clipboard_wire_record_clear(&record);
-        return TRUE;
+        return complete_observation(client, id, result, NULL, error);
     }
     if (record.type == MUX_CLIPBOARD_WIRE_REMOTE_ERROR) {
+        guint64 id = record.transaction_id;
+        g_autoptr(GError) remote_error = g_error_new_literal(
+            G_IO_ERROR,
+            G_IO_ERROR_FAILED,
+            "clipboard broker rejected an observed snapshot");
+
         mux_clipboard_wire_record_clear(&record);
+        return complete_observation(
+            client,
+            id,
+            MUX_CLIPBOARD_BROKER_OBSERVATION_REJECTED,
+            remote_error,
+            error);
+    }
+
+    if (client->pending_kind != PENDING_SELECT ||
+        record_transaction_id != client->pending_request_id) {
+        mux_clipboard_wire_record_clear(&record);
+        if (g_hash_table_contains(client->expired_request_ids,
+                                  &record_transaction_id))
+            return TRUE;
         g_set_error_literal(error,
                             G_IO_ERROR,
-                            G_IO_ERROR_FAILED,
-                            "clipboard broker rejected an observed snapshot");
+                            G_IO_ERROR_INVALID_DATA,
+                            "clipboard selection fragment has no matching request");
         return FALSE;
     }
 
@@ -719,12 +943,15 @@ handle_snapshot(MuxClipboardBrokerClient *client,
         return FALSE;
     }
     if (feed_result == MUX_CLIPBOARD_WIRE_FEED_ACCEPTED ||
-        feed_result == MUX_CLIPBOARD_WIRE_FEED_CANCELLED)
+        feed_result == MUX_CLIPBOARD_WIRE_FEED_CANCELLED) {
+        client->pending_deadline_us = request_deadline();
         return TRUE;
+    }
     if (feed_result == MUX_CLIPBOARD_WIRE_FEED_REJECTED)
         return FALSE;
 
     if (client->pending_kind != PENDING_SELECT ||
+        transaction_id != client->pending_request_id ||
         client->pending_snapshot != NULL ||
         mux_clipboard_wire_transfer_get_profile(transfer) == NULL ||
         !g_str_equal(mux_clipboard_wire_transfer_get_profile(transfer),
@@ -802,37 +1029,163 @@ mux_clipboard_broker_client_tick(MuxClipboardBrokerClient *client,
                                  gint64 monotonic_us)
 {
     MuxClipboardBrokerClient *guard;
+    g_autoptr(GArray) expired_observations = NULL;
+    const gchar *expired_operation = NULL;
+    gboolean assembler_expired;
+    gboolean request_expired = FALSE;
+    gboolean selection_expired = FALSE;
     guint expired = 0;
 
     g_return_val_if_fail(client != NULL, 0);
     guard = mux_clipboard_broker_client_ref(client);
+    assembler_expired = mux_clipboard_wire_assembler_tick(
+        client->assembler,
+        monotonic_us);
     if (client->pending_kind != PENDING_NONE &&
         client->pending_deadline_us <= monotonic_us) {
+        expired_operation = pending_name(client);
+        remember_id(client->expired_request_ids,
+                    client->pending_request_id);
+        if (client->pending_kind == PENDING_HELLO)
+            client->state = MUX_CLIPBOARD_BROKER_CLIENT_NEW;
+        clear_pending(client);
+        request_expired = TRUE;
+        expired++;
+    }
+    if (assembler_expired &&
+        client->pending_kind == PENDING_SELECT) {
+        remember_id(client->expired_request_ids,
+                    client->pending_request_id);
+        clear_pending(client);
+        selection_expired = TRUE;
+        expired++;
+    }
+    expired_observations = g_array_new(FALSE, FALSE, sizeof(guint64));
+    if (g_hash_table_size(client->pending_observations) > 0) {
+        GHashTableIter iterator;
+        gpointer value;
+        guint i;
+
+        g_hash_table_iter_init(&iterator, client->pending_observations);
+        while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+            PendingObservation *pending = value;
+
+            if (pending->deadline_us <= monotonic_us)
+                g_array_append_val(expired_observations,
+                                   pending->transaction_id);
+        }
+        for (i = 0; i < expired_observations->len; i++) {
+            guint64 id = g_array_index(expired_observations, guint64, i);
+
+            remember_id(client->expired_observation_ids, id);
+            g_hash_table_remove(client->pending_observations, &id);
+            expired++;
+        }
+    }
+    if (request_expired) {
         g_autoptr(GError) timeout = g_error_new_literal(
             G_IO_ERROR,
             G_IO_ERROR_TIMED_OUT,
             "clipboard broker request timed out");
-        const gchar *operation = pending_name(client);
 
-        if (client->pending_kind == PENDING_HELLO)
-            client->state = MUX_CLIPBOARD_BROKER_CLIENT_NEW;
-        clear_pending(client);
-        report_failure(client, operation, timeout);
-        expired++;
+        report_failure(client, expired_operation, timeout);
     }
-    if (mux_clipboard_wire_assembler_tick(client->assembler,
-                                          monotonic_us)) {
+    if (selection_expired) {
         g_autoptr(GError) timeout = g_error_new_literal(
             G_IO_ERROR,
             G_IO_ERROR_TIMED_OUT,
             "clipboard selection snapshot timed out");
 
-        clear_pending(client);
         report_failure(client, "clipboard-select", timeout);
-        expired++;
+    }
+    if (expired_observations->len > 0) {
+        g_autoptr(GError) timeout = g_error_new_literal(
+            G_IO_ERROR,
+            G_IO_ERROR_TIMED_OUT,
+            "clipboard observation timed out");
+        guint i;
+
+        for (i = 0; i < expired_observations->len; i++) {
+            guint64 id = g_array_index(expired_observations, guint64, i);
+
+            if (client->observation_func != NULL)
+                client->observation_func(
+                    client,
+                    id,
+                    MUX_CLIPBOARD_BROKER_OBSERVATION_REJECTED,
+                    timeout,
+                    client->observation_data);
+            else
+                report_failure(client, "clipboard-observe", timeout);
+        }
     }
     mux_clipboard_broker_client_unref(guard);
     return expired;
+}
+
+void
+mux_clipboard_broker_client_handle_disconnect(
+    MuxClipboardBrokerClient *client,
+    const GError *error)
+{
+    MuxClipboardBrokerClient *guard;
+    g_autoptr(GArray) observation_ids = NULL;
+    g_autoptr(GError) fallback = NULL;
+    const gchar *operation = NULL;
+    GHashTableIter iterator;
+    gpointer value;
+    guint i;
+
+    g_return_if_fail(client != NULL);
+    guard = mux_clipboard_broker_client_ref(client);
+    if (client->state == MUX_CLIPBOARD_BROKER_CLIENT_CLOSED)
+        goto out;
+    if (error == NULL) {
+        fallback = g_error_new_literal(G_IO_ERROR,
+                                       G_IO_ERROR_CONNECTION_CLOSED,
+                                       "clipboard broker disconnected");
+        error = fallback;
+    }
+    if (client->pending_kind != PENDING_NONE) {
+        operation = pending_name(client);
+        remember_id(client->expired_request_ids,
+                    client->pending_request_id);
+    }
+    clear_pending(client);
+    client->state = MUX_CLIPBOARD_BROKER_CLIENT_CLOSED;
+
+    observation_ids = g_array_new(FALSE, FALSE, sizeof(guint64));
+    g_hash_table_iter_init(&iterator, client->pending_observations);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        PendingObservation *pending = value;
+
+        g_array_append_val(observation_ids, pending->transaction_id);
+    }
+    for (i = 0; i < observation_ids->len; i++) {
+        guint64 id = g_array_index(observation_ids, guint64, i);
+
+        remember_id(client->expired_observation_ids, id);
+        g_hash_table_remove(client->pending_observations, &id);
+    }
+    if (operation != NULL)
+        report_failure(client, operation, error);
+    for (i = 0; i < observation_ids->len; i++) {
+        guint64 id = g_array_index(observation_ids, guint64, i);
+
+        if (client->observation_func != NULL)
+            client->observation_func(
+                client,
+                id,
+                MUX_CLIPBOARD_BROKER_OBSERVATION_REJECTED,
+                error,
+                client->observation_data);
+        else
+            report_failure(client, "clipboard-observe", error);
+    }
+    report_failure(client, "transport", error);
+
+out:
+    mux_clipboard_broker_client_unref(guard);
 }
 
 MuxClipboardBrokerClientState

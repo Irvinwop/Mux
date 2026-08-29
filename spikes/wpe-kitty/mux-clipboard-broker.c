@@ -7,6 +7,7 @@ typedef struct {
     MuxClipboardHistoryMode mode;
     MuxClipboardHistory *history;
     MuxClipboardSnapshot *current;
+    guint64 current_entry_id;
 } ProfileClipboard;
 
 struct _MuxClipboardBroker {
@@ -89,6 +90,7 @@ mux_clipboard_broker_set_profile_mode(MuxClipboardBroker *broker,
 {
     ProfileClipboard *state;
     MuxClipboardHistory *history;
+    MuxClipboardHistoryScope scope;
 
     g_return_val_if_fail(broker != NULL, FALSE);
     if (!valid_profile_name(profile) ||
@@ -112,7 +114,15 @@ mux_clipboard_broker_set_profile_mode(MuxClipboardBroker *broker,
         return FALSE;
     }
 
-    history = mux_clipboard_history_new(profile, mode);
+    scope = mode == MUX_CLIPBOARD_HISTORY_MEMORY
+                ? MUX_CLIPBOARD_HISTORY_SCOPE_PERSISTENT
+                : mode == MUX_CLIPBOARD_HISTORY_EPHEMERAL
+                      ? MUX_CLIPBOARD_HISTORY_SCOPE_PRIVATE
+                      : MUX_CLIPBOARD_HISTORY_SCOPE_EPHEMERAL;
+    history = mux_clipboard_history_new_for_namespace(profile,
+                                                      profile,
+                                                      scope,
+                                                      mode);
     if (history == NULL) {
         g_set_error_literal(error,
                             G_IO_ERROR,
@@ -161,6 +171,8 @@ mux_clipboard_broker_observe(MuxClipboardBroker *broker,
 {
     ProfileClipboard *state;
     MuxClipboardSnapshot *copy;
+    MuxClipboardHistoryAddResult result;
+    guint64 entry_id = 0;
 
     g_return_val_if_fail(broker != NULL,
                          MUX_CLIPBOARD_HISTORY_IGNORED);
@@ -181,13 +193,17 @@ mux_clipboard_broker_observe(MuxClipboardBroker *broker,
     g_clear_pointer(&state->current, mux_clipboard_snapshot_unref);
     state->current = copy;
 
-    return mux_clipboard_history_add(state->history,
-                                     snapshot,
-                                     created_us,
-                                     source_origin,
-                                     source_view_id,
-                                     history_entry_id,
-                                     error);
+    result = mux_clipboard_history_add(state->history,
+                                       snapshot,
+                                       created_us,
+                                       source_origin,
+                                       source_view_id,
+                                       &entry_id,
+                                       error);
+    state->current_entry_id = entry_id;
+    if (history_entry_id != NULL)
+        *history_entry_id = entry_id;
+    return result;
 }
 
 MuxClipboardSnapshot *
@@ -218,6 +234,7 @@ mux_clipboard_broker_summary_free(MuxClipboardBrokerSummary *summary)
         return;
     g_free(summary->source_origin);
     g_free(summary->preview);
+    g_strfreev(summary->mime_types);
     g_free(summary);
 }
 
@@ -244,6 +261,7 @@ mux_clipboard_broker_list(MuxClipboardBroker *broker,
             mux_clipboard_history_entry_get_snapshot(entry);
         MuxClipboardBrokerSummary *summary =
             g_new0(MuxClipboardBrokerSummary, 1);
+        guint format_index;
 
         summary->id = mux_clipboard_history_entry_get_id(entry);
         summary->created_us =
@@ -256,6 +274,19 @@ mux_clipboard_broker_list(MuxClipboardBroker *broker,
             mux_clipboard_history_entry_get_pinned(entry);
         summary->format_count =
             mux_clipboard_snapshot_get_count(snapshot);
+        summary->mime_type_count = summary->format_count;
+        summary->mime_types = g_new0(gchar *, summary->format_count + 1);
+        for (format_index = 0;
+             format_index < summary->format_count;
+             format_index++) {
+            const gchar *mime = NULL;
+
+            mux_clipboard_snapshot_get_item(snapshot,
+                                            format_index,
+                                            &mime,
+                                            NULL);
+            summary->mime_types[format_index] = g_strdup(mime);
+        }
         summary->total_bytes =
             mux_clipboard_snapshot_get_total_bytes(snapshot);
         summary->preview =
@@ -286,6 +317,7 @@ mux_clipboard_broker_select(MuxClipboardBroker *broker,
         return NULL;
     g_clear_pointer(&state->current, mux_clipboard_snapshot_unref);
     state->current = mux_clipboard_snapshot_ref(snapshot);
+    state->current_entry_id = entry_id;
     return snapshot;
 }
 
@@ -314,13 +346,20 @@ mux_clipboard_broker_delete(MuxClipboardBroker *broker,
                             GError **error)
 {
     ProfileClipboard *state;
+    gboolean removed;
 
     g_return_val_if_fail(broker != NULL, FALSE);
     state = lookup_profile(broker, profile, error);
-    return state != NULL &&
-           mux_clipboard_history_delete(state->history,
-                                        entry_id,
-                                        error);
+    if (state == NULL)
+        return FALSE;
+    removed = mux_clipboard_history_delete(state->history,
+                                           entry_id,
+                                           error);
+    if (removed && state->current_entry_id == entry_id) {
+        state->current_entry_id = 0;
+        g_clear_pointer(&state->current, mux_clipboard_snapshot_unref);
+    }
+    return removed;
 }
 
 guint
@@ -330,11 +369,32 @@ mux_clipboard_broker_clear(MuxClipboardBroker *broker,
                            GError **error)
 {
     ProfileClipboard *state;
+    gboolean clear_current = FALSE;
+    guint removed;
+    guint i;
 
     g_return_val_if_fail(broker != NULL, 0);
     state = lookup_profile(broker, profile, error);
-    return state != NULL
-               ? mux_clipboard_history_clear(state->history,
-                                             include_pinned)
-               : 0;
+    if (state == NULL)
+        return 0;
+    if (state->current_entry_id != 0) {
+        for (i = 0; i < mux_clipboard_history_get_count(state->history); i++) {
+            const MuxClipboardHistoryEntry *entry =
+                mux_clipboard_history_get(state->history, i);
+
+            if (mux_clipboard_history_entry_get_id(entry) ==
+                state->current_entry_id) {
+                clear_current = include_pinned ||
+                    !mux_clipboard_history_entry_get_pinned(entry);
+                break;
+            }
+        }
+    }
+    removed = mux_clipboard_history_clear(state->history,
+                                          include_pinned);
+    if (clear_current && removed > 0) {
+        state->current_entry_id = 0;
+        g_clear_pointer(&state->current, mux_clipboard_snapshot_unref);
+    }
+    return removed;
 }

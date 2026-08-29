@@ -14,14 +14,22 @@ G_DECLARE_FINAL_TYPE(MuxWpeClipboard,
                      WPE_CLIPBOARD,
                      WPEClipboard)
 
+/* Captures opaque publication state before WPE processes a local change. */
+typedef gpointer (*MuxWpeClipboardPublishBeginFunc)(
+    MuxWpeClipboard *clipboard,
+    gpointer user_data);
+
 /* snapshot is borrowed and sealed for the duration of the callback. */
 typedef void (*MuxWpeClipboardPublishFunc)(MuxWpeClipboard *clipboard,
                                           MuxClipboardSnapshot *snapshot,
+                                          gpointer publication_data,
                                           gpointer user_data);
 
 MuxWpeClipboard *mux_wpe_clipboard_new(
     WPEDisplay *display,
+    MuxWpeClipboardPublishBeginFunc publish_begin_func,
     MuxWpeClipboardPublishFunc publish_func,
+    GDestroyNotify publication_data_destroy,
     gpointer user_data,
     GDestroyNotify user_data_destroy);
 

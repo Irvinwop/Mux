@@ -6,15 +6,19 @@ struct _MuxClipboardHistoryEntry {
     guint64 id;
     gint64 created_us;
     gchar *profile;
+    gchar *storage_namespace;
     gchar *source_origin;
     guint64 source_view_id;
     MuxClipboardSnapshot *snapshot;
+    gchar *semantic_digest;
     gboolean pinned;
 };
 
 struct _MuxClipboardHistory {
     gchar *profile;
+    gchar *storage_namespace;
     MuxClipboardHistoryMode mode;
+    MuxClipboardHistoryScope scope;
     GQueue entries;
     guint64 next_id;
     gsize total_bytes;
@@ -27,21 +31,37 @@ history_entry_free(MuxClipboardHistoryEntry *entry)
         return;
 
     g_free(entry->profile);
+    g_free(entry->storage_namespace);
     g_free(entry->source_origin);
+    g_free(entry->semantic_digest);
     mux_clipboard_snapshot_unref(entry->snapshot);
     g_free(entry);
 }
 
 static gboolean
-valid_profile(const gchar *profile)
+valid_label(const gchar *value, gsize maximum)
 {
+    const gchar *cursor;
+    const gchar *end;
     gsize length;
 
-    if (profile == NULL || profile[0] == '\0')
+    if (value == NULL || value[0] == '\0')
         return FALSE;
-    length = strlen(profile);
-    return length <= MUX_CLIPBOARD_HISTORY_MAX_PROFILE &&
-           g_utf8_validate(profile, length, NULL);
+    length = strlen(value);
+    if (length > maximum || !g_utf8_validate(value, length, NULL))
+        return FALSE;
+
+    cursor = value;
+    end = value + length;
+    while (cursor < end) {
+        gunichar character = g_utf8_get_char(cursor);
+
+        if (g_unichar_iscntrl(character) ||
+            g_unichar_type(character) == G_UNICODE_FORMAT)
+            return FALSE;
+        cursor = g_utf8_next_char(cursor);
+    }
+    return TRUE;
 }
 
 static gboolean
@@ -52,44 +72,150 @@ valid_origin(const gchar *origin)
     if (origin == NULL)
         return TRUE;
     length = strlen(origin);
-    return length <= MUX_CLIPBOARD_HISTORY_MAX_ORIGIN &&
-           g_utf8_validate(origin, length, NULL);
+    return valid_label(origin, MUX_CLIPBOARD_HISTORY_MAX_ORIGIN) &&
+           length <= MUX_CLIPBOARD_HISTORY_MAX_ORIGIN;
+}
+
+static const gchar *
+scope_name(MuxClipboardHistoryScope scope)
+{
+    switch (scope) {
+    case MUX_CLIPBOARD_HISTORY_SCOPE_PERSISTENT:
+        return "persistent";
+    case MUX_CLIPBOARD_HISTORY_SCOPE_PRIVATE:
+        return "private";
+    case MUX_CLIPBOARD_HISTORY_SCOPE_EPHEMERAL:
+    default:
+        return "ephemeral";
+    }
+}
+
+static gboolean mime_has_base(const gchar *mime, const gchar *base);
+
+static guint
+history_mime_priority(const gchar *mime)
+{
+    if (mime_has_base(mime, "text/plain"))
+        return 0;
+    if (mime_has_base(mime, "text/uri-list"))
+        return 1;
+    if (mime_has_base(mime, "text/html"))
+        return 2;
+    if (g_ascii_strncasecmp(mime, "text/", 5) == 0)
+        return 3;
+    return 4;
+}
+
+typedef struct {
+    const gchar *mime;
+    GBytes *bytes;
+} HistoryDigestItem;
+
+static gint
+history_digest_item_compare(gconstpointer left, gconstpointer right)
+{
+    const HistoryDigestItem *left_item =
+        *(HistoryDigestItem * const *)left;
+    const HistoryDigestItem *right_item =
+        *(HistoryDigestItem * const *)right;
+
+    return g_strcmp0(left_item->mime, right_item->mime);
+}
+
+static gchar *
+history_semantic_digest(const MuxClipboardSnapshot *snapshot)
+{
+    g_autoptr(GPtrArray) items =
+        g_ptr_array_new_with_free_func(g_free);
+    GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    guint64 count = GUINT64_TO_BE(
+        mux_clipboard_snapshot_get_count(snapshot));
+    gchar *digest;
+    guint i;
+
+    g_checksum_update(checksum, (const guchar *)&count, sizeof(count));
+    for (i = 0; i < mux_clipboard_snapshot_get_count(snapshot); i++) {
+        HistoryDigestItem *item = g_new0(HistoryDigestItem, 1);
+
+        mux_clipboard_snapshot_get_item(snapshot,
+                                        i,
+                                        &item->mime,
+                                        &item->bytes);
+        g_ptr_array_add(items, item);
+    }
+    g_ptr_array_sort(items, history_digest_item_compare);
+    for (i = 0; i < items->len; i++) {
+        HistoryDigestItem *item = g_ptr_array_index(items, i);
+        gsize length = 0;
+        const guint8 *data = g_bytes_get_data(item->bytes, &length);
+        guint64 mime_length = GUINT64_TO_BE(strlen(item->mime));
+        guint64 data_length = GUINT64_TO_BE(length);
+
+        g_checksum_update(checksum,
+                          (const guchar *)&mime_length,
+                          sizeof(mime_length));
+        g_checksum_update(checksum,
+                          (const guchar *)item->mime,
+                          strlen(item->mime));
+        g_checksum_update(checksum,
+                          (const guchar *)&data_length,
+                          sizeof(data_length));
+        g_checksum_update(checksum, data, length);
+    }
+    digest = g_strdup(g_checksum_get_string(checksum));
+    g_checksum_free(checksum);
+    return digest;
 }
 
 static MuxClipboardSnapshot *
-history_snapshot(const MuxClipboardSnapshot *source, GError **error)
+history_snapshot(const MuxClipboardSnapshot *source,
+                 gboolean *degraded,
+                 GError **error)
 {
     MuxClipboardSnapshot *copy;
+    gboolean omitted = FALSE;
+    guint priority;
     guint i;
 
     copy = mux_clipboard_snapshot_new(
         mux_clipboard_snapshot_get_serial(source));
-    for (i = 0; i < mux_clipboard_snapshot_get_count(source); i++) {
-        const gchar *mime = NULL;
-        GBytes *bytes = NULL;
+    for (priority = 0; priority < 5; priority++) {
+        for (i = 0; i < mux_clipboard_snapshot_get_count(source); i++) {
+            const gchar *mime = NULL;
+            GBytes *bytes = NULL;
+            gsize length;
 
-        mux_clipboard_snapshot_get_item(source, i, &mime, &bytes);
-        if (!mux_clipboard_snapshot_add(copy, mime, bytes, error)) {
-            mux_clipboard_snapshot_unref(copy);
-            return NULL;
+            mux_clipboard_snapshot_get_item(source, i, &mime, &bytes);
+            if (history_mime_priority(mime) != priority)
+                continue;
+
+            length = g_bytes_get_size(bytes);
+            if (length > MUX_CLIPBOARD_HISTORY_MAX_ITEM_BYTES ||
+                length > MUX_CLIPBOARD_HISTORY_MAX_BYTES -
+                             mux_clipboard_snapshot_get_total_bytes(copy)) {
+                omitted = TRUE;
+                continue;
+            }
+            if (!mux_clipboard_snapshot_add(copy, mime, bytes, error)) {
+                mux_clipboard_snapshot_unref(copy);
+                return NULL;
+            }
         }
     }
 
     if (mux_clipboard_snapshot_get_count(copy) == 0) {
-        mux_clipboard_snapshot_unref(copy);
-        return NULL;
-    }
-    if (mux_clipboard_snapshot_get_total_bytes(copy) >
-        MUX_CLIPBOARD_HISTORY_MAX_BYTES) {
-        g_set_error_literal(error,
-                            G_IO_ERROR,
-                            G_IO_ERROR_NO_SPACE,
-                            "clipboard history entry exceeds 16 MiB");
+        if (mux_clipboard_snapshot_get_count(source) > 0)
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_NO_SPACE,
+                                "no clipboard format fits in history");
         mux_clipboard_snapshot_unref(copy);
         return NULL;
     }
 
     mux_clipboard_snapshot_seal(copy);
+    if (degraded != NULL)
+        *degraded = omitted;
     return copy;
 }
 
@@ -193,16 +319,51 @@ MuxClipboardHistory *
 mux_clipboard_history_new(const gchar *profile,
                           MuxClipboardHistoryMode mode)
 {
+    MuxClipboardHistoryScope scope =
+        mode == MUX_CLIPBOARD_HISTORY_MEMORY
+            ? MUX_CLIPBOARD_HISTORY_SCOPE_PERSISTENT
+            : MUX_CLIPBOARD_HISTORY_SCOPE_EPHEMERAL;
+
+    return mux_clipboard_history_new_for_namespace(
+        profile, profile, scope, mode);
+}
+
+MuxClipboardHistory *
+mux_clipboard_history_new_for_namespace(
+    const gchar *profile,
+    const gchar *profile_namespace,
+    MuxClipboardHistoryScope scope,
+    MuxClipboardHistoryMode mode)
+{
     MuxClipboardHistory *history;
 
-    g_return_val_if_fail(valid_profile(profile), NULL);
+    g_return_val_if_fail(
+        valid_label(profile, MUX_CLIPBOARD_HISTORY_MAX_PROFILE), NULL);
+    g_return_val_if_fail(
+        valid_label(profile_namespace,
+                    MUX_CLIPBOARD_HISTORY_MAX_NAMESPACE),
+        NULL);
+    g_return_val_if_fail(
+        scope >= MUX_CLIPBOARD_HISTORY_SCOPE_PERSISTENT &&
+            scope <= MUX_CLIPBOARD_HISTORY_SCOPE_EPHEMERAL,
+        NULL);
     g_return_val_if_fail(mode >= MUX_CLIPBOARD_HISTORY_DISABLED &&
                          mode <= MUX_CLIPBOARD_HISTORY_EPHEMERAL,
                          NULL);
+    g_return_val_if_fail(
+        mode == MUX_CLIPBOARD_HISTORY_DISABLED ||
+            (mode == MUX_CLIPBOARD_HISTORY_MEMORY &&
+             scope == MUX_CLIPBOARD_HISTORY_SCOPE_PERSISTENT) ||
+            (mode == MUX_CLIPBOARD_HISTORY_EPHEMERAL &&
+             scope != MUX_CLIPBOARD_HISTORY_SCOPE_PERSISTENT),
+        NULL);
 
     history = g_new0(MuxClipboardHistory, 1);
     history->profile = g_strdup(profile);
+    history->storage_namespace = g_strdup_printf(
+        "%s/%s", scope_name(scope), profile_namespace);
     history->mode = mode;
+    history->scope = scope;
     g_queue_init(&history->entries);
     return history;
 }
@@ -216,6 +377,7 @@ mux_clipboard_history_free(MuxClipboardHistory *history)
     g_queue_clear_full(&history->entries,
                        (GDestroyNotify)history_entry_free);
     g_free(history->profile);
+    g_free(history->storage_namespace);
     g_free(history);
 }
 
@@ -231,7 +393,9 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
     MuxClipboardSnapshot *filtered;
     GList *link;
     MuxClipboardHistoryEntry *entry;
+    g_autofree gchar *semantic_digest = NULL;
     gsize bytes;
+    gboolean degraded = FALSE;
 
     g_return_val_if_fail(history != NULL,
                          MUX_CLIPBOARD_HISTORY_IGNORED);
@@ -250,13 +414,15 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
         return MUX_CLIPBOARD_HISTORY_IGNORED;
     }
 
-    filtered = history_snapshot(snapshot, error);
+    semantic_digest = history_semantic_digest(snapshot);
+    filtered = history_snapshot(snapshot, &degraded, error);
     if (filtered == NULL)
         return MUX_CLIPBOARD_HISTORY_IGNORED;
 
     for (link = history->entries.head; link != NULL; link = link->next) {
         entry = link->data;
-        if (!snapshots_equal(entry->snapshot, filtered))
+        if (!g_str_equal(entry->semantic_digest, semantic_digest) ||
+            !snapshots_equal(entry->snapshot, filtered))
             continue;
 
         entry->created_us = created_us > 0
@@ -270,7 +436,8 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
         if (entry_id != NULL)
             *entry_id = entry->id;
         mux_clipboard_snapshot_unref(filtered);
-        return MUX_CLIPBOARD_HISTORY_DEDUPLICATED;
+        return degraded ? MUX_CLIPBOARD_HISTORY_DEGRADED
+                        : MUX_CLIPBOARD_HISTORY_DEDUPLICATED;
     }
 
     bytes = mux_clipboard_snapshot_get_total_bytes(filtered);
@@ -287,14 +454,18 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
                             ? created_us
                             : g_get_monotonic_time();
     entry->profile = g_strdup(history->profile);
+    entry->storage_namespace =
+        g_strdup(history->storage_namespace);
     entry->source_origin = g_strdup(source_origin);
     entry->source_view_id = source_view_id;
     entry->snapshot = filtered;
+    entry->semantic_digest = g_steal_pointer(&semantic_digest);
     g_queue_push_head(&history->entries, entry);
     history->total_bytes += bytes;
     if (entry_id != NULL)
         *entry_id = entry->id;
-    return MUX_CLIPBOARD_HISTORY_ADDED;
+    return degraded ? MUX_CLIPBOARD_HISTORY_DEGRADED
+                    : MUX_CLIPBOARD_HISTORY_ADDED;
 }
 
 guint
@@ -324,6 +495,22 @@ mux_clipboard_history_get_mode(const MuxClipboardHistory *history)
     g_return_val_if_fail(history != NULL,
                          MUX_CLIPBOARD_HISTORY_DISABLED);
     return history->mode;
+}
+
+MuxClipboardHistoryScope
+mux_clipboard_history_get_scope(const MuxClipboardHistory *history)
+{
+    g_return_val_if_fail(history != NULL,
+                         MUX_CLIPBOARD_HISTORY_SCOPE_EPHEMERAL);
+    return history->scope;
+}
+
+const gchar *
+mux_clipboard_history_get_namespace(
+    const MuxClipboardHistory *history)
+{
+    g_return_val_if_fail(history != NULL, NULL);
+    return history->storage_namespace;
 }
 
 const MuxClipboardHistoryEntry *
@@ -468,6 +655,14 @@ mux_clipboard_history_entry_get_profile(
 {
     g_return_val_if_fail(entry != NULL, NULL);
     return entry->profile;
+}
+
+const gchar *
+mux_clipboard_history_entry_get_namespace(
+    const MuxClipboardHistoryEntry *entry)
+{
+    g_return_val_if_fail(entry != NULL, NULL);
+    return entry->storage_namespace;
 }
 
 const gchar *

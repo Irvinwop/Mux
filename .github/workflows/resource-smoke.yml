@@ -1,0 +1,80 @@
+name: Resource qualification
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resource-smoke:
+    name: Headless resource budgets
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: archlinux:base-devel
+      options: >-
+        --privileged
+        --userns=host
+        --security-opt seccomp=unconfined
+        --shm-size=2g
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install build and fixture dependencies
+        run: >-
+          pacman -Syu --needed --noconfirm
+          base-devel
+          dbus
+          git
+          glib2
+          kitty
+          mesa
+          meson
+          ninja
+          noto-fonts
+          pkgconf
+          procps-ng
+          python
+          weston
+          wpewebkit
+
+      - name: Build release binaries once
+        run: |
+          meson setup --buildtype=release --werror build/resource-smoke spikes/wpe-kitty
+          meson compile -C build/resource-smoke
+
+      - name: Enforce resource budgets
+        env:
+          CI: "true"
+          MUX_RESOURCE_ALLOW_ROOT_CI: "1"
+          MUX_BIN_DIR: ${{ github.workspace }}/build/resource-smoke
+          MUX_RESOURCE_ARTIFACT_DIR: ${{ github.workspace }}/resource-smoke-artifacts
+          MUX_RESOURCE_ACTIVE_SECONDS: "15"
+          MUX_RESOURCE_IDLE_SECONDS: "20"
+          MUX_RESOURCE_IDLE_CPU_PCT: "25"
+          MUX_RESOURCE_ACTIVE_CPU_PCT: "425"
+          MUX_RESOURCE_MAX_RSS_MIB: "1800"
+          MUX_RESOURCE_MAX_PSS_MIB: "1280"
+          MUX_RESOURCE_MAX_PROCESSES: "48"
+          MUX_RESOURCE_MAX_SHM_PEAK_MIB: "64"
+          MUX_RESOURCE_MAX_SHM_LEAK_BYTES: "0"
+          MUX_RESOURCE_MAX_SHM_LEAK_ENTRIES: "0"
+          MUX_RESOURCE_MIN_ACTIVE_ACKS: "10"
+          MUX_RESOURCE_MAX_HIDDEN_ACKS: "1"
+          MUX_RESOURCE_GRACEFUL_CLEANUP_SECONDS: "10"
+          MUX_RESOURCE_PROCESS_CLEANUP_SECONDS: "10"
+        run: ./resource-smoke
+
+      - name: Upload resource diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: resource-smoke-artifacts
+          if-no-files-found: error
+          retention-days: 7

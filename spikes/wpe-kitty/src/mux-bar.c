@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "mux-protocol.h"
+#include "mux-shortcuts.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -34,7 +35,10 @@ typedef struct {
     gboolean replace_on_type;
     guint columns;
     guint rows;
+    gboolean saw_view;
 } Bar;
+
+#define BAR_STARTUP_TIMEOUT_MS 10000
 
 static volatile sig_atomic_t stop_requested;
 static Bar *global_bar;
@@ -79,13 +83,23 @@ static gchar *display_text(const gchar *text)
     for (const gchar *cursor = valid; *cursor;
          cursor = g_utf8_next_char(cursor)) {
         gunichar codepoint = g_utf8_get_char(cursor);
+        GUnicodeType type = g_unichar_type(codepoint);
 
-        if (g_unichar_iscntrl(codepoint) ||
-            g_unichar_type(codepoint) == G_UNICODE_FORMAT)
+        if (!g_unichar_isprint(codepoint) ||
+            type == G_UNICODE_FORMAT ||
+            type == G_UNICODE_LINE_SEPARATOR ||
+            type == G_UNICODE_PARAGRAPH_SEPARATOR)
             continue;
         g_string_append_unichar(clean, codepoint);
     }
     return g_string_free(clean, FALSE);
+}
+
+static guint codepoint_columns(gunichar codepoint)
+{
+    if (g_unichar_combining_class(codepoint) != 0)
+        return 0;
+    return g_unichar_iswide(codepoint) ? 2 : 1;
 }
 
 static BarView *active_view(Bar *bar)
@@ -95,7 +109,18 @@ static BarView *active_view(Bar *bar)
         : NULL;
 }
 
-static void append_padded(
+static void select_fallback_view(Bar *bar)
+{
+    GHashTableIter iterator;
+    gpointer key;
+
+    g_clear_pointer(&bar->active_id, g_free);
+    g_hash_table_iter_init(&iterator, bar->views);
+    if (g_hash_table_iter_next(&iterator, &key, NULL))
+        bar->active_id = g_strdup(key);
+}
+
+static guint append_padded(
     GString *output,
     const gchar *prefix,
     const gchar *value,
@@ -105,11 +130,20 @@ static void append_padded(
     guint used = 0;
     for (const gchar *cursor = prefix; *cursor && used < columns; cursor++, used++)
         g_string_append_c(output, *cursor);
-    for (const gchar *cursor = clean; *cursor && used < columns; cursor++, used++)
-        g_string_append_c(output, *cursor);
+    for (const gchar *cursor = clean; *cursor;) {
+        gunichar codepoint = g_utf8_get_char(cursor);
+        guint width = codepoint_columns(codepoint);
+        if (width > columns - used)
+            break;
+        g_string_append_unichar(output, codepoint);
+        used += width;
+        cursor = g_utf8_next_char(cursor);
+    }
+    guint content_columns = used;
     while (used++ < columns)
         g_string_append_c(output, ' ');
     g_free(clean);
+    return content_columns;
 }
 
 static void redraw(Bar *bar)
@@ -121,11 +155,16 @@ static void redraw(Bar *bar)
 
     BarView *view = active_view(bar);
     const gchar *uri = view && view->uri ? view->uri : "no active view";
+    const gchar *title = view && view->title && *view->title
+        ? view->title
+        : "No active page";
     gchar *header = g_strdup_printf(
-        " MUX / %s  [%u view%s]",
+        " MUX/%s [%u]  Super-L:url  Super-W:close  Super-Shift-P:cmd  Super-Shift-V:clip | %s",
         bar->layer ? bar->layer : "main",
         g_hash_table_size(bar->views),
-        g_hash_table_size(bar->views) == 1 ? "" : "s");
+        title);
+    guint edit_columns = 0;
+    guint rendered_rows = 1;
 
     GString *output = g_string_new(
         "\033[H\033[48;2;8;22;19m\033[38;2;133;220;170m");
@@ -134,17 +173,39 @@ static void redraw(Bar *bar)
         g_string_append(
             output,
             "\r\n\033[48;2;17;34;29m\033[38;2;222;246;232m");
-        append_padded(
+        edit_columns = append_padded(
             output,
-            bar->editing ? " > " : "   ",
+            bar->editing ? " URL> " : " URL  ",
             bar->editing ? bar->edit->str : uri,
             bar->columns);
+        rendered_rows = 2;
     }
-    for (guint row = 2; row < bar->rows; row++) {
+    if (bar->rows > 2) {
+        g_string_append(
+            output,
+            "\r\n\033[48;2;8;22;19m\033[38;2;154;179;168m");
+        append_padded(
+            output,
+            " ",
+            "Super-D bookmark  Super-Shift-Enter right  Super-Alt-Enter down  Super-Shift-T layer  Alt-HJKL pane",
+            bar->columns);
+        rendered_rows = 3;
+    }
+    for (guint row = rendered_rows; row < bar->rows; row++) {
         g_string_append(output, "\r\n");
         append_padded(output, "", "", bar->columns);
     }
-    g_string_append(output, bar->editing ? "\033[?25h" : "\033[?25l");
+    if (bar->editing && bar->rows > 1) {
+        guint cursor_column = edit_columns < bar->columns
+            ? edit_columns + 1
+            : bar->columns;
+        g_string_append_printf(
+            output,
+            "\033[2;%uH\033[?25h",
+            cursor_column);
+    } else {
+        g_string_append(output, "\033[?25l");
+    }
     output_text(output->str);
 
     g_string_free(output, TRUE);
@@ -160,7 +221,8 @@ static gboolean terminal_enable(Bar *bar)
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) < 0)
         return FALSE;
     bar->terminal_active = TRUE;
-    output_text("\033[?1049h\033[2J\033[H\033[?25l\033[>31u");
+    output_text("\033[?1049h\033[2J\033[H\033[?25l"
+                "\033]2;MUX-BAR\033\\\033[>31u");
     return TRUE;
 }
 
@@ -250,14 +312,33 @@ static void handle_key(
     guint event_type,
     const gchar *text)
 {
-    if (event_type == 3)
-        return;
-    guint modifiers = encoded_modifiers ? encoded_modifiers - 1 : 0;
+    guint modifiers =
+        mux_shortcut_modifiers_from_kitty(encoded_modifiers);
+    MuxShortcut pane_shortcut =
+        mux_shortcut_match_pane(modifiers, key);
+    MuxShortcut shortcut = mux_shortcut_match_bar(modifiers, key);
 
-    if ((modifiers & 4) && key == 'l') {
-        begin_edit(bar);
+    if (mux_shortcut_key_is_kitty_functional(key))
+        return;
+    if (pane_shortcut == MUX_SHORTCUT_CLOSE) {
+        if (event_type == MUX_SHORTCUT_EVENT_PRESS)
+            mux_send_line(bar->daemon_fd, "CLOSE");
         return;
     }
+    if (shortcut != MUX_SHORTCUT_NONE) {
+        if (event_type == MUX_SHORTCUT_EVENT_PRESS) {
+            if (shortcut == MUX_SHORTCUT_LOCATION)
+                begin_edit(bar);
+            else if (shortcut == MUX_SHORTCUT_BAR_CLEAR && bar->editing) {
+                g_string_truncate(bar->edit, 0);
+                bar->replace_on_type = FALSE;
+                redraw(bar);
+            }
+        }
+        return;
+    }
+    if (event_type == MUX_SHORTCUT_EVENT_RELEASE)
+        return;
     if (!bar->editing)
         return;
     if (key == 13) {
@@ -272,13 +353,10 @@ static void handle_key(
         backspace(bar);
         return;
     }
-    if ((modifiers & 4) && key == 'u') {
-        g_string_truncate(bar->edit, 0);
-        bar->replace_on_type = FALSE;
-        redraw(bar);
-        return;
-    }
-    if (!(modifiers & 4) && text && *text) {
+    if (!(modifiers & (MUX_SHORTCUT_MODIFIER_CONTROL |
+                       MUX_SHORTCUT_MODIFIER_ALT |
+                       MUX_SHORTCUT_MODIFIER_META)) &&
+        text && *text) {
         gchar **codepoints = g_strsplit(text, ":", -1);
         for (guint i = 0; codepoints[i]; i++)
             append_codepoint(bar, parse_uint(codepoints[i], 0));
@@ -363,6 +441,7 @@ static void upsert_view(
         view = g_new0(BarView, 1);
         g_hash_table_insert(bar->views, g_strdup(id), view);
     }
+    bar->saw_view = TRUE;
     g_free(view->layer);
     g_free(view->uri);
     g_free(view->title);
@@ -379,9 +458,7 @@ static void handle_daemon_line(Bar *bar, const gchar *line)
 
     if (count >= 4 && g_strcmp0(fields[0], "BEGIN") == 0) {
         g_free(bar->active_id);
-        g_free(bar->layer);
         bar->active_id = mux_decode(fields[2]);
-        bar->layer = mux_decode(fields[3]);
     } else if (count >= 8 && g_strcmp0(fields[0], "VIEW") == 0) {
         upsert_view(bar, fields[1], fields[2], fields[3], fields[4]);
     } else if (count >= 10 && g_strcmp0(fields[0], "EVENT") == 0 &&
@@ -391,15 +468,22 @@ static void handle_daemon_line(Bar *bar, const gchar *line)
                g_strcmp0(fields[2], "REMOVE") == 0) {
         gchar *id = mux_decode(fields[3]);
         g_hash_table_remove(bar->views, id);
+        if (g_strcmp0(bar->active_id, id) == 0)
+            select_fallback_view(bar);
         g_free(id);
+        if (bar->saw_view && g_hash_table_size(bar->views) == 0)
+            stop_requested = 1;
     } else if (count >= 4 && g_strcmp0(fields[0], "EVENT") == 0 &&
                g_strcmp0(fields[2], "ACTIVE") == 0) {
-        g_free(bar->active_id);
-        bar->active_id = mux_decode(fields[3]);
-    } else if (count >= 4 && g_strcmp0(fields[0], "EVENT") == 0 &&
-               g_strcmp0(fields[2], "LAYER") == 0) {
-        g_free(bar->layer);
-        bar->layer = mux_decode(fields[3]);
+        g_autofree gchar *candidate = mux_decode(fields[3]);
+
+        if (!candidate || !*candidate ||
+            g_hash_table_contains(bar->views, candidate)) {
+            g_free(bar->active_id);
+            bar->active_id = g_steal_pointer(&candidate);
+        } else {
+            select_fallback_view(bar);
+        }
     } else if (count >= 2 && g_strcmp0(fields[0], "DO") == 0 &&
                g_strcmp0(fields[1], "EDIT") == 0) {
         begin_edit(bar);
@@ -437,14 +521,19 @@ static gboolean register_bar(Bar *bar)
     gchar *window = mux_encode(g_getenv("KITTY_WINDOW_ID"));
     gchar *socket = mux_encode(g_getenv("KITTY_LISTEN_ON"));
     gchar *layer = mux_encode(g_getenv("MUX_LAYER"));
+    gchar *profile = mux_encode(g_getenv("MUX_PROFILE")
+                                    ? g_getenv("MUX_PROFILE")
+                                    : "default");
     gboolean result = mux_send_line(
         bar->daemon_fd,
-        "BAR\t%s\t%ld\t%s\t%s\t%s",
+        "BAR\t%s\t%ld\t%s\t%s\t%s\t%s",
         id,
         (long)getpid(),
         window,
         socket,
-        layer);
+        layer,
+        profile);
+    g_free(profile);
     g_free(layer);
     g_free(socket);
     g_free(window);
@@ -464,6 +553,8 @@ int main(void)
         .edit = g_string_new(NULL),
     };
     global_bar = &bar;
+    gint64 startup_deadline_us = g_get_monotonic_time() +
+        (gint64)BAR_STARTUP_TIMEOUT_MS * 1000;
     atexit(restore_at_exit);
     signal(SIGINT, stop_signal);
     signal(SIGTERM, stop_signal);
@@ -495,9 +586,21 @@ int main(void)
             { .fd = STDIN_FILENO, .events = POLLIN },
         };
         int result;
+        gint timeout_ms = -1;
+
+        if (!bar.saw_view) {
+            gint64 remaining_us = startup_deadline_us - g_get_monotonic_time();
+
+            timeout_ms = remaining_us <= 0
+                ? 0
+                : (gint)MIN((remaining_us + 999) / 1000,
+                            (gint64)G_MAXINT);
+        }
         do {
-            result = poll(poll_fds, 2, -1);
+            result = poll(poll_fds, 2, timeout_ms);
         } while (result < 0 && errno == EINTR && !stop_requested);
+        if (result == 0 && !bar.saw_view)
+            break;
         if (result <= 0)
             continue;
 

@@ -1,0 +1,1393 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+readonly SCRIPT_PATH
+REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
+readonly REPO_ROOT
+
+die() {
+    printf 'resource-smoke: %s\n' "$*" >&2
+    exit 1
+}
+
+[[ $(uname -s) == Linux ]] || die "Linux is required"
+
+if (( EUID == 0 )); then
+    if [[ ${CI:-} != true || ${MUX_RESOURCE_ALLOW_ROOT_CI:-0} != 1 ]]; then
+        die "do not run as root; CI may opt in with CI=true MUX_RESOURCE_ALLOW_ROOT_CI=1"
+    fi
+fi
+
+for command in dbus-run-session sha256sum timeout; do
+    command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
+done
+
+if [[ -n ${MUX_BIN_DIR:-} ]]; then
+    [[ -d $MUX_BIN_DIR ]] || die "MUX_BIN_DIR is not a directory: $MUX_BIN_DIR"
+    MUX_BIN_DIR=$(CDPATH='' cd -- "$MUX_BIN_DIR" && pwd -P)
+else
+    host_cache=${XDG_CACHE_HOME:-${HOME:?HOME is not set}/.cache}
+    repo_key=$(printf '%s' "$REPO_ROOT" | sha256sum)
+    repo_key=${repo_key%% *}
+    MUX_BIN_DIR="$host_cache/mux/checkouts/$repo_key/wpe-kitty"
+fi
+export MUX_BIN_DIR
+
+timeout_seconds=${MUX_RESOURCE_TIMEOUT_SECONDS:-180}
+active_seconds=${MUX_RESOURCE_ACTIVE_SECONDS:-15}
+idle_seconds=${MUX_RESOURCE_IDLE_SECONDS:-20}
+active_warmup_seconds=${MUX_RESOURCE_ACTIVE_WARMUP_SECONDS:-4}
+idle_settle_seconds=${MUX_RESOURCE_IDLE_SETTLE_SECONDS:-4}
+idle_cpu_budget=${MUX_RESOURCE_IDLE_CPU_PCT:-25}
+case $(uname -m) in
+    x86_64|amd64) default_active_cpu_budget=425 ;;
+    *) default_active_cpu_budget=220 ;;
+esac
+active_cpu_budget=${MUX_RESOURCE_ACTIVE_CPU_PCT:-$default_active_cpu_budget}
+rss_budget_mib=${MUX_RESOURCE_MAX_RSS_MIB:-1800}
+pss_budget_mib=${MUX_RESOURCE_MAX_PSS_MIB:-1280}
+process_budget=${MUX_RESOURCE_MAX_PROCESSES:-48}
+shm_peak_budget_mib=${MUX_RESOURCE_MAX_SHM_PEAK_MIB:-64}
+shm_leak_budget_bytes=${MUX_RESOURCE_MAX_SHM_LEAK_BYTES:-0}
+shm_leak_budget_entries=${MUX_RESOURCE_MAX_SHM_LEAK_ENTRIES:-0}
+minimum_active_acks=${MUX_RESOURCE_MIN_ACTIVE_ACKS:-10}
+maximum_hidden_acks=${MUX_RESOURCE_MAX_HIDDEN_ACKS:-1}
+graceful_cleanup_budget=${MUX_RESOURCE_GRACEFUL_CLEANUP_SECONDS:-10}
+process_cleanup_budget=${MUX_RESOURCE_PROCESS_CLEANUP_SECONDS:-10}
+keep_artifacts=${MUX_RESOURCE_KEEP_ARTIFACTS:-0}
+
+require_integer() {
+    local name=$1 value=$2 minimum=$3 maximum=$4
+    [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
+    (( value >= minimum && value <= maximum )) ||
+        die "$name must be between $minimum and $maximum"
+}
+
+require_integer MUX_RESOURCE_TIMEOUT_SECONDS "$timeout_seconds" 60 900
+require_integer MUX_RESOURCE_ACTIVE_SECONDS "$active_seconds" 5 120
+require_integer MUX_RESOURCE_IDLE_SECONDS "$idle_seconds" 5 120
+require_integer MUX_RESOURCE_ACTIVE_WARMUP_SECONDS "$active_warmup_seconds" 1 30
+require_integer MUX_RESOURCE_IDLE_SETTLE_SECONDS "$idle_settle_seconds" 1 30
+require_integer MUX_RESOURCE_IDLE_CPU_PCT "$idle_cpu_budget" 1 1000
+require_integer MUX_RESOURCE_ACTIVE_CPU_PCT "$active_cpu_budget" 1 1000
+require_integer MUX_RESOURCE_MAX_RSS_MIB "$rss_budget_mib" 64 16384
+require_integer MUX_RESOURCE_MAX_PSS_MIB "$pss_budget_mib" 64 16384
+require_integer MUX_RESOURCE_MAX_PROCESSES "$process_budget" 1 512
+require_integer MUX_RESOURCE_MAX_SHM_PEAK_MIB "$shm_peak_budget_mib" 1 4096
+require_integer MUX_RESOURCE_MAX_SHM_LEAK_BYTES "$shm_leak_budget_bytes" 0 1073741824
+require_integer MUX_RESOURCE_MAX_SHM_LEAK_ENTRIES "$shm_leak_budget_entries" 0 1024
+require_integer MUX_RESOURCE_MIN_ACTIVE_ACKS "$minimum_active_acks" 1 100000
+require_integer MUX_RESOURCE_MAX_HIDDEN_ACKS "$maximum_hidden_acks" 0 1000
+require_integer MUX_RESOURCE_GRACEFUL_CLEANUP_SECONDS "$graceful_cleanup_budget" 1 60
+require_integer MUX_RESOURCE_PROCESS_CLEANUP_SECONDS "$process_cleanup_budget" 1 60
+require_integer MUX_RESOURCE_KEEP_ARTIFACTS "$keep_artifacts" 0 1
+
+if [[ ${1:-} != --resource-smoke-inner ]]; then
+    (( $# == 0 )) || die "usage: ./resource-smoke"
+    if [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]]; then
+        exec timeout --foreground --signal=TERM --kill-after=10s \
+            "${timeout_seconds}s" "$SCRIPT_PATH" --resource-smoke-inner
+    fi
+    exec timeout --foreground --signal=TERM --kill-after=10s \
+        "${timeout_seconds}s" dbus-run-session -- \
+        "$SCRIPT_PATH" --resource-smoke-inner
+fi
+shift
+(( $# == 0 )) || die "unexpected internal arguments"
+
+required_commands=(
+    awk basename cat chmod cp date dbus-run-session env grep id install kitty
+    kitten kill mkdir mktemp pgrep pkg-config python3 rm sed sha256sum sleep
+    stat tail timeout tr uname weston
+)
+for command in "${required_commands[@]}"; do
+    command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
+done
+
+kitty_version_output=$(LC_ALL=C kitty --version 2>/dev/null) ||
+    die "kitty --version failed; Kitty 0.45 or newer is required"
+if [[ $kitty_version_output =~ ^kitty[[:space:]]+([0-9]+)\.([0-9]+)(\.[0-9]+)?([[:space:]]|$) ]]; then
+    kitty_major=${BASH_REMATCH[1]}
+    kitty_minor=${BASH_REMATCH[2]}
+else
+    die "could not parse Kitty version: $kitty_version_output"
+fi
+if (( kitty_major == 0 && kitty_minor < 45 )); then
+    die "Kitty 0.45 or newer is required; found $kitty_version_output"
+fi
+
+pkg-config --atleast-version=2.52.5 wpe-webkit-2.0 ||
+    die "wpe-webkit-2.0 2.52.5 or newer is required"
+pkg-config --atleast-version=2.52.5 wpe-platform-2.0 ||
+    die "wpe-platform-2.0 2.52.5 or newer is required"
+weston --version >/dev/null 2>&1 || die "weston --version failed"
+python3 --version >/dev/null 2>&1 || die "python3 --version failed"
+[[ -r /proc/$$/stat ]] || die "/proc process statistics must be readable"
+[[ -d /dev/shm && -w /dev/shm ]] || die "/dev/shm must exist and be writable"
+if [[ ${WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS+x} ]]; then
+    die "refusing to run with WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS set"
+fi
+
+readonly BIN_DIR=$MUX_BIN_DIR
+for executable in muxd muxctl mux-engine mux-layer mux-pane mux-bar; do
+    [[ -x "$BIN_DIR/$executable" ]] || die "missing executable: $BIN_DIR/$executable"
+done
+
+BASE=
+LOG_DIR=
+REPORT_DIR=
+PROBE=
+SHM_BASELINE=
+TRACKED_PROCESSES=
+KITTY_SOCKET=
+KITTY_LISTEN_ON=
+KITTY_PUBLIC_KEY_VALUE=
+SNAPSHOT=
+FRAME_ACK_TELEMETRY=
+ROOT_PIDS=
+MUXD_PID=0
+ENGINE_PID=0
+WESTON_PID=0
+HTTP_PID=0
+KITTY_PID=0
+BOOT_PANE_PID=0
+ALT_PANE_PID=0
+BAR_PID=0
+TEARDOWN_DONE=0
+ARTIFACTS_PUBLISHED=0
+ACTIVE_ACK_DELTA=0
+HIDDEN_ACK_DELTA=0
+GRACEFUL_CLEANUP_ELAPSED=unmeasured
+PROCESS_CLEANUP_ELAPSED=unmeasured
+declare -a CHILD_PIDS=()
+declare -a CHILD_LABELS=()
+declare -a KITTY_WINDOW_IDS=()
+declare -a QUALIFICATION_FAILURES=()
+
+pid_alive() {
+    local pid=$1
+    (( pid > 0 )) && kill -0 "$pid" 2>/dev/null
+}
+
+track_child() {
+    CHILD_PIDS+=("$1")
+    CHILD_LABELS+=("$2")
+}
+
+record_failure() {
+    QUALIFICATION_FAILURES+=("$*")
+    printf 'resource-smoke: QUALIFICATION FAILURE: %s\n' "$*" >&2
+}
+
+pid_env_value() {
+    local pid=$1 key=$2 entry
+    [[ -r /proc/$pid/environ ]] || return 1
+    while IFS= read -r -d '' entry; do
+        case $entry in
+            "$key="*)
+                printf '%s\n' "${entry#*=}"
+                return 0
+                ;;
+        esac
+    done <"/proc/$pid/environ"
+    return 1
+}
+
+marked_pid() {
+    local process_name=$1 excluded_pid=${2:-} pid marker
+    while IFS= read -r pid; do
+        [[ -n $pid && $pid != "$excluded_pid" ]] || continue
+        marker=$(pid_env_value "$pid" MUX_SMOKE_ID 2>/dev/null || true)
+        if [[ $marker == "$MUX_SMOKE_ID" ]]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done < <(pgrep -u "$(id -u)" -x "$process_name" 2>/dev/null || true)
+    return 1
+}
+
+publish_artifacts() {
+    local destination=${MUX_RESOURCE_ARTIFACT_DIR:-}
+    (( ARTIFACTS_PUBLISHED == 0 )) || return 0
+    ARTIFACTS_PUBLISHED=1
+    [[ -n $destination && -n ${BASE:-} && -d $BASE ]] || return 0
+    install -d -m 700 "$destination/log" "$destination/report"
+    cp -R "$LOG_DIR"/. "$destination/log/" 2>/dev/null || true
+    cp -R "$REPORT_DIR"/. "$destination/report/" 2>/dev/null || true
+    printf 'resource-smoke: artifacts copied to %s\n' "$destination"
+}
+
+dump_failure() {
+    local path
+    printf '\nresource-smoke: failure diagnostics\n' >&2
+    if [[ -x $BIN_DIR/muxctl ]]; then
+        printf '\n--- muxctl status ---\n' >&2
+        timeout 2s "$BIN_DIR/muxctl" status >&2 2>&1 || true
+        printf '\n--- muxctl list ---\n' >&2
+        timeout 2s "$BIN_DIR/muxctl" list >&2 2>&1 || true
+    fi
+    if [[ -d ${REPORT_DIR:-/nonexistent} ]]; then
+        for path in "$REPORT_DIR"/*; do
+            [[ -f $path ]] || continue
+            printf '\n--- report/%s ---\n' "$(basename -- "$path")" >&2
+            cat "$path" >&2 2>&1 || true
+        done
+    fi
+    if [[ -d ${LOG_DIR:-/nonexistent} ]]; then
+        for path in "$LOG_DIR"/*.log; do
+            [[ -f $path ]] || continue
+            printf '\n--- log/%s (last 120 lines) ---\n' "$(basename -- "$path")" >&2
+            tail -n 120 "$path" >&2 2>&1 || true
+        done
+    fi
+}
+
+best_effort_teardown() {
+    local pid index
+    (( TEARDOWN_DONE == 0 )) || return 0
+    TEARDOWN_DONE=1
+    for (( index=${#CHILD_PIDS[@]} - 1; index >= 0; index-- )); do
+        pid=${CHILD_PIDS[index]}
+        pid_alive "$pid" && kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 0.5
+    for pid in "${CHILD_PIDS[@]}"; do
+        pid_alive "$pid" && kill -KILL "$pid" 2>/dev/null || true
+    done
+    for pid in "${CHILD_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM
+    if (( rc != 0 )); then
+        dump_failure || true
+    fi
+    best_effort_teardown || true
+    publish_artifacts || true
+    if [[ -n ${BASE:-} && -d $BASE ]]; then
+        if (( keep_artifacts == 1 )); then
+            printf 'resource-smoke: temporary artifacts retained at %s\n' "$BASE" >&2
+        else
+            rm -rf -- "$BASE"
+        fi
+    fi
+    exit "$rc"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+fail() {
+    printf 'resource-smoke: FAIL: %s\n' "$*" >&2
+    exit 1
+}
+
+wait_socket() {
+    local path=$1 pid=$2 label=$3 attempt
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        [[ -S $path ]] && return 0
+        pid_alive "$pid" || fail "$label exited before creating $path"
+        sleep 0.05
+    done
+    fail "$label did not create $path within 10 seconds"
+}
+
+assert_core_alive() {
+    pid_alive "$WESTON_PID" || fail "Weston exited"
+    pid_alive "$HTTP_PID" || fail "HTTP fixture server exited"
+    pid_alive "$MUXD_PID" || fail "muxd exited"
+    pid_alive "$ENGINE_PID" || fail "mux-engine exited"
+    pid_alive "$KITTY_PID" || fail "Kitty exited"
+}
+
+run_muxctl() {
+    timeout 2s "$BIN_DIR/muxctl" "$@"
+}
+
+view_record() {
+    local listing=$1 view_id=$2
+    awk -v wanted="$view_id" '
+        $1 == "*" && $2 == wanted { print; exit }
+        $1 == wanted { print; exit }
+    ' <<<"$listing"
+}
+
+record_field() {
+    local listing=$1 view_id=$2 field=$3 record
+    record=$(view_record "$listing" "$view_id")
+    awk -v prefix="$field=" '
+        {
+            for (i = 1; i <= NF; i++) {
+                if (index($i, prefix) == 1) {
+                    print substr($i, length(prefix) + 1)
+                    exit
+                }
+            }
+        }
+    ' <<<"$record"
+}
+
+wait_initial_view() {
+    local expected_url=$1 expected_title=$2 attempt listing view_id record
+    for (( attempt=0; attempt < 400; attempt++ )); do
+        listing=$(run_muxctl list 2>/dev/null || true)
+        view_id=$(awk '
+            $1 == "*" && $2 ~ /^(view|transient)-/ { print $2; exit }
+            $1 ~ /^(view|transient)-/ { print $1; exit }
+        ' <<<"$listing")
+        if [[ -n $view_id ]]; then
+            record=$(view_record "$listing" "$view_id")
+            if [[ $record == *"$expected_url"* && $record == *"$expected_title"* ]]; then
+                printf '%s\n' "$view_id"
+                return 0
+            fi
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "initial JavaScript title was not observed within 20 seconds"
+}
+
+wait_new_view() {
+    local old_view=$1 attempt listing new_view
+    for (( attempt=0; attempt < 400; attempt++ )); do
+        listing=$(run_muxctl list 2>/dev/null || true)
+        new_view=$(awk -v old="$old_view" '
+            {
+                candidate = ""
+                if ($1 == "*" && $2 ~ /^(view|transient)-/) candidate = $2
+                else if ($1 ~ /^(view|transient)-/) candidate = $1
+                if (candidate != "" && candidate != old) {
+                    print candidate
+                    exit
+                }
+            }
+        ' <<<"$listing")
+        if [[ -n $new_view ]]; then
+            printf '%s\n' "$new_view"
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "second Kitty layer did not register a view within 20 seconds"
+}
+
+wait_title() {
+    local view_id=$1 expected_url=$2 expected_title=$3 attempt listing record
+    for (( attempt=0; attempt < 400; attempt++ )); do
+        listing=$(run_muxctl list 2>/dev/null || true)
+        record=$(view_record "$listing" "$view_id")
+        if [[ $record == *"$expected_url"* && $record == *"$expected_title"* ]]; then
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "title $expected_title was not observed for $view_id within 20 seconds"
+}
+
+wait_active_view() {
+    local expected_view=$1 attempt listing
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        listing=$(run_muxctl list 2>/dev/null || true)
+        if awk -v wanted="$expected_view" '
+            $1 == "*" && $2 == wanted { found = 1 }
+            END { exit found ? 0 : 1 }
+        ' <<<"$listing"; then
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "$expected_view did not become the active Kitty view within 10 seconds"
+}
+
+wait_layer() {
+    local expected_layer=$1 expected_view=$2 attempt status listing
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        status=$(run_muxctl status 2>/dev/null || true)
+        listing=$(run_muxctl list 2>/dev/null || true)
+        if [[ $status =~ (^|[[:space:]])layer=$expected_layer($|[[:space:]]) ]] &&
+            awk -v wanted="$expected_view" '
+                $1 == "*" && $2 == wanted { found = 1 }
+                END { exit found ? 0 : 1 }
+            ' <<<"$listing"; then
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "layer $expected_layer did not focus $expected_view within 10 seconds"
+}
+
+wait_view_closed() {
+    local view_id=$1 pane_pid=$2 attempt listing
+    for (( attempt=0; attempt < 100; attempt++ )); do
+        listing=$(run_muxctl list 2>/dev/null || true)
+        if [[ -z $(view_record "$listing" "$view_id") ]] && ! pid_alive "$pane_pid"; then
+            return 0
+        fi
+        pid_alive "$ENGINE_PID" || fail "mux-engine exited while closing $view_id"
+        pid_alive "$MUXD_PID" || fail "muxd exited while closing $view_id"
+        sleep 0.05
+    done
+    fail "graceful close did not remove $view_id within 5 seconds"
+}
+
+kitty_rc() {
+    timeout 5s env KITTY_PUBLIC_KEY="$KITTY_PUBLIC_KEY_VALUE" \
+        kitten @ --to "$KITTY_LISTEN_ON" --use-password=always "$@"
+}
+
+frame_view_number() {
+    local view_id=$1
+    [[ $view_id =~ ([0-9]+)$ ]] || fail "cannot derive telemetry view number from $view_id"
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+frame_ack_count() {
+    local view_number=$1
+    awk -F '\t' -v expected="view=$view_number" '
+        $1 == "KITTY_FRAME_ACK" && $2 == expected { count++ }
+        END { print count + 0 }
+    ' "$FRAME_ACK_TELEMETRY"
+}
+
+wait_frame_growth() {
+    local view_number=$1 initial attempt current
+    initial=$(frame_ack_count "$view_number")
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        current=$(frame_ack_count "$view_number")
+        (( current > initial )) && return 0
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "visible view $view_number did not acknowledge a frame within 10 seconds"
+}
+
+elapsed_seconds() {
+    local start_ns=$1 end_ns=$2
+    awk -v start="$start_ns" -v end="$end_ns" \
+        'BEGIN { printf "%.3f", (end - start) / 1000000000 }'
+}
+
+float_exceeds() {
+    local actual=$1 budget=$2
+    awk -v actual="$actual" -v budget="$budget" \
+        'BEGIN { exit actual > budget ? 0 : 1 }'
+}
+
+umask 077
+BASE=$(mktemp -d "${TMPDIR:-/tmp}/mux-resource-smoke.XXXXXX")
+chmod 700 "$BASE"
+LOG_DIR="$BASE/log"
+REPORT_DIR="$BASE/report"
+PROBE="$BASE/resource_probe.py"
+SHM_BASELINE="$REPORT_DIR/shm-baseline.json"
+TRACKED_PROCESSES="$REPORT_DIR/tracked-processes.tsv"
+
+install -d -m 700 "$LOG_DIR" "$REPORT_DIR"
+: >"$TRACKED_PROCESSES"
+
+cat >"$PROBE" <<'PY'
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+def parse_roots(value):
+    return [int(item) for item in value.split(",") if item]
+
+
+def read_stat(pid):
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    left = text.find("(")
+    right = text.rfind(")")
+    if left < 0 or right < left:
+        return None
+    fields = text[right + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return {
+            "pid": pid,
+            "comm": text[left + 1 : right],
+            "state": fields[0],
+            "ppid": int(fields[1]),
+            "ticks": int(fields[11]) + int(fields[12]),
+            "starttime": int(fields[19]),
+        }
+    except ValueError:
+        return None
+
+
+def read_cmdline(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return ""
+    return " ".join(part.decode("utf-8", "replace") for part in raw.split(b"\0") if part)[:320]
+
+
+def scan_proc():
+    records = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        record = read_stat(int(entry.name))
+        if record is not None:
+            records[record["pid"]] = record
+    return records
+
+
+def load_tracked(path):
+    identities = set()
+    try:
+        lines = Path(path).read_text(encoding="ascii").splitlines()
+    except FileNotFoundError:
+        return identities
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        try:
+            identities.add((int(parts[0]), int(parts[1])))
+        except ValueError:
+            continue
+    return identities
+
+
+def scoped_records(roots, tracked_path):
+    records = scan_proc()
+    seeds = {pid for pid in roots if pid in records}
+    for pid, starttime in load_tracked(tracked_path):
+        record = records.get(pid)
+        if record is not None and record["starttime"] == starttime:
+            seeds.add(pid)
+    children = {}
+    for record in records.values():
+        children.setdefault(record["ppid"], []).append(record["pid"])
+    wanted = set()
+    pending = list(seeds)
+    while pending:
+        pid = pending.pop()
+        if pid in wanted or pid not in records:
+            continue
+        wanted.add(pid)
+        pending.extend(children.get(pid, ()))
+    return {pid: records[pid] for pid in wanted}
+
+
+def append_tracked(path, records):
+    known = load_tracked(path)
+    additions = []
+    for record in records.values():
+        identity = (record["pid"], record["starttime"])
+        if identity not in known:
+            known.add(identity)
+            additions.append(record)
+    if additions:
+        with Path(path).open("a", encoding="ascii") as stream:
+            for record in sorted(additions, key=lambda item: item["pid"]):
+                stream.write(f'{record["pid"]}\t{record["starttime"]}\t{record["comm"]}\n')
+
+
+def rss_kib(pid):
+    try:
+        lines = Path(f"/proc/{pid}/status").read_text(encoding="ascii").splitlines()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    for line in lines:
+        if line.startswith("VmRSS:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return 0
+
+
+def pss_kib(pid):
+    try:
+        lines = Path(f"/proc/{pid}/smaps_rollup").read_text(encoding="ascii").splitlines()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return None
+    for line in lines:
+        if line.startswith("Pss:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def shm_snapshot():
+    entries = {}
+    root = Path("/dev/shm")
+    try:
+        paths = list(root.rglob("*"))
+    except (FileNotFoundError, PermissionError, OSError):
+        paths = []
+    for path in paths:
+        try:
+            info = path.lstat()
+            relative = str(path.relative_to(root))
+            entries[relative] = {
+                "inode": info.st_ino,
+                "mode": info.st_mode,
+                "size": info.st_size,
+            }
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+    return entries
+
+
+def added_shm_entries(baseline, current):
+    added = {}
+    for name, info in current.items():
+        original = baseline.get(name)
+        if original is None or original.get("inode") != info.get("inode"):
+            added[name] = info
+    return added
+
+
+def load_shm_baseline(path):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return data["entries"]
+
+
+def write_json(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def cmd_shm_snapshot(args):
+    entries = shm_snapshot()
+    write_json(args.output, {"entries": entries, "total_entries": len(entries)})
+    return 0
+
+
+def cmd_capture(args):
+    records = scoped_records(parse_roots(args.roots), args.tracked)
+    append_tracked(args.tracked, records)
+    for record in sorted(records.values(), key=lambda item: item["pid"]):
+        print(
+            f'{record["pid"]}\t{record["starttime"]}\t{record["ppid"]}\t'
+            f'{record["state"]}\t{record["comm"]}\t{read_cmdline(record["pid"])}'
+        )
+    return 0
+
+
+def live_tracked(tracked_path):
+    live = []
+    records = scan_proc()
+    for pid, starttime in load_tracked(tracked_path):
+        record = records.get(pid)
+        if record is not None and record["starttime"] == starttime and record["state"] != "Z":
+            live.append(record)
+    return sorted(live, key=lambda item: item["pid"])
+
+
+def cmd_clean(args):
+    live = live_tracked(args.tracked)
+    if live and not args.quiet:
+        for record in live:
+            print(
+                f'{record["pid"]}\t{record["starttime"]}\t{record["ppid"]}\t'
+                f'{record["state"]}\t{record["comm"]}\t{read_cmdline(record["pid"])}'
+            )
+    return 1 if live else 0
+
+
+def cmd_signal(args):
+    signum = getattr(signal, f"SIG{args.signal}")
+    failed = False
+    for record in reversed(live_tracked(args.tracked)):
+        try:
+            os.kill(record["pid"], signum)
+        except ProcessLookupError:
+            continue
+        except PermissionError as error:
+            print(f'cannot signal pid {record["pid"]}: {error}', file=sys.stderr)
+            failed = True
+    return 1 if failed else 0
+
+
+def cmd_shm_compare(args):
+    baseline = load_shm_baseline(args.baseline)
+    current = shm_snapshot()
+    added = added_shm_entries(baseline, current)
+    added_bytes = sum(item["size"] for item in added.values())
+    failures = []
+    if len(added) > args.max_entries:
+        failures.append(f"/dev/shm leaked entries {len(added)} > {args.max_entries}")
+    if added_bytes > args.max_bytes:
+        failures.append(f"/dev/shm leaked bytes {added_bytes} > {args.max_bytes}")
+    result = {
+        "added_bytes": added_bytes,
+        "added_entries": added,
+        "added_entry_count": len(added),
+        "budgets": {"max_bytes": args.max_bytes, "max_entries": args.max_entries},
+        "failures": failures,
+    }
+    write_json(args.output, result)
+    print(
+        f"resource-smoke: cleanup shm_leak_entries={len(added)} "
+        f"shm_leak_bytes={added_bytes}"
+    )
+    for failure in failures:
+        print(f"resource-smoke: budget exceeded: {failure}", file=sys.stderr)
+    return 2 if failures else 0
+
+
+def cmd_sample(args):
+    roots = parse_roots(args.roots)
+    baseline_shm = load_shm_baseline(args.baseline_shm)
+    started = time.monotonic()
+    deadline = started + args.duration
+    previous_ticks = {}
+    process_totals = {}
+    total_ticks = 0
+    samples = 0
+    complete_pss_samples = 0
+    peak_rss = 0
+    peak_pss = 0
+    peak_processes = 0
+    peak_shm_entries = 0
+    peak_shm_bytes = 0
+    missing_roots = set()
+
+    def take_sample():
+        nonlocal total_ticks, samples, complete_pss_samples
+        nonlocal peak_rss, peak_pss, peak_processes
+        nonlocal peak_shm_entries, peak_shm_bytes
+
+        records = scoped_records(roots, args.tracked)
+        append_tracked(args.tracked, records)
+        samples += 1
+        for root in roots:
+            record = records.get(root)
+            if record is None or record["state"] == "Z":
+                missing_roots.add(root)
+
+        aggregate_rss = 0
+        aggregate_pss = 0
+        pss_complete = bool(records)
+        for record in records.values():
+            identity = (record["pid"], record["starttime"])
+            previous = previous_ticks.get(identity)
+            delta = 0 if previous is None else max(0, record["ticks"] - previous)
+            previous_ticks[identity] = record["ticks"]
+            total_ticks += delta
+
+            current_rss = rss_kib(record["pid"])
+            current_pss = pss_kib(record["pid"])
+            if current_rss is not None:
+                aggregate_rss += current_rss
+            if current_pss is None:
+                pss_complete = False
+            else:
+                aggregate_pss += current_pss
+
+            item = process_totals.setdefault(
+                identity,
+                {
+                    "pid": record["pid"],
+                    "starttime": record["starttime"],
+                    "comm": record["comm"],
+                    "cmdline": read_cmdline(record["pid"]),
+                    "cpu_ticks": 0,
+                    "peak_rss_kib": 0,
+                    "peak_pss_kib": None,
+                },
+            )
+            item["cpu_ticks"] += delta
+            if current_rss is not None:
+                item["peak_rss_kib"] = max(item["peak_rss_kib"], current_rss)
+            if current_pss is not None:
+                old_pss = item["peak_pss_kib"] or 0
+                item["peak_pss_kib"] = max(old_pss, current_pss)
+
+        peak_rss = max(peak_rss, aggregate_rss)
+        if pss_complete:
+            complete_pss_samples += 1
+            peak_pss = max(peak_pss, aggregate_pss)
+        peak_processes = max(peak_processes, len(records))
+
+        added = added_shm_entries(baseline_shm, shm_snapshot())
+        peak_shm_entries = max(peak_shm_entries, len(added))
+        peak_shm_bytes = max(peak_shm_bytes, sum(item["size"] for item in added.values()))
+
+    take_sample()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(args.interval, remaining))
+        take_sample()
+
+    elapsed = max(time.monotonic() - started, 0.001)
+    cpu_pct = total_ticks / CLK_TCK / elapsed * 100.0
+    failures = []
+    if missing_roots:
+        failures.append("required roots disappeared: " + ",".join(str(pid) for pid in sorted(missing_roots)))
+    if cpu_pct > args.max_cpu_pct:
+        failures.append(f"CPU {cpu_pct:.2f}% > {args.max_cpu_pct:.2f}%")
+    if peak_rss > args.max_rss_mib * 1024:
+        failures.append(f"RSS {peak_rss / 1024:.2f} MiB > {args.max_rss_mib} MiB")
+    if complete_pss_samples and peak_pss > args.max_pss_mib * 1024:
+        failures.append(f"PSS {peak_pss / 1024:.2f} MiB > {args.max_pss_mib} MiB")
+    if peak_processes > args.max_processes:
+        failures.append(f"processes {peak_processes} > {args.max_processes}")
+    if peak_shm_bytes > args.max_shm_peak_mib * 1024 * 1024:
+        failures.append(
+            f"/dev/shm added bytes {peak_shm_bytes} > {args.max_shm_peak_mib * 1024 * 1024}"
+        )
+
+    processes = []
+    for item in process_totals.values():
+        result_item = dict(item)
+        result_item["cpu_pct"] = item["cpu_ticks"] / CLK_TCK / elapsed * 100.0
+        processes.append(result_item)
+    processes.sort(key=lambda item: (item["cpu_ticks"], item["peak_rss_kib"]), reverse=True)
+
+    result = {
+        "phase": args.phase,
+        "duration_seconds": elapsed,
+        "sample_interval_seconds": args.interval,
+        "samples": samples,
+        "scope": "Weston, loopback HTTP, muxd, mux-engine and descendants, Kitty and descendants",
+        "cpu_pct_one_core_is_100": cpu_pct,
+        "peak_rss_kib": peak_rss,
+        "peak_pss_kib": peak_pss if complete_pss_samples else None,
+        "pss_complete_samples": complete_pss_samples,
+        "peak_processes": peak_processes,
+        "peak_added_shm_entries": peak_shm_entries,
+        "peak_added_shm_bytes": peak_shm_bytes,
+        "missing_roots": sorted(missing_roots),
+        "budgets": {
+            "max_cpu_pct": args.max_cpu_pct,
+            "max_rss_mib": args.max_rss_mib,
+            "max_pss_mib": args.max_pss_mib,
+            "max_processes": args.max_processes,
+            "max_shm_peak_mib": args.max_shm_peak_mib,
+        },
+        "failures": failures,
+        "processes": processes,
+    }
+    write_json(args.output, result)
+
+    pss_text = f"{peak_pss / 1024:.2f}MiB" if complete_pss_samples else "unavailable"
+    print(
+        f"resource-smoke: phase={args.phase} duration={elapsed:.2f}s samples={samples} "
+        f"cpu={cpu_pct:.2f}% rss={peak_rss / 1024:.2f}MiB pss={pss_text} "
+        f"processes={peak_processes} shm_peak={peak_shm_bytes}B/{peak_shm_entries}entries"
+    )
+    print("resource-smoke: top scoped processes (cpu%, peak RSS MiB, peak PSS MiB, pid, comm)")
+    for item in processes[:12]:
+        pss_value = item["peak_pss_kib"]
+        pss_column = "n/a" if pss_value is None else f"{pss_value / 1024:.2f}"
+        print(
+            f'  {item["cpu_pct"]:7.2f} {item["peak_rss_kib"] / 1024:10.2f} '
+            f'{pss_column:>10} {item["pid"]:7d} {item["comm"]} {item["cmdline"]}'
+        )
+    for failure in failures:
+        print(f"resource-smoke: budget exceeded: {failure}", file=sys.stderr)
+    return 2 if failures else 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    shm = subparsers.add_parser("shm-snapshot")
+    shm.add_argument("--output", required=True)
+    shm.set_defaults(func=cmd_shm_snapshot)
+
+    capture = subparsers.add_parser("capture")
+    capture.add_argument("--roots", required=True)
+    capture.add_argument("--tracked", required=True)
+    capture.set_defaults(func=cmd_capture)
+
+    clean = subparsers.add_parser("clean")
+    clean.add_argument("--tracked", required=True)
+    clean.add_argument("--quiet", action="store_true")
+    clean.set_defaults(func=cmd_clean)
+
+    signal_parser = subparsers.add_parser("signal")
+    signal_parser.add_argument("--tracked", required=True)
+    signal_parser.add_argument("--signal", choices=("TERM", "KILL"), required=True)
+    signal_parser.set_defaults(func=cmd_signal)
+
+    compare = subparsers.add_parser("shm-compare")
+    compare.add_argument("--baseline", required=True)
+    compare.add_argument("--output", required=True)
+    compare.add_argument("--max-bytes", type=int, required=True)
+    compare.add_argument("--max-entries", type=int, required=True)
+    compare.set_defaults(func=cmd_shm_compare)
+
+    sample = subparsers.add_parser("sample")
+    sample.add_argument("--phase", required=True)
+    sample.add_argument("--duration", type=float, required=True)
+    sample.add_argument("--interval", type=float, default=1.0)
+    sample.add_argument("--roots", required=True)
+    sample.add_argument("--tracked", required=True)
+    sample.add_argument("--baseline-shm", required=True)
+    sample.add_argument("--output", required=True)
+    sample.add_argument("--max-cpu-pct", type=float, required=True)
+    sample.add_argument("--max-rss-mib", type=int, required=True)
+    sample.add_argument("--max-pss-mib", type=int, required=True)
+    sample.add_argument("--max-processes", type=int, required=True)
+    sample.add_argument("--max-shm-peak-mib", type=int, required=True)
+    sample.set_defaults(func=cmd_sample)
+    return parser
+
+
+if __name__ == "__main__":
+    arguments = build_parser().parse_args()
+    raise SystemExit(arguments.func(arguments))
+PY
+chmod 700 "$PROBE"
+python3 "$PROBE" shm-snapshot --output "$SHM_BASELINE"
+
+cat >"$REPORT_DIR/budgets.txt" <<EOF
+active_seconds=$active_seconds
+idle_seconds=$idle_seconds
+active_warmup_seconds=$active_warmup_seconds
+idle_settle_seconds=$idle_settle_seconds
+idle_cpu_pct=$idle_cpu_budget
+active_cpu_pct=$active_cpu_budget
+max_rss_mib=$rss_budget_mib
+max_pss_mib=$pss_budget_mib
+max_processes=$process_budget
+max_shm_peak_mib=$shm_peak_budget_mib
+max_shm_leak_bytes=$shm_leak_budget_bytes
+max_shm_leak_entries=$shm_leak_budget_entries
+minimum_active_frame_acks=$minimum_active_acks
+maximum_hidden_frame_acks=$maximum_hidden_acks
+graceful_cleanup_seconds=$graceful_cleanup_budget
+process_cleanup_seconds=$process_cleanup_budget
+EOF
+
+export MUX_SMOKE_ID="mux-resource-smoke-$$"
+export MUX_RESOURCE_ID="$MUX_SMOKE_ID"
+export XDG_RUNTIME_DIR="$BASE/run"
+export XDG_STATE_HOME="$BASE/state"
+export XDG_DATA_HOME="$BASE/data"
+export XDG_CACHE_HOME="$BASE/cache"
+export XDG_CONFIG_HOME="$BASE/config"
+export MUX_PROFILE=resource-smoke
+export MUX_EPHEMERAL=1
+export MUX_LAYER=main
+export MUX_GLOBAL_BAR=1
+export MUX_PROFILE_DATA_DIR="$BASE/profile-data"
+export MUX_PROFILE_CACHE_DIR="$BASE/profile-cache"
+export MUX_ENGINE_SOCKET="$XDG_RUNTIME_DIR/mux/engine.sock"
+export WAYLAND_DISPLAY=mux-resource-smoke-wayland
+export WPE_DISPLAY=wpe-display-headless
+export LIBGL_ALWAYS_SOFTWARE=1
+export PATH="$BIN_DIR:$PATH"
+unset DISPLAY KITTY_DISABLE_WAYLAND
+
+install -d -m 700 \
+    "$XDG_RUNTIME_DIR" \
+    "$XDG_RUNTIME_DIR/mux" \
+    "$XDG_STATE_HOME" \
+    "$XDG_DATA_HOME" \
+    "$XDG_CACHE_HOME" \
+    "$XDG_CONFIG_HOME" \
+    "$MUX_PROFILE_DATA_DIR" \
+    "$MUX_PROFILE_CACHE_DIR" \
+    "$BASE/site" \
+    "$BASE/kitty"
+
+cat >"$BASE/site/idle.html" <<'HTML'
+<!doctype html>
+<meta charset="utf-8">
+<title>MUX_RESOURCE_IDLE_LOADING</title>
+<style>
+html, body { margin: 0; width: 100%; height: 100%; background: #d7f4e8; }
+body { display: grid; place-items: center; font: 32px sans-serif; color: #163b2c; }
+</style>
+<body>Mux resource idle fixture</body>
+<script>
+addEventListener("load", () => requestAnimationFrame(() => {
+  document.title = "MUX_RESOURCE_IDLE_LOADED";
+}));
+</script>
+HTML
+
+cat >"$BASE/site/active.html" <<'HTML'
+<!doctype html>
+<meta charset="utf-8">
+<title>MUX_RESOURCE_ACTIVE_LOADING</title>
+<style>
+html, body, canvas { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+</style>
+<canvas id="surface" width="1280" height="800"></canvas>
+<script>
+const canvas = document.getElementById("surface");
+const context = canvas.getContext("2d", {alpha: false});
+let frame = 0;
+function draw(timestamp) {
+  const hue = (frame * 3) % 360;
+  context.fillStyle = `hsl(${hue} 55% 82%)`;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = `hsl(${(hue + 180) % 360} 70% 28%)`;
+  const x = (timestamp / 4) % (canvas.width + 240) - 120;
+  context.fillRect(x, 120, 120, 560);
+  context.font = "48px sans-serif";
+  context.fillText(`resource frame ${frame}`, 48, 80);
+  frame += 1;
+  requestAnimationFrame(draw);
+}
+addEventListener("load", () => {
+  document.title = "MUX_RESOURCE_ACTIVE_LOADED";
+  requestAnimationFrame(draw);
+});
+</script>
+HTML
+
+cp "$REPO_ROOT/kitty/kitty.conf" "$BASE/kitty/kitty.conf"
+cp "$REPO_ROOT/kitty/wpe.conf" "$BASE/kitty/wpe.conf"
+python3 - "$BASE/kitty/wpe.conf" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+old = 'remote_control_password "" detach-window focus-window launch\n'
+new = 'remote_control_password "" detach-window focus-window launch send-key get-text\n'
+text = path.read_text(encoding="ascii")
+if text.count(old) != 1:
+    raise SystemExit("temporary Kitty ACL source did not match production config")
+path.write_text(text.replace(old, new), encoding="ascii")
+PY
+
+weston \
+    --backend=headless \
+    --renderer=pixman \
+    --shell=kiosk-shell.so \
+    --width=1280 \
+    --height=800 \
+    --idle-time=0 \
+    -S "$WAYLAND_DISPLAY" \
+    --log="$LOG_DIR/weston.log" \
+    >"$LOG_DIR/weston-stdio.log" 2>&1 &
+WESTON_PID=$!
+track_child "$WESTON_PID" weston
+wait_socket "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" "$WESTON_PID" weston
+
+PORT_FILE="$BASE/http.port"
+python3 - "$BASE/site" "$PORT_FILE" >"$LOG_DIR/http.log" 2>&1 <<'PY' &
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import sys
+
+handler = partial(SimpleHTTPRequestHandler, directory=sys.argv[1])
+server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+Path(sys.argv[2]).write_text(str(server.server_port), encoding="ascii")
+server.serve_forever()
+PY
+HTTP_PID=$!
+track_child "$HTTP_PID" http
+
+for (( attempt=0; attempt < 200; attempt++ )); do
+    [[ -s $PORT_FILE ]] && break
+    pid_alive "$HTTP_PID" || fail "HTTP fixture exited before publishing its port"
+    sleep 0.05
+done
+[[ -s $PORT_FILE ]] || fail "HTTP fixture did not publish its port"
+HTTP_PORT=$(<"$PORT_FILE")
+[[ $HTTP_PORT =~ ^[0-9]+$ ]] || fail "invalid fixture port: $HTTP_PORT"
+IDLE_URL="http://127.0.0.1:$HTTP_PORT/idle.html"
+ACTIVE_URL="http://127.0.0.1:$HTTP_PORT/active.html"
+
+python3 - "$IDLE_URL" "$ACTIVE_URL" <<'PY'
+import sys
+import urllib.request
+
+for url in sys.argv[1:]:
+    with urllib.request.urlopen(url, timeout=2) as response:
+        if response.status != 200:
+            raise SystemExit(f"fixture returned HTTP {response.status}: {url}")
+PY
+
+"$BIN_DIR/muxd" --foreground >"$LOG_DIR/muxd.log" 2>&1 &
+MUXD_PID=$!
+track_child "$MUXD_PID" muxd
+wait_socket "$XDG_RUNTIME_DIR/mux/muxd.sock" "$MUXD_PID" muxd
+
+initial_status=$(run_muxctl status) || fail "muxctl could not reach muxd"
+[[ $initial_status =~ (^|[[:space:]])views=0($|[[:space:]]) ]] ||
+    fail "muxd did not begin with zero views: $initial_status"
+
+FRAME_ACK_TELEMETRY="$LOG_DIR/frame-acks.log"
+: >"$FRAME_ACK_TELEMETRY"
+chmod 600 "$FRAME_ACK_TELEMETRY"
+MUX_SMOKE_FRAME_ACK_FILE="$FRAME_ACK_TELEMETRY" "$BIN_DIR/mux-engine" \
+    --profile "$MUX_PROFILE" \
+    --socket "$MUX_ENGINE_SOCKET" \
+    >"$LOG_DIR/engine.log" 2>&1 &
+ENGINE_PID=$!
+track_child "$ENGINE_PID" mux-engine
+wait_socket "$MUX_ENGINE_SOCKET" "$ENGINE_PID" mux-engine
+
+KITTY_SOCKET="$XDG_RUNTIME_DIR/mux/kitty.sock"
+KITTY_LISTEN_ON="unix:$KITTY_SOCKET"
+export KITTY_LISTEN_ON
+
+kitty \
+    --config "$BASE/kitty/wpe.conf" \
+    --listen-on "$KITTY_LISTEN_ON" \
+    --title Mux \
+    env \
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        XDG_STATE_HOME="$XDG_STATE_HOME" \
+        XDG_DATA_HOME="$XDG_DATA_HOME" \
+        XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+        XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+        MUX_PROFILE="$MUX_PROFILE" \
+        MUX_EPHEMERAL="$MUX_EPHEMERAL" \
+        MUX_LAYER="$MUX_LAYER" \
+        MUX_GLOBAL_BAR="$MUX_GLOBAL_BAR" \
+        MUX_ENGINE_SOCKET="$MUX_ENGINE_SOCKET" \
+        MUX_PROFILE_DATA_DIR="$MUX_PROFILE_DATA_DIR" \
+        MUX_PROFILE_CACHE_DIR="$MUX_PROFILE_CACHE_DIR" \
+        MUX_SMOKE_ID="$MUX_SMOKE_ID" \
+        MUX_RESOURCE_ID="$MUX_RESOURCE_ID" \
+        WPE_DISPLAY="$WPE_DISPLAY" \
+        LIBGL_ALWAYS_SOFTWARE="$LIBGL_ALWAYS_SOFTWARE" \
+        PATH="$PATH" \
+        "$BIN_DIR/mux-layer" "$IDLE_URL" \
+    >"$LOG_DIR/kitty.log" 2>&1 &
+KITTY_PID=$!
+track_child "$KITTY_PID" kitty
+wait_socket "$KITTY_SOCKET" "$KITTY_PID" kitty
+
+BOOT_VIEW_ID=$(wait_initial_view "$IDLE_URL" MUX_RESOURCE_IDLE_LOADED)
+SNAPSHOT=$(run_muxctl list)
+BOOT_PANE_PID=$(marked_pid mux-pane) || fail "mux-pane process was not observed"
+BAR_PID=$(marked_pid mux-bar) || fail "mux-bar process was not observed"
+pid_alive "$BAR_PID" || fail "mux-bar exited"
+BOOT_KITTY_ID=$(record_field "$SNAPSHOT" "$BOOT_VIEW_ID" kitty)
+[[ -n $BOOT_KITTY_ID ]] || fail "muxctl did not report the initial Kitty window ID"
+KITTY_WINDOW_IDS+=("$BOOT_KITTY_ID")
+KITTY_PUBLIC_KEY_VALUE=$(pid_env_value "$BOOT_PANE_PID" KITTY_PUBLIC_KEY || true)
+[[ -n $KITTY_PUBLIC_KEY_VALUE ]] || fail "KITTY_PUBLIC_KEY was absent from mux-pane"
+
+kitty_rc launch \
+    --source-window "id:$BOOT_KITTY_ID" \
+    --type=tab \
+    --copy-env \
+    "$BIN_DIR/mux-layer" --new \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
+    fail "Kitty could not launch the alternate Mux layer"
+
+ALT_VIEW_ID=$(wait_new_view "$BOOT_VIEW_ID")
+SNAPSHOT=$(run_muxctl list)
+ALT_LAYER=$(record_field "$SNAPSHOT" "$ALT_VIEW_ID" layer)
+ALT_KITTY_ID=$(record_field "$SNAPSHOT" "$ALT_VIEW_ID" kitty)
+[[ -n $ALT_LAYER && $ALT_LAYER != main ]] || fail "alternate view has no distinct layer"
+[[ -n $ALT_KITTY_ID ]] || fail "alternate view has no Kitty window ID"
+KITTY_WINDOW_IDS+=("$ALT_KITTY_ID")
+
+for (( attempt=0; attempt < 200; attempt++ )); do
+    ALT_PANE_PID=$(marked_pid mux-pane "$BOOT_PANE_PID" 2>/dev/null || true)
+    [[ -n $ALT_PANE_PID ]] && break
+    ALT_PANE_PID=0
+    assert_core_alive
+    sleep 0.05
+done
+(( ALT_PANE_PID > 0 )) || fail "alternate mux-pane process was not observed"
+
+run_muxctl layer "$ALT_LAYER" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl could not activate $ALT_LAYER"
+wait_layer "$ALT_LAYER" "$ALT_VIEW_ID"
+run_muxctl open "$ALT_VIEW_ID" "$ACTIVE_URL" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl could not navigate the active probe"
+wait_title "$ALT_VIEW_ID" "$ACTIVE_URL" MUX_RESOURCE_ACTIVE_LOADED
+ALT_FRAME_VIEW=$(frame_view_number "$ALT_VIEW_ID")
+wait_frame_growth "$ALT_FRAME_VIEW"
+
+ROOT_PIDS="$WESTON_PID,$HTTP_PID,$MUXD_PID,$ENGINE_PID,$KITTY_PID"
+python3 "$PROBE" capture --roots "$ROOT_PIDS" --tracked "$TRACKED_PROCESSES" \
+    >"$REPORT_DIR/processes-before-active.tsv"
+
+printf 'resource-smoke: active workload warmup %ss\n' "$active_warmup_seconds"
+sleep "$active_warmup_seconds"
+assert_core_alive
+
+run_phase() {
+    local phase=$1 duration=$2 cpu_budget=$3 rc
+    if python3 "$PROBE" sample \
+        --phase "$phase" \
+        --duration "$duration" \
+        --interval 1 \
+        --roots "$ROOT_PIDS" \
+        --tracked "$TRACKED_PROCESSES" \
+        --baseline-shm "$SHM_BASELINE" \
+        --output "$REPORT_DIR/$phase.json" \
+        --max-cpu-pct "$cpu_budget" \
+        --max-rss-mib "$rss_budget_mib" \
+        --max-pss-mib "$pss_budget_mib" \
+        --max-processes "$process_budget" \
+        --max-shm-peak-mib "$shm_peak_budget_mib"; then
+        :
+    else
+        rc=$?
+        record_failure "$phase resource budget failed (sampler exit $rc; see $phase.json)"
+    fi
+    assert_core_alive
+}
+
+active_ack_before=$(frame_ack_count "$ALT_FRAME_VIEW")
+run_phase active "$active_seconds" "$active_cpu_budget"
+active_ack_after=$(frame_ack_count "$ALT_FRAME_VIEW")
+ACTIVE_ACK_DELTA=$(( active_ack_after - active_ack_before ))
+printf 'resource-smoke: active visible frame acknowledgements=%s budget_min=%s\n' \
+    "$ACTIVE_ACK_DELTA" "$minimum_active_acks"
+if (( ACTIVE_ACK_DELTA < minimum_active_acks )); then
+    record_failure "active probe produced $ACTIVE_ACK_DELTA frame acknowledgements; expected at least $minimum_active_acks"
+fi
+
+run_muxctl layer main >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl could not restore the main layer"
+wait_layer main "$BOOT_VIEW_ID"
+printf 'resource-smoke: hidden-layer settle %ss\n' "$idle_settle_seconds"
+sleep "$idle_settle_seconds"
+assert_core_alive
+
+hidden_ack_before=$(frame_ack_count "$ALT_FRAME_VIEW")
+run_phase idle "$idle_seconds" "$idle_cpu_budget"
+hidden_ack_after=$(frame_ack_count "$ALT_FRAME_VIEW")
+HIDDEN_ACK_DELTA=$(( hidden_ack_after - hidden_ack_before ))
+printf 'resource-smoke: hidden-layer frame acknowledgements=%s budget_max=%s\n' \
+    "$HIDDEN_ACK_DELTA" "$maximum_hidden_acks"
+if (( HIDDEN_ACK_DELTA > maximum_hidden_acks )); then
+    record_failure "hidden animated layer produced $HIDDEN_ACK_DELTA frame acknowledgements; maximum is $maximum_hidden_acks"
+fi
+
+graceful_started_ns=$(date +%s%N)
+run_muxctl layer "$ALT_LAYER" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl could not focus alternate layer for cleanup"
+wait_layer "$ALT_LAYER" "$ALT_VIEW_ID"
+kitty_rc send-key --match "id:$ALT_KITTY_ID" super+q \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 || fail "could not close alternate pane"
+wait_view_closed "$ALT_VIEW_ID" "$ALT_PANE_PID"
+
+run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+    fail "muxctl could not focus main view for cleanup"
+wait_active_view "$BOOT_VIEW_ID"
+kitty_rc send-key --match "id:$BOOT_KITTY_ID" super+q \
+    >>"$LOG_DIR/kitty-actions.log" 2>&1 || fail "could not close main pane"
+wait_view_closed "$BOOT_VIEW_ID" "$BOOT_PANE_PID"
+graceful_finished_ns=$(date +%s%N)
+GRACEFUL_CLEANUP_ELAPSED=$(elapsed_seconds "$graceful_started_ns" "$graceful_finished_ns")
+
+final_status=$(run_muxctl status) || fail "muxctl status failed after pane closure"
+[[ $final_status =~ (^|[[:space:]])views=0($|[[:space:]]) ]] ||
+    fail "muxd retained views after graceful close: $final_status"
+pid_alive "$ENGINE_PID" || fail "mux-engine exited after its last view closed"
+pid_alive "$MUXD_PID" || fail "muxd exited after its last view closed"
+
+printf 'resource-smoke: graceful cleanup=%ss budget=%ss\n' \
+    "$GRACEFUL_CLEANUP_ELAPSED" "$graceful_cleanup_budget"
+if float_exceeds "$GRACEFUL_CLEANUP_ELAPSED" "$graceful_cleanup_budget"; then
+    record_failure "graceful cleanup took ${GRACEFUL_CLEANUP_ELAPSED}s; budget is ${graceful_cleanup_budget}s"
+fi
+
+teardown_and_audit() {
+    local pid index attempt clean=0 started_ns finished_ns
+
+    python3 "$PROBE" capture --roots "$ROOT_PIDS" --tracked "$TRACKED_PROCESSES" \
+        >"$REPORT_DIR/processes-before-teardown.tsv"
+    started_ns=$(date +%s%N)
+
+    for (( index=${#CHILD_PIDS[@]} - 1; index >= 0; index-- )); do
+        pid=${CHILD_PIDS[index]}
+        pid_alive "$pid" && kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    for (( attempt=0; attempt < process_cleanup_budget * 10; attempt++ )); do
+        if python3 "$PROBE" clean --tracked "$TRACKED_PROCESSES" --quiet; then
+            clean=1
+            break
+        fi
+        sleep 0.1
+    done
+
+    finished_ns=$(date +%s%N)
+    PROCESS_CLEANUP_ELAPSED=$(elapsed_seconds "$started_ns" "$finished_ns")
+    printf 'resource-smoke: process cleanup=%ss budget=%ss\n' \
+        "$PROCESS_CLEANUP_ELAPSED" "$process_cleanup_budget"
+
+    if (( clean == 0 )); then
+        record_failure "scoped processes survived the ${process_cleanup_budget}s cleanup budget"
+        python3 "$PROBE" clean --tracked "$TRACKED_PROCESSES" \
+            >"$REPORT_DIR/cleanup-survivors.tsv" 2>&1 || true
+        python3 "$PROBE" signal --tracked "$TRACKED_PROCESSES" --signal KILL || true
+        sleep 0.5
+    fi
+
+    for pid in "${CHILD_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    if ! python3 "$PROBE" clean --tracked "$TRACKED_PROCESSES" --quiet; then
+        record_failure "scoped processes remained after SIGKILL fallback"
+        python3 "$PROBE" clean --tracked "$TRACKED_PROCESSES" \
+            >"$REPORT_DIR/post-kill-survivors.tsv" 2>&1 || true
+    fi
+
+    [[ ! -S $MUX_ENGINE_SOCKET ]] || record_failure "engine socket remained after shutdown"
+    [[ ! -S $XDG_RUNTIME_DIR/mux/muxd.sock ]] || record_failure "muxd socket remained after shutdown"
+    [[ ! -S $KITTY_SOCKET ]] || record_failure "Kitty socket remained after shutdown"
+
+    if python3 "$PROBE" shm-compare \
+        --baseline "$SHM_BASELINE" \
+        --output "$REPORT_DIR/shm-final.json" \
+        --max-bytes "$shm_leak_budget_bytes" \
+        --max-entries "$shm_leak_budget_entries"; then
+        :
+    else
+        record_failure "/dev/shm did not return to its baseline"
+    fi
+    TEARDOWN_DONE=1
+}
+
+teardown_and_audit
+
+{
+    printf 'active_frame_ack_delta=%s\n' "$ACTIVE_ACK_DELTA"
+    printf 'hidden_frame_ack_delta=%s\n' "$HIDDEN_ACK_DELTA"
+    printf 'graceful_cleanup_seconds=%s\n' "$GRACEFUL_CLEANUP_ELAPSED"
+    printf 'process_cleanup_seconds=%s\n' "$PROCESS_CLEANUP_ELAPSED"
+    printf 'qualification_failures=%s\n' "${#QUALIFICATION_FAILURES[@]}"
+    for failure in "${QUALIFICATION_FAILURES[@]}"; do
+        printf 'failure=%s\n' "$failure"
+    done
+} >"$REPORT_DIR/summary.txt"
+
+if (( ${#QUALIFICATION_FAILURES[@]} > 0 )); then
+    printf 'resource-smoke: FAIL (%s qualification failures)\n' \
+        "${#QUALIFICATION_FAILURES[@]}" >&2
+    exit 1
+fi
+
+printf 'resource-smoke: PASS\n'

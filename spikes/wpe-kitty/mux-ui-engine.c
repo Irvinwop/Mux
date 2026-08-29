@@ -2,10 +2,13 @@
 
 #include <string.h>
 
+#define BEFORE_UNLOAD_STAY_DATA "mux-before-unload-stay"
+
 typedef struct {
     guint64 request_id;
     MuxUiRequestKind kind;
     WebKitScriptDialog *dialog;
+    WebKitWebView *web_view;
 } PendingDialog;
 
 typedef struct {
@@ -18,6 +21,7 @@ typedef struct {
 } PendingPermission;
 
 struct _MuxUiEngineBridge {
+    gatomicrefcount references;
     WebKitWebView *web_view;
     GHashTable *pending;
     GHashTable *permissions;
@@ -29,6 +33,7 @@ struct _MuxUiEngineBridge {
     gulong permission_request_handler;
     gulong query_permission_state_handler;
     gulong load_changed_handler;
+    gboolean disposing;
 };
 
 static void
@@ -52,6 +57,29 @@ pending_permission_free(PendingPermission *pending)
     g_free(pending->category);
     g_free(pending);
 }
+
+static MuxUiEngineBridge *
+ui_engine_bridge_ref(MuxUiEngineBridge *bridge)
+{
+    g_atomic_ref_count_inc(&bridge->references);
+    return bridge;
+}
+
+static void
+ui_engine_bridge_unref(MuxUiEngineBridge *bridge)
+{
+    if (!g_atomic_ref_count_dec(&bridge->references))
+        return;
+    g_clear_pointer(&bridge->pending, g_hash_table_unref);
+    g_clear_pointer(&bridge->permissions, g_hash_table_unref);
+    mux_permission_store_free(bridge->permission_store);
+    if (bridge->user_data_destroy)
+        bridge->user_data_destroy(bridge->user_data);
+    g_clear_object(&bridge->web_view);
+    g_free(bridge);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxUiEngineBridge, ui_engine_bridge_unref)
 
 static guint64 *
 request_key_new(guint64 request_id)
@@ -208,6 +236,10 @@ resolve_dialog(PendingDialog *pending,
     case MUX_UI_REQUEST_DIALOG_BEFORE_UNLOAD:
         webkit_script_dialog_confirm_set_confirmed(
             pending->dialog, action == MUX_UI_ACTION_LEAVE);
+        if (action != MUX_UI_ACTION_LEAVE && pending->web_view)
+            g_object_set_data(G_OBJECT(pending->web_view),
+                              BEFORE_UNLOAD_STAY_DATA,
+                              GINT_TO_POINTER(1));
         break;
     case MUX_UI_REQUEST_DIALOG_ALERT:
     default:
@@ -270,6 +302,7 @@ on_script_dialog(WebKitWebView *web_view,
                  WebKitScriptDialog *dialog,
                  MuxUiEngineBridge *bridge)
 {
+    g_autoptr(MuxUiEngineBridge) guard = ui_engine_bridge_ref(bridge);
     MuxUiRequestKind kind = request_kind_for_dialog(
         webkit_script_dialog_get_dialog_type(dialog));
     g_autoptr(MuxUiRequest) request = NULL;
@@ -277,6 +310,11 @@ on_script_dialog(WebKitWebView *web_view,
     g_autoptr(GError) error = NULL;
     PendingDialog *pending;
 
+    bridge = guard;
+    if (bridge->disposing) {
+        webkit_script_dialog_close(dialog);
+        return TRUE;
+    }
     if (!kind) {
         webkit_script_dialog_close(dialog);
         return TRUE;
@@ -304,11 +342,14 @@ on_script_dialog(WebKitWebView *web_view,
     pending->request_id = request->request_id;
     pending->kind = kind;
     pending->dialog = webkit_script_dialog_ref(dialog);
+    pending->web_view = web_view;
     g_hash_table_insert(bridge->pending,
                         request_key_new(pending->request_id),
                         pending);
 
     if (!send_payload(bridge, payload, &error)) {
+        if (bridge->disposing)
+            return TRUE;
         PendingDialog *failed =
             take_pending_dialog(bridge, request->request_id);
 
@@ -420,25 +461,19 @@ resolve_permission(PendingPermission *pending, MuxUiAction action)
     if (!pending || !pending->request)
         return;
     if (pending->persistence_available && pending->store &&
-        (action == MUX_UI_ACTION_ALLOW_ALWAYS ||
-         action == MUX_UI_ACTION_DENY_ALWAYS)) {
+        action == MUX_UI_ACTION_DENY_ALWAYS) {
         g_autoptr(GError) error = NULL;
-        MuxPermissionDecision decision =
-            action == MUX_UI_ACTION_ALLOW_ALWAYS
-                ? MUX_PERMISSION_DECISION_ALLOW
-                : MUX_PERMISSION_DECISION_DENY;
 
         if (!mux_permission_store_set(pending->store,
                                       pending->origin,
                                       pending->category,
-                                      decision,
+                                      MUX_PERMISSION_DECISION_DENY,
                                       &error))
             g_warning("could not persist permission decision: %s",
                       error->message);
     }
     allow = action == MUX_UI_ACTION_ALLOW_ONCE ||
-            (pending->persistence_available &&
-             action == MUX_UI_ACTION_ALLOW_ALWAYS);
+            action == MUX_UI_ACTION_ALLOW_ALWAYS;
     if (allow)
         webkit_permission_request_allow(pending->request);
     else
@@ -450,43 +485,37 @@ on_permission_request(WebKitWebView *web_view,
                       WebKitPermissionRequest *permission,
                       MuxUiEngineBridge *bridge)
 {
+    g_autoptr(MuxUiEngineBridge) guard = ui_engine_bridge_ref(bridge);
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_PERMISSION);
     g_autoptr(GBytes) payload = NULL;
     g_autoptr(GError) error = NULL;
     PendingPermission *pending;
-    MuxPermissionDecision remembered;
     const gchar *category = permission_category(permission);
+    g_autofree gchar *top_level_origin = NULL;
+    g_autofree gchar *permission_text = NULL;
 
-    request->request_id = next_request_id(bridge);
-    request->deadline_ms = 30000;
-    request->origin = security_origin_for_view(web_view);
-    remembered = bridge->permission_store
-                     ? mux_permission_store_lookup(
-                           bridge->permission_store,
-                           request->origin,
-                           category)
-                     : MUX_PERMISSION_DECISION_ASK;
-    if (remembered == MUX_PERMISSION_DECISION_ALLOW) {
-        webkit_permission_request_allow(permission);
-        return TRUE;
-    }
-    if (remembered == MUX_PERMISSION_DECISION_DENY) {
+    bridge = guard;
+    if (bridge->disposing) {
         webkit_permission_request_deny(permission);
         return TRUE;
     }
+    request->request_id = next_request_id(bridge);
+    request->deadline_ms = 30000;
+    top_level_origin = security_origin_for_view(web_view);
+    request->origin = g_strdup("Requesting origin unavailable");
 
     request->heading = g_strdup("Permission request");
-    request->message = permission_message(permission);
+    permission_text = permission_message(permission);
+    request->message = g_strdup_printf(
+        "%s\nTop-level page context: %s\n"
+        "WPE did not expose the requesting frame origin; this decision is "
+        "one-shot and will not be persisted.",
+        permission_text,
+        top_level_origin);
     request->default_value = g_strdup(category);
     if (permission_is_dangerous(permission))
         request->flags |= MUX_UI_REQUEST_FLAG_DANGER;
-    if (bridge->permission_store &&
-        mux_permission_store_is_persistent(
-            bridge->permission_store))
-        request->flags |=
-            MUX_UI_REQUEST_FLAG_PERSISTENCE_AVAILABLE;
-
     payload = mux_ui_request_encode(request, &error);
     if (!payload) {
         webkit_permission_request_deny(permission);
@@ -496,11 +525,8 @@ on_permission_request(WebKitWebView *web_view,
     pending = g_new0(PendingPermission, 1);
     pending->request_id = request->request_id;
     pending->request = g_object_ref(permission);
-    pending->store = bridge->permission_store
-                         ? mux_permission_store_ref(
-                               bridge->permission_store)
-                         : NULL;
-    pending->origin = g_strdup(request->origin);
+    pending->store = NULL;
+    pending->origin = NULL;
     pending->category = g_strdup(category);
     pending->persistence_available =
         !!(request->flags &
@@ -509,6 +535,8 @@ on_permission_request(WebKitWebView *web_view,
                         request_key_new(pending->request_id),
                         pending);
     if (!send_payload(bridge, payload, &error)) {
+        if (bridge->disposing)
+            return TRUE;
         PendingPermission *failed =
             take_pending_permission(bridge, request->request_id);
 
@@ -602,6 +630,7 @@ mux_ui_engine_bridge_new(WebKitWebView *web_view,
     g_return_val_if_fail(send_func, NULL);
 
     bridge = g_new0(MuxUiEngineBridge, 1);
+    g_atomic_ref_count_init(&bridge->references);
     bridge->web_view = g_object_ref(web_view);
     bridge->pending = g_hash_table_new_full(g_int64_hash,
                                             g_int64_equal,
@@ -645,6 +674,8 @@ mux_ui_engine_bridge_set_permission_store(
     MuxPermissionStore *store)
 {
     g_return_if_fail(bridge);
+    if (bridge->disposing)
+        return;
     if (bridge->permission_store == store)
         return;
     if (store)
@@ -656,8 +687,9 @@ mux_ui_engine_bridge_set_permission_store(
 void
 mux_ui_engine_bridge_free(MuxUiEngineBridge *bridge)
 {
-    if (!bridge)
+    if (!bridge || bridge->disposing)
         return;
+    bridge->disposing = TRUE;
     if (bridge->script_dialog_handler)
         g_signal_handler_disconnect(bridge->web_view,
                                     bridge->script_dialog_handler);
@@ -673,13 +705,7 @@ mux_ui_engine_bridge_free(MuxUiEngineBridge *bridge)
                                     bridge->load_changed_handler);
     mux_ui_engine_bridge_cancel_all(
         bridge, MUX_UI_CANCEL_VIEW_DESTROYED, TRUE);
-    g_clear_pointer(&bridge->pending, g_hash_table_unref);
-    g_clear_pointer(&bridge->permissions, g_hash_table_unref);
-    mux_permission_store_free(bridge->permission_store);
-    if (bridge->user_data_destroy)
-        bridge->user_data_destroy(bridge->user_data);
-    g_clear_object(&bridge->web_view);
-    g_free(bridge);
+    ui_engine_bridge_unref(bridge);
 }
 
 gboolean
@@ -688,9 +714,18 @@ mux_ui_engine_bridge_handle_payload(MuxUiEngineBridge *bridge,
                                     gsize length,
                                     GError **error)
 {
+    g_autoptr(MuxUiEngineBridge) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(bridge, FALSE);
+    guard = ui_engine_bridge_ref(bridge);
+    if (bridge->disposing) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "UI engine bridge is closing");
+        return FALSE;
+    }
     if (!mux_ui_record_type(data, length, &type, error))
         return FALSE;
 
@@ -785,9 +820,11 @@ mux_ui_engine_bridge_cancel(MuxUiEngineBridge *bridge,
                             MuxUiCancelReason reason,
                             gboolean notify_pane)
 {
+    g_autoptr(MuxUiEngineBridge) guard = NULL;
     PendingDialog *pending;
 
     g_return_if_fail(bridge);
+    guard = ui_engine_bridge_ref(bridge);
     pending = take_pending_dialog(bridge, request_id);
     if (pending) {
         if (notify_pane)
@@ -814,7 +851,10 @@ mux_ui_engine_bridge_cancel_all(MuxUiEngineBridge *bridge,
                                 MuxUiCancelReason reason,
                                 gboolean notify_pane)
 {
+    g_autoptr(MuxUiEngineBridge) guard = NULL;
+
     g_return_if_fail(bridge);
+    guard = ui_engine_bridge_ref(bridge);
 
     while (g_hash_table_size(bridge->pending)) {
         GHashTableIter iterator;

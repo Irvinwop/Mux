@@ -7,6 +7,7 @@
 G_BEGIN_DECLS
 
 typedef struct _MuxClipboardEngineLink MuxClipboardEngineLink;
+typedef struct _MuxClipboardEngineWrite MuxClipboardEngineWrite;
 
 /* packet is borrowed and should be sent on the pane extension channel. */
 typedef gboolean (*MuxClipboardEngineOutputFunc)(
@@ -46,10 +47,17 @@ gboolean mux_clipboard_engine_link_set_active_source(
     MuxClipboardEngineLink *link,
     guint64 view_id,
     const gchar *origin,
+    gboolean ephemeral,
     GError **error);
-void mux_clipboard_engine_link_set_ephemeral(
+
+MuxClipboardEngineWrite *mux_clipboard_engine_link_begin_write(
+    MuxClipboardEngineLink *link);
+gboolean mux_clipboard_engine_link_complete_write(
     MuxClipboardEngineLink *link,
-    gboolean ephemeral);
+    MuxClipboardEngineWrite *write,
+    const MuxClipboardSnapshot *snapshot,
+    GError **error);
+void mux_clipboard_engine_write_free(MuxClipboardEngineWrite *write);
 
 gboolean mux_clipboard_engine_link_handle_packet(
     MuxClipboardEngineLink *link,
@@ -62,6 +70,8 @@ gboolean mux_clipboard_engine_link_tick(MuxClipboardEngineLink *link,
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxClipboardEngineLink,
                               mux_clipboard_engine_link_free)
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxClipboardEngineWrite,
+                              mux_clipboard_engine_write_free)
 
 G_END_DECLS
 

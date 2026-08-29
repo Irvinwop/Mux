@@ -1,7 +1,7 @@
 #ifndef MUX_CLIPBOARD_CONTROL_H
 #define MUX_CLIPBOARD_CONTROL_H
 
-#include <gio/gio.h>
+#include "mux-clipboard.h"
 
 G_BEGIN_DECLS
 
@@ -67,6 +67,8 @@ typedef struct {
     gchar *preview;
     guint64 source_view_id;
     guint32 format_count;
+    gchar **mime_types;
+    guint32 mime_type_count;
     guint64 total_bytes;
 } MuxClipboardControlSummary;
 

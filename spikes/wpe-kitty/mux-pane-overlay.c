@@ -577,54 +577,70 @@ action_hint(const PendingPrompt *pending)
     }
 }
 
+static gboolean
+terminal_character_allowed(gunichar character)
+{
+    GUnicodeType type = g_unichar_type(character);
+
+    return type != G_UNICODE_CONTROL &&
+           type != G_UNICODE_FORMAT &&
+           type != G_UNICODE_LINE_SEPARATOR &&
+           type != G_UNICODE_PARAGRAPH_SEPARATOR;
+}
+
+static guint
+terminal_character_width(gunichar character)
+{
+    GUnicodeType type = g_unichar_type(character);
+
+    if (type == G_UNICODE_NON_SPACING_MARK ||
+        type == G_UNICODE_ENCLOSING_MARK)
+        return 0;
+    return g_unichar_iswide(character) ? 2 : 1;
+}
+
 static gchar *
-sanitize_line(const gchar *input)
+sanitize_terminal_line(const gchar *input, guint width)
 {
     g_autofree gchar *valid = g_utf8_make_valid(input ? input : "", -1);
-    GString *output = g_string_sized_new(strlen(valid));
+    GString *safe = g_string_sized_new(strlen(valid));
+    GString *output;
     const gchar *cursor;
+    guint64 total_width = 0;
+    guint used = 0;
+    guint content_width;
+
+    if (!width) {
+        g_string_free(safe, TRUE);
+        return g_strdup("");
+    }
 
     for (cursor = valid; *cursor; cursor = g_utf8_next_char(cursor)) {
         gunichar character = g_utf8_get_char(cursor);
 
-        if (g_unichar_iscntrl(character))
-            g_string_append_c(output, ' ');
-        else
-            g_string_append_unichar(output, character);
+        if (!terminal_character_allowed(character))
+            continue;
+        g_string_append_unichar(safe, character);
+        total_width += terminal_character_width(character);
     }
-    return g_string_free(output, FALSE);
-}
+    if (total_width <= width)
+        return g_string_free(safe, FALSE);
 
-static gchar *
-fit_line(const gchar *input, guint width)
-{
-    g_autofree gchar *safe = sanitize_line(input);
-    GString *output;
-    const gchar *cursor;
-    guint used = 0;
-
-    if (!width)
-        return g_strdup("");
-    output = g_string_sized_new(MIN(strlen(safe), width));
-    for (cursor = safe; *cursor && used < width; cursor = g_utf8_next_char(cursor)) {
+    content_width = width >= 3 ? width - 3 : width;
+    output = g_string_sized_new(MIN(safe->len, (gsize)width));
+    for (cursor = safe->str; *cursor; cursor = g_utf8_next_char(cursor)) {
         const gchar *next = g_utf8_next_char(cursor);
+        guint character_width =
+            terminal_character_width(g_utf8_get_char(cursor));
 
-        if (used + 1 == width && *next) {
-            if (width >= 3) {
-                while (output->len && used > width - 3) {
-                    gchar *previous =
-                        g_utf8_find_prev_char(output->str,
-                                              output->str + output->len);
-                    g_string_truncate(output, previous - output->str);
-                    used--;
-                }
-                g_string_append(output, "...");
-            }
+        if (character_width && used + character_width > content_width)
             break;
-        }
         g_string_append_len(output, cursor, next - cursor);
-        used++;
+        used += character_width;
     }
+    if (width >= 3)
+        g_string_append(output, "...");
+    g_string_free(safe, TRUE);
     return g_string_free(output, FALSE);
 }
 
@@ -635,8 +651,8 @@ render_row(GString *output,
            const gchar *style,
            const gchar *text)
 {
-    g_autofree gchar *fitted =
-        fit_line(text, columns > 2 ? columns - 2 : columns);
+    g_autofree gchar *fitted = sanitize_terminal_line(
+        text, columns > 2 ? columns - 2 : columns);
 
     g_string_append_printf(output,
                            "\x1b[%u;1H\x1b[2K%s",
@@ -689,10 +705,10 @@ mux_pane_overlay_render(const MuxPaneOverlay *overlay,
     start = rows - panel_rows + 1;
     remaining_ms = MAX((gint64)0,
                        (pending->expires_at_us - monotonic_us + 999) / 1000);
-    heading = sanitize_line(
-        pending->request->heading && *pending->request->heading
-            ? pending->request->heading
-            : default_heading(pending->request->kind));
+    heading = g_strdup(pending->request->heading &&
+                               *pending->request->heading
+                           ? pending->request->heading
+                           : default_heading(pending->request->kind));
     title = g_strdup_printf("MUX  %s  (%" G_GINT64_FORMAT "s)",
                             heading,
                             (remaining_ms + 999) / 1000);
@@ -701,7 +717,9 @@ mux_pane_overlay_render(const MuxPaneOverlay *overlay,
                                      *pending->request->origin
                                  ? pending->request->origin
                                  : "browser");
-    body = sanitize_line(pending->request->message);
+    body = g_strdup(pending->request->message
+                        ? pending->request->message
+                        : "");
 
     switch (pending->request->kind) {
     case MUX_UI_REQUEST_DIALOG_PROMPT:

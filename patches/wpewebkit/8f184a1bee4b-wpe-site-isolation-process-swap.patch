@@ -1,0 +1,34 @@
+From 8f184a1bee4b3815392bd9ee1e7ca8ad0ab88836 Mon Sep 17 00:00:00 2001
+From: Jeffrey Xu <jeffrey_xu2@apple.com>
+Date: Fri, 31 Jul 2026 11:35:19 -0700
+Subject: [PATCH] Fix crash on WPE caused by process swap on cross-origin
+ iframe in Site Isolation due to entering compositing mode twice.
+ rdar://183650308 https://bugs.webkit.org/show_bug.cgi?id=320671
+
+Reviewed by Carlos Garcia Campos.
+New processes for iframes in site isolation will be expected to call enterAcceleratedCompositingMode twice on the same drawing area, so this assert is no longer expected to be valid.
+No new tests. Layout tests can't use more than two domains, so they can't trigger a process swap on a remote cross-origin iframe yet. API tests can proxy multiple domains, but they aren't run on WPE. https://github.com/WebKit/WebKit/pull/70156 adds a process swap on reload after requesting storage access, which will allow testing this more easily. (That commit includes a layout test that crashes on WPE without this change and passes with it.)
+* Source/WebKit/UIProcess/CoordinatedGraphics/DrawingAreaProxyCoordinatedGraphics.cpp:
+(WebKit::DrawingAreaProxyCoordinatedGraphics::enterAcceleratedCompositingMode):
+
+Canonical link: https://commits.webkit.org/318334@main
+---
+ .../DrawingAreaProxyCoordinatedGraphics.cpp                | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+diff --git a/Source/WebKit/UIProcess/CoordinatedGraphics/DrawingAreaProxyCoordinatedGraphics.cpp b/Source/WebKit/UIProcess/CoordinatedGraphics/DrawingAreaProxyCoordinatedGraphics.cpp
+index be40fa0e3e3e..931f7dc80030 100644
+--- a/Source/WebKit/UIProcess/CoordinatedGraphics/DrawingAreaProxyCoordinatedGraphics.cpp
++++ b/Source/WebKit/UIProcess/CoordinatedGraphics/DrawingAreaProxyCoordinatedGraphics.cpp
+@@ -243,7 +243,12 @@ bool DrawingAreaProxyCoordinatedGraphics::alwaysUseCompositing() const
+ void DrawingAreaProxyCoordinatedGraphics::enterAcceleratedCompositingMode(const LayerTreeContext& layerTreeContext)
+ {
+-    ASSERT(!isInAcceleratedCompositingMode());
++    // Under Site Isolation, a process swap within an iframe may send EnterAcceleratedCompositingMode
++    // while the drawing area is already compositing (from the previous process). Treat it as an update.
++    if (isInAcceleratedCompositingMode()) {
++        updateAcceleratedCompositingMode(layerTreeContext);
++        return;
++    }
+ #if !PLATFORM(WPE) && !PLATFORM(GTK)
+     m_backingStore = nullptr;
+ #endif

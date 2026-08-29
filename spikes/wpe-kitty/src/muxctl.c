@@ -6,12 +6,15 @@
 #include <string.h>
 #include <unistd.h>
 
+#define RESPONSE_TIMEOUT_MS 5000
+
 static void usage(void)
 {
     g_printerr(
         "usage:\n"
         "  muxctl list\n"
         "  muxctl status\n"
+        "  muxctl stop\n"
         "  muxctl open [view-id] URI\n"
         "  muxctl back|forward|reload|quit [view-id]\n"
         "  muxctl focus VIEW-ID\n"
@@ -85,13 +88,42 @@ static void print_protocol_line(const gchar *line)
     g_strfreev(fields);
 }
 
+static gint remaining_ms(gint64 deadline_us)
+{
+    gint64 remaining_us = deadline_us - g_get_monotonic_time();
+
+    if (remaining_us <= 0)
+        return 0;
+    return (gint)MIN((remaining_us + 999) / 1000, (gint64)G_MAXINT);
+}
+
 static int read_response(int fd, gboolean stream)
 {
     int result = EXIT_SUCCESS;
+    gint64 deadline_us = stream
+        ? 0
+        : g_get_monotonic_time() +
+              ((gint64)RESPONSE_TIMEOUT_MS * 1000);
+
     while (TRUE) {
-        gchar *line = mux_read_line(fd, stream ? -1 : 2000);
-        if (!line)
-            break;
+        gint timeout_ms = stream ? -1 : remaining_ms(deadline_us);
+        gchar *line;
+
+        if (!stream && timeout_ms == 0) {
+            g_printerr("muxctl: timed out waiting for a complete response\n");
+            return EXIT_FAILURE;
+        }
+
+        line = mux_read_line(fd, timeout_ms);
+        if (!line) {
+            if (stream)
+                break;
+            if (remaining_ms(deadline_us) == 0)
+                g_printerr("muxctl: timed out waiting for a complete response\n");
+            else
+                g_printerr("muxctl: connection closed before a complete response\n");
+            return EXIT_FAILURE;
+        }
         if (g_str_has_prefix(line, "ERR\t"))
             result = EXIT_FAILURE;
         print_protocol_line(line);
@@ -133,18 +165,30 @@ static gboolean send_target_command(
 
 int main(int argc, char **argv)
 {
+    const gchar *command;
+
     if (argc < 2) {
+        usage();
+        return EXIT_FAILURE;
+    }
+
+    command = argv[1];
+    if (g_strcmp0(command, "stop") == 0 && argc != 2) {
         usage();
         return EXIT_FAILURE;
     }
 
     int fd = mux_connect_socket();
     if (fd < 0) {
+        if (g_strcmp0(command, "stop") == 0 &&
+            (errno == ENOENT || errno == ECONNREFUSED)) {
+            g_print("muxd is not running\n");
+            return EXIT_SUCCESS;
+        }
         g_printerr("muxctl: muxd is unavailable: %s\n", g_strerror(errno));
         return EXIT_FAILURE;
     }
 
-    const gchar *command = argv[1];
     gboolean sent = FALSE;
     gboolean stream = FALSE;
 
@@ -152,6 +196,8 @@ int main(int argc, char **argv)
         sent = mux_send_line(fd, "CTL\tLIST");
     } else if (g_strcmp0(command, "status") == 0) {
         sent = mux_send_line(fd, "CTL\tSTATUS");
+    } else if (g_strcmp0(command, "stop") == 0) {
+        sent = mux_send_line(fd, "CTL\tSTOP");
     } else if (g_strcmp0(command, "watch") == 0) {
         sent = mux_send_line(fd, "SUB");
         stream = TRUE;
@@ -205,5 +251,7 @@ int main(int argc, char **argv)
 
     int result = read_response(fd, stream);
     close(fd);
+    if (result == EXIT_SUCCESS && g_strcmp0(command, "stop") == 0)
+        g_print("muxd stopped\n");
     return result;
 }

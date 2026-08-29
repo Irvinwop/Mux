@@ -9,6 +9,14 @@ G_BEGIN_DECLS
 
 typedef struct _MuxDownloadManager MuxDownloadManager;
 
+#define MUX_DOWNLOAD_MAX_PENDING_PER_VIEW 2U
+#define MUX_DOWNLOAD_MAX_PENDING_GLOBAL 8U
+#define MUX_DOWNLOAD_MAX_ACTIVE_PER_VIEW 4U
+#define MUX_DOWNLOAD_MAX_ACTIVE_GLOBAL 16U
+#define MUX_DOWNLOAD_DESTINATION_TIMEOUT_MS 120000U
+#define MUX_DOWNLOAD_CLIPBOARD_MAX_FILES 64U
+#define MUX_DOWNLOAD_CLIPBOARD_MAX_BYTES ((guint64)512 * 1024 * 1024)
+
 typedef enum {
     MUX_DOWNLOAD_EVENT_STARTED,
     MUX_DOWNLOAD_EVENT_DESTINATION,
@@ -16,6 +24,8 @@ typedef enum {
     MUX_DOWNLOAD_EVENT_FINISHED,
     MUX_DOWNLOAD_EVENT_FAILED,
     MUX_DOWNLOAD_EVENT_CANCELLED,
+    MUX_DOWNLOAD_EVENT_CLIPBOARD_READY,
+    MUX_DOWNLOAD_EVENT_CLIPBOARD_FAILED,
 } MuxDownloadEventType;
 
 typedef struct {
@@ -40,6 +50,13 @@ typedef gboolean (*MuxDownloadSendFunc)(WebKitWebView *source_view,
 typedef void (*MuxDownloadEventFunc)(const MuxDownloadEvent *event,
                                      gpointer user_data);
 
+typedef gboolean (*MuxDownloadClipboardFunc)(WebKitWebView *source_view,
+                                              const gchar *local_path,
+                                              const gchar *public_path,
+                                              const gchar *mime_type,
+                                              gpointer user_data,
+                                              GError **error);
+
 MuxDownloadManager *mux_download_manager_new(
     WebKitNetworkSession *network_session,
     MuxDownloadSendFunc send_func,
@@ -48,6 +65,16 @@ MuxDownloadManager *mux_download_manager_new(
     GDestroyNotify user_data_destroy);
 
 void mux_download_manager_free(MuxDownloadManager *manager);
+
+void mux_download_manager_set_clipboard_func(
+    MuxDownloadManager *manager,
+    MuxDownloadClipboardFunc clipboard_func);
+
+gboolean mux_download_manager_download_uri_to_clipboard(
+    MuxDownloadManager *manager,
+    WebKitWebView *source_view,
+    const gchar *uri,
+    GError **error);
 
 /*
  * Handles a mux-ui response or cancel record routed from any pane.
@@ -60,6 +87,8 @@ gboolean mux_download_manager_handle_payload(MuxDownloadManager *manager,
 
 void mux_download_manager_cancel(MuxDownloadManager *manager,
                                  guint64 download_id);
+void mux_download_manager_cancel_view(MuxDownloadManager *manager,
+                                      WebKitWebView *source_view);
 void mux_download_manager_cancel_all(MuxDownloadManager *manager);
 guint mux_download_manager_count(const MuxDownloadManager *manager);
 

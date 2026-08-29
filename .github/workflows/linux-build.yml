@@ -1,4 +1,4 @@
-name: Linux build
+name: Linux WPE build
 
 on:
   push:
@@ -9,9 +9,28 @@ permissions:
   contents: read
 
 jobs:
-  arch:
-    name: Arch Linux / WPE 2.52
+  nix-eval:
+    name: Nix flake evaluation
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Check all flake outputs without building
+        run: >-
+          docker run --rm
+          --volume "$GITHUB_WORKSPACE:/work:ro"
+          --workdir /work
+          nixos/nix:2.28.7
+          nix --extra-experimental-features "nix-command flakes"
+          flake check --no-build --all-systems path:/work
+
+  wpe:
+    name: Arch Linux / WPEPlatform
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     container:
       image: archlinux:base-devel
 
@@ -19,11 +38,12 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: >-
           pacman -Syu --needed --noconfirm
           base-devel
           git
+          glib2
           kitty
           meson
           ninja
@@ -33,11 +53,61 @@ jobs:
       - name: Check dependency surface
         run: ./doctor
 
-      - name: Configure
-        run: meson setup --werror build/ci spikes/wpe-kitty
+      - name: Configure real WPE implementation
+        run: meson setup --buildtype=release --werror build/ci spikes/wpe-kitty
 
-      - name: Compile
+      - name: Compile all WPE targets
         run: meson compile -C build/ci
 
-      - name: Test
-        run: meson test -C build/ci --print-errorlogs
+      - name: Run native tests
+        env:
+          G_DEBUG: fatal-warnings
+        run: meson test -C build/ci --print-errorlogs --no-rebuild
+
+  runtime-smoke:
+    name: Runtime smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: archlinux:base-devel
+      # The outer throwaway container needs host user namespaces and broad
+      # privileges so WebKit's nested bubblewrap sandbox can remain enabled.
+      options: >-
+        --privileged
+        --userns=host
+        --security-opt seccomp=unconfined
+        --shm-size=2g
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install runtime smoke dependencies
+        run: >-
+          pacman -Syu --needed --noconfirm
+          base-devel
+          dbus
+          git
+          glib2
+          kitty
+          mesa
+          meson
+          ninja
+          noto-fonts
+          pkgconf
+          procps-ng
+          python
+          weston
+          wpewebkit
+
+      - name: Build real WPE implementation
+        run: |
+          meson setup --buildtype=release --werror build/runtime-smoke spikes/wpe-kitty
+          meson compile -C build/runtime-smoke
+
+      - name: Run full-stack headless gate
+        env:
+          CI: "true"
+          MUX_SMOKE_ALLOW_ROOT_CI: "1"
+          MUX_BIN_DIR: ${{ github.workspace }}/build/runtime-smoke
+        run: ./runtime-smoke

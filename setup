@@ -5,99 +5,232 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 deps_only=0
+development=0
+no_launch=0
+skip_packages=0
+uninstall=0
+prefix="${MUX_INSTALL_PREFIX:-${HOME:?HOME must be set}/.local}"
+destdir="${DESTDIR:-}"
 declare -a mux_args=()
 
 usage() {
   cat <<'EOF'
-Usage: ./setup [--deps-only] [--] [MUX_ARGUMENTS...]
+Usage: ./setup [OPTIONS] [--] [MUX_ARGUMENTS...]
 
-Install Mux's Arch Linux dependencies, check the environment, and launch Mux.
+Install Mux v0.1 for the current user and optionally launch it.
 
-  ./setup
-  ./setup https://example.com
-  ./setup --deps-only
+Options:
+  --prefix PATH       Install below PATH (default: $MUX_INSTALL_PREFIX or ~/.local)
+  --no-launch         Install without opening Kitty
+  --deps-only         Reconcile/check dependencies without building or installing
+  --development       Build and launch directly from this checkout
+  --skip-packages     Do not run pacman; check already-provided dependencies
+  --uninstall         Remove only the Mux files below the selected prefix
+  -h, --help          Show this help
 
-Arch Linux and Arch Linux ARM are the package-supported distributions.
-Current Debian and Fedora WPE packages omit the required WPEPlatform API;
-custom builds remain usable when they provide wpe-platform-2.0 >= 2.52.
+DESTDIR is honored for staged installs and implies --no-launch.
+
+The automatic package recipe is release-qualified only for x86_64 Arch Linux.
+Official Arch Linux ARM repositories do not provide wpewebkit; ARM users must
+provide the WPE dependencies separately or use the aarch64 Nix path, whose full
+build is qualified but whose graphical launch remains unqualified.
 EOF
 }
 
-for argument in "$@"; do
-  case "$argument" in
+die() {
+  printf 'setup: %s\n' "$1" >&2
+  exit 1
+}
+
+while (( $# )); do
+  case "$1" in
+    --prefix)
+      (( $# >= 2 )) || die '--prefix requires a path'
+      prefix="$2"
+      shift 2
+      ;;
+    --prefix=*)
+      prefix="${1#--prefix=}"
+      shift
+      ;;
+    --no-launch)
+      no_launch=1
+      shift
+      ;;
     --deps-only)
       deps_only=1
+      shift
+      ;;
+    --development|--dev)
+      development=1
+      shift
+      ;;
+    --skip-packages)
+      skip_packages=1
+      shift
+      ;;
+    --uninstall)
+      uninstall=1
+      shift
       ;;
     -h|--help)
       usage
       exit 0
       ;;
     --)
+      shift
+      mux_args+=("$@")
+      break
       ;;
     *)
-      mux_args+=("$argument")
+      mux_args+=("$@")
+      break
       ;;
   esac
 done
 
-if [[ "$(uname -s)" != Linux ]]; then
-  printf 'Mux currently requires Linux: WPEPlatform, shared memory, and SO_PEERCRED are Linux APIs.\n' >&2
-  exit 1
+while [[ "$prefix" != / && "$prefix" == */ ]]; do
+  prefix="${prefix%/}"
+done
+[[ -n "$prefix" && "$prefix" == /* && "$prefix" != / ]] ||
+  die '--prefix must be an absolute path other than /'
+
+staged=0
+if [[ -n "$destdir" ]]; then
+  staged=1
+  while [[ "$destdir" != / && "$destdir" == */ ]]; do
+    destdir="${destdir%/}"
+  done
+  [[ "$destdir" == /* ]] || die 'DESTDIR must be an absolute path'
+  [[ "$destdir" != / ]] || destdir=''
+  no_launch=1
+fi
+install_root="${destdir}${prefix}"
+
+if (( EUID == 0 )); then
+  die 'run ./setup as the user who will own Mux; setup elevates only the pacman command'
 fi
 
-run_root() {
-  if (( EUID == 0 )); then
-    "$@"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo "$@"
+if (( uninstall )); then
+  (( ${#mux_args[@]} == 0 )) || die '--uninstall does not accept Mux arguments'
+  launcher="$install_root/bin/mux"
+  if [[ -x "$launcher" ]]; then
+    exec "$launcher" --uninstall
+  fi
+  printf 'No Mux launcher is installed at %s.\n' "$launcher"
+  exit 0
+fi
+
+if (( deps_only && development )); then
+  die '--deps-only and --development cannot be combined'
+fi
+if (( no_launch && development )); then
+  die '--no-launch and --development cannot be combined'
+fi
+
+if [[ "$(uname -s)" != Linux ]]; then
+  die 'Mux v0.1 requires Linux because its WPEPlatform and local IPC paths are Linux-specific'
+fi
+
+run_pacman() {
+  if command -v sudo >/dev/null 2>&1; then
+    sudo pacman -Syu --needed \
+      base-devel coreutils glib2 kitty meson ninja pkgconf wpewebkit \
+      gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly \
+      gst-libav noto-fonts
+  elif command -v doas >/dev/null 2>&1; then
+    doas pacman -Syu --needed \
+      base-devel coreutils glib2 kitty meson ninja pkgconf wpewebkit \
+      gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly \
+      gst-libav noto-fonts
+  elif command -v su >/dev/null 2>&1; then
+    su -c 'pacman -Syu --needed base-devel coreutils glib2 kitty meson ninja pkgconf wpewebkit gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav noto-fonts'
   else
-    printf 'setup needs root privileges and sudo is unavailable.\n' >&2
-    exit 1
+    die 'pacman needs root privileges, but sudo, doas, and su are unavailable'
   fi
 }
 
-if command -v pacman >/dev/null 2>&1; then
-  printf 'Installing Arch Linux dependencies...\n'
-  run_root pacman -Syu --needed --noconfirm \
-    base-devel \
-    kitty \
-    meson \
-    ninja \
-    pkgconf \
-    wpewebkit \
-    gst-libav \
-    gst-plugins-good \
-    gst-plugins-bad \
-    noto-fonts
-elif command -v apt-get >/dev/null 2>&1 ||
-     command -v dnf >/dev/null 2>&1; then
-  if ! command -v pkg-config >/dev/null 2>&1 ||
-     ! pkg-config --exists 'wpe-platform-2.0 >= 2.52'; then
+if (( skip_packages )); then
+  printf 'Skipping package installation; checking the current environment.\n'
+elif command -v pacman >/dev/null 2>&1; then
+  machine="$(uname -m)"
+  if [[ "$machine" != x86_64 ]]; then
     cat >&2 <<'EOF'
-This distribution's WPE packages omit wpe-platform-2.0, even when WPE WebKit
-itself is version 2.52 or newer. Mux will not install a known-incomplete
-dependency set. Use Arch Linux/Arch Linux ARM, or install WPE WebKit built with
-WPEPlatform 2.52+ and rerun ./setup.
+setup: the automatic Arch recipe is x86_64-only.
+
+Official Arch Linux ARM repositories do not provide wpewebkit, so setup cannot
+satisfy the WPE dependency there. Use --skip-packages only after supplying
+wpe-webkit-2.0 and wpe-platform-2.0 >= 2.52.5 yourself. The aarch64 Nix output
+has completed its full WPE, runtime, test, and app build, but its graphical
+launch is not release-qualified yet.
 EOF
     exit 1
   fi
-  printf 'Using the externally installed WPEPlatform dependency set.\n'
-else
-  cat >&2 <<'EOF'
-No supported package manager was found.
 
-Install these manually:
-  kitty, meson, ninja, pkg-config, a C17 compiler, GLib/GIO development files,
-  WPE WebKit 2.52+, WPEPlatform headless 2.52+, GStreamer codecs, and fonts.
-EOF
-  exit 1
+  printf 'Reconciling x86_64 Arch Linux dependencies with a full system upgrade.\n'
+  printf 'Pacman will ask for confirmation before making changes.\n'
+  run_pacman
+  hash -r
+else
+  printf 'No automatic package recipe is available for this distribution.\n'
+  printf 'Checking the dependencies already installed on this machine...\n'
 fi
 
 "$ROOT/doctor"
 
 if (( deps_only )); then
-  printf 'Dependencies are ready. Run ./mux to start Mux.\n'
+  printf '\nDependencies are ready.\n'
+  printf 'Run ./setup --no-launch to install, or ./mux for checkout development mode.\n'
   exit 0
 fi
 
-exec "$ROOT/mux" "${mux_args[@]}"
+if (( development )); then
+  exec "$ROOT/mux" "${mux_args[@]}"
+fi
+
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}"
+[[ "$cache_root" == /* ]] || die 'XDG_CACHE_HOME must be an absolute path'
+
+repo_key="$(printf '%s' "$ROOT" | sha256sum)"
+repo_key="${repo_key%% *}"
+build_dir="$cache_root/mux/install-builds/$repo_key/wpe-kitty"
+mkdir -p "$build_dir"
+
+meson_options=(
+  --buildtype=release
+  "--prefix=$prefix"
+  --bindir=bin
+  --libexecdir=libexec
+  --datadir=share
+)
+
+if [[ -f "$build_dir/build.ninja" ]]; then
+  meson setup --reconfigure "${meson_options[@]}" "$build_dir"
+else
+  meson setup "${meson_options[@]}" "$build_dir" "$ROOT/spikes/wpe-kitty"
+fi
+
+meson compile -C "$build_dir"
+
+if (( staged )); then
+  DESTDIR="$destdir" meson install -C "$build_dir"
+else
+  meson install -C "$build_dir"
+fi
+
+printf '\nInstalled Mux v0.1 below %s\n' "$install_root"
+printf '  launcher: %s/bin/mux\n' "$install_root"
+printf '  runtime:  %s/libexec/mux\n' "$install_root"
+printf '  configs:  %s/share/mux/kitty\n' "$install_root"
+printf 'The installation no longer depends on this checkout or its build cache.\n'
+
+if (( no_launch )); then
+  exit 0
+fi
+
+case ":$PATH:" in
+  *":$prefix/bin:"*) ;;
+  *) printf '\nAdd %s/bin to PATH to invoke Mux as "mux".\n' "$prefix" ;;
+esac
+
+exec "$install_root/bin/mux" "${mux_args[@]}"

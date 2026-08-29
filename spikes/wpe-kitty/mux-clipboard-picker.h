@@ -50,6 +50,17 @@ MuxClipboardPickerItem *mux_clipboard_picker_item_new(
     const gchar *preview,
     const gchar *const *mime_types,
     gsize mime_type_count);
+MuxClipboardPickerItem *mux_clipboard_picker_item_new_full(
+    guint64 id,
+    gint64 created_us,
+    const gchar *origin,
+    guint64 source_view_id,
+    gboolean pinned,
+    gsize total_size,
+    const gchar *preview,
+    const gchar *const *mime_types,
+    gsize mime_type_count,
+    gsize format_count);
 MuxClipboardPickerItem *mux_clipboard_picker_item_ref(
     MuxClipboardPickerItem *item);
 void mux_clipboard_picker_item_unref(MuxClipboardPickerItem *item);

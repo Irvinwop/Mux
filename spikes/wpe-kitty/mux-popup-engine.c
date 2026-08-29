@@ -21,16 +21,28 @@ typedef struct {
 } PopupRecord;
 
 struct _MuxPopupManager {
+    gatomicrefcount references;
     WebKitWebView *parent;
     GHashTable *by_token;
     GHashTable *by_child;
+    guint creating_count;
     MuxPopupCreateFunc create_func;
     MuxPopupOfferFunc offer_func;
     MuxPopupDestroyFunc destroy_func;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
+    gboolean disposing;
     gulong create_handler;
 };
+
+static gboolean
+popup_request_is_admissible(gboolean user_gesture,
+                            guint pending_count,
+                            guint creating_count)
+{
+    return user_gesture && pending_count < MUX_POPUP_MAX_PENDING &&
+           creating_count < MUX_POPUP_MAX_PENDING - pending_count;
+}
 
 static gboolean
 random_bytes(guint8 *data, gsize length)
@@ -109,6 +121,29 @@ popup_record_free(PopupRecord *record)
     g_free(record);
 }
 
+static MuxPopupManager *
+popup_manager_ref(MuxPopupManager *manager)
+{
+    g_atomic_ref_count_inc(&manager->references);
+    return manager;
+}
+
+static void
+popup_manager_unref(MuxPopupManager *manager)
+{
+    if (!g_atomic_ref_count_dec(&manager->references))
+        return;
+    g_hash_table_remove_all(manager->by_child);
+    g_clear_pointer(&manager->by_token, g_hash_table_unref);
+    g_clear_pointer(&manager->by_child, g_hash_table_unref);
+    if (manager->user_data_destroy)
+        manager->user_data_destroy(manager->user_data);
+    g_clear_object(&manager->parent);
+    g_free(manager);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxPopupManager, popup_manager_unref)
+
 static void
 remove_record(PopupRecord *record)
 {
@@ -124,10 +159,14 @@ static void
 on_child_ready(WebKitWebView *child, PopupRecord *record)
 {
     MuxPopupManager *manager = record->manager;
+    g_autoptr(MuxPopupManager) guard = popup_manager_ref(manager);
     g_autofree gchar *token = g_strdup(record->token);
     g_autoptr(GError) error = NULL;
     gboolean offered;
 
+    manager = guard;
+    if (manager->disposing || record->ready)
+        return;
     record->ready = TRUE;
     record->expires_at_us =
         g_get_monotonic_time() +
@@ -139,6 +178,8 @@ on_child_ready(WebKitWebView *child, PopupRecord *record)
                                   manager->user_data,
                                   &error);
 
+    if (manager->disposing)
+        return;
     record = g_hash_table_lookup(manager->by_token, token);
     if (!record)
         return;
@@ -153,7 +194,12 @@ on_child_ready(WebKitWebView *child, PopupRecord *record)
 static void
 on_child_close(WebKitWebView *child, PopupRecord *record)
 {
+    g_autoptr(MuxPopupManager) guard =
+        popup_manager_ref(record->manager);
+
     (void)child;
+    if (guard->disposing)
+        return;
     remove_record(record);
 }
 
@@ -162,18 +208,36 @@ on_create(WebKitWebView *parent,
           WebKitNavigationAction *navigation_action,
           MuxPopupManager *manager)
 {
+    g_autoptr(MuxPopupManager) guard = popup_manager_ref(manager);
     g_autoptr(GError) error = NULL;
     WebKitWebView *child;
     PopupRecord *record;
     gchar *token;
+    guint pending_count;
+    gboolean user_gesture =
+        navigation_action &&
+        webkit_navigation_action_is_user_gesture(navigation_action);
 
-    if (g_hash_table_size(manager->by_token) >= MUX_POPUP_MAX_PENDING)
+    manager = guard;
+    if (manager->disposing)
+        return NULL;
+    pending_count = g_hash_table_size(manager->by_token);
+    if (!popup_request_is_admissible(user_gesture,
+                                     pending_count,
+                                     manager->creating_count))
         return NULL;
 
+    manager->creating_count++;
     child = manager->create_func(parent,
                                  navigation_action,
                                  manager->user_data,
                                  &error);
+    manager->creating_count--;
+    if (manager->disposing) {
+        if (WEBKIT_IS_WEB_VIEW(child))
+            manager->destroy_func(child, manager->user_data);
+        return NULL;
+    }
     if (!child) {
         if (error)
             g_warning("popup creation denied: %s", error->message);
@@ -229,6 +293,7 @@ mux_popup_manager_new(WebKitWebView *parent,
     g_return_val_if_fail(destroy_func, NULL);
 
     manager = g_new0(MuxPopupManager, 1);
+    g_atomic_ref_count_init(&manager->references);
     manager->parent = g_object_ref(parent);
     manager->by_token = g_hash_table_new_full(
         g_str_hash,
@@ -253,18 +318,14 @@ mux_popup_manager_new(WebKitWebView *parent,
 void
 mux_popup_manager_free(MuxPopupManager *manager)
 {
-    if (!manager)
+    if (!manager || manager->disposing)
         return;
+    manager->disposing = TRUE;
     if (manager->create_handler)
         g_signal_handler_disconnect(manager->parent,
                                     manager->create_handler);
-    g_hash_table_remove_all(manager->by_child);
-    g_clear_pointer(&manager->by_token, g_hash_table_unref);
-    g_clear_pointer(&manager->by_child, g_hash_table_unref);
-    if (manager->user_data_destroy)
-        manager->user_data_destroy(manager->user_data);
-    g_clear_object(&manager->parent);
-    g_free(manager);
+    manager->create_handler = 0;
+    popup_manager_unref(manager);
 }
 
 WebKitWebView *
@@ -272,10 +333,19 @@ mux_popup_manager_claim(MuxPopupManager *manager,
                         const gchar *token,
                         GError **error)
 {
+    g_autoptr(MuxPopupManager) guard = NULL;
     PopupRecord *record;
     WebKitWebView *child;
 
     g_return_val_if_fail(manager, NULL);
+    guard = popup_manager_ref(manager);
+    if (manager->disposing) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "popup manager is closing");
+        return NULL;
+    }
     if (!token || strlen(token) != MUX_POPUP_TOKEN_LENGTH) {
         g_set_error_literal(error,
                             G_IO_ERROR,
@@ -307,6 +377,7 @@ guint
 mux_popup_manager_tick(MuxPopupManager *manager,
                        gint64 monotonic_us)
 {
+    g_autoptr(MuxPopupManager) guard = NULL;
     GHashTableIter iterator;
     gpointer value;
     g_autoptr(GPtrArray) expired =
@@ -315,6 +386,9 @@ mux_popup_manager_tick(MuxPopupManager *manager,
     guint i;
 
     g_return_val_if_fail(manager, 0);
+    guard = popup_manager_ref(manager);
+    if (manager->disposing)
+        return 0;
     g_hash_table_iter_init(&iterator, manager->by_token);
     while (g_hash_table_iter_next(&iterator, NULL, &value)) {
         PopupRecord *record = value;

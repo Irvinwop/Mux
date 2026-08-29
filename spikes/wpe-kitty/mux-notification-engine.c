@@ -12,6 +12,7 @@ typedef struct {
 } PendingNotification;
 
 struct _MuxNotificationEngine {
+    gatomicrefcount references;
     WebKitWebView *web_view;
     GHashTable *pending;
     MuxNotificationEngineSendFunc send_func;
@@ -58,6 +59,28 @@ pending_notification_free(PendingNotification *pending)
     g_clear_object(&pending->notification);
     g_free(pending);
 }
+
+static MuxNotificationEngine *
+notification_engine_ref(MuxNotificationEngine *engine)
+{
+    g_atomic_ref_count_inc(&engine->references);
+    return engine;
+}
+
+static void
+notification_engine_unref(MuxNotificationEngine *engine)
+{
+    if (!g_atomic_ref_count_dec(&engine->references))
+        return;
+    g_clear_pointer(&engine->pending, g_hash_table_unref);
+    if (engine->user_data_destroy)
+        engine->user_data_destroy(engine->user_data);
+    g_clear_object(&engine->web_view);
+    g_free(engine);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxNotificationEngine,
+                              notification_engine_unref)
 
 static PendingNotification *
 take_pending(MuxNotificationEngine *engine, guint64 request_id)
@@ -162,9 +185,12 @@ static void
 on_notification_closed(WebKitNotification *notification,
                        MuxNotificationEngine *engine)
 {
+    g_autoptr(MuxNotificationEngine) guard =
+        notification_engine_ref(engine);
     guint64 request_id;
     PendingNotification *pending;
 
+    engine = guard;
     if (engine->destroying)
         return;
     request_id = find_notification(engine, notification);
@@ -180,6 +206,8 @@ on_show_notification(WebKitWebView *web_view,
                      WebKitNotification *notification,
                      MuxNotificationEngine *engine)
 {
+    g_autoptr(MuxNotificationEngine) guard =
+        notification_engine_ref(engine);
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_NOTIFICATION);
     g_autoptr(GError) error = NULL;
@@ -187,6 +215,10 @@ on_show_notification(WebKitWebView *web_view,
     PendingNotification *pending;
     const gchar *tag = webkit_notification_get_tag(notification);
     guint64 reused_id = take_matching_tag(engine, tag);
+
+    engine = guard;
+    if (engine->destroying)
+        return FALSE;
 
     if (!reused_id &&
         g_hash_table_size(engine->pending) >=
@@ -228,6 +260,8 @@ on_show_notification(WebKitWebView *web_view,
                         request_key_new(pending->request_id),
                         pending);
     if (!send_payload(engine, payload, &error)) {
+        if (engine->destroying)
+            return FALSE;
         pending = take_pending(engine, request->request_id);
         pending_notification_free(pending);
         return FALSE;
@@ -248,6 +282,7 @@ mux_notification_engine_new(WebKitWebView *web_view,
     g_return_val_if_fail(send_func, NULL);
 
     engine = g_new0(MuxNotificationEngine, 1);
+    g_atomic_ref_count_init(&engine->references);
     engine->web_view = g_object_ref(web_view);
     engine->pending = g_hash_table_new_full(
         g_int64_hash,
@@ -272,7 +307,7 @@ mux_notification_engine_free(MuxNotificationEngine *engine)
     GList *keys;
     GList *link;
 
-    if (!engine)
+    if (!engine || engine->destroying)
         return;
     engine->destroying = TRUE;
     if (engine->show_handler)
@@ -286,11 +321,7 @@ mux_notification_engine_free(MuxNotificationEngine *engine)
         send_cancel(engine, request_id);
     }
     g_list_free(keys);
-    g_hash_table_unref(engine->pending);
-    if (engine->user_data_destroy)
-        engine->user_data_destroy(engine->user_data);
-    g_object_unref(engine->web_view);
-    g_free(engine);
+    notification_engine_unref(engine);
 }
 
 gboolean
@@ -299,9 +330,18 @@ mux_notification_engine_handle_payload(MuxNotificationEngine *engine,
                                        gsize length,
                                        GError **error)
 {
+    g_autoptr(MuxNotificationEngine) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(engine, FALSE);
+    guard = notification_engine_ref(engine);
+    if (engine->destroying) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "notification engine is closing");
+        return FALSE;
+    }
     if (!mux_ui_record_type(data, length, &type, error))
         return FALSE;
     if (type != MUX_UI_RECORD_RESPONSE)

@@ -313,7 +313,8 @@ mux_clipboard_wire_send_snapshot(guint64 transaction_id,
 
     g_return_val_if_fail(snapshot != NULL, FALSE);
     g_return_val_if_fail(send_func != NULL, FALSE);
-    if (transaction_id == 0 || flags & ~MUX_CLIPBOARD_WIRE_FLAGS_ALL)
+    if (transaction_id == 0 ||
+        flags & ~MUX_CLIPBOARD_WIRE_TRANSFER_FLAGS_ALL)
         return set_invalid(error, "invalid clipboard snapshot transfer");
     if (!valid_metadata_text(profile, MUX_CLIPBOARD_WIRE_MAX_PROFILE) ||
         !valid_metadata_text(source_origin, MUX_CLIPBOARD_WIRE_MAX_ORIGIN))
@@ -485,6 +486,8 @@ decode_begin(MuxClipboardWireAssembler *assembler,
     guint32 origin_length;
     guint64 total;
 
+    if (record->flags & ~MUX_CLIPBOARD_WIRE_TRANSFER_FLAGS_ALL)
+        return set_invalid(error, "clipboard begin has response-only flags");
     data = g_bytes_get_data(record->payload, &length);
     if (length < BEGIN_FIXED_SIZE)
         return set_invalid(error, "clipboard begin metadata is truncated");

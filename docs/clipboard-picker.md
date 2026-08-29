@@ -19,15 +19,16 @@ exists.
 
 ## Pane key mapping
 
-The pane adapter will open the picker with `Ctrl+Shift+V` and map Kitty keyboard
+The pane adapter opens the picker with `Super+Shift+V` (`Ctrl+Shift+V` as a
+Linux compatibility alias) and maps Kitty keyboard
 events as follows:
 
 | Key | Picker command |
 | --- | --- |
 | Printable text | Extend query |
 | Backspace | Delete character |
-| `Ctrl+W` | Delete query word |
-| `Ctrl+U` | Clear query |
+| `Super+W` (`Ctrl+W` Linux alias) | Delete query word |
+| `Super+U` (`Ctrl+U` Linux alias) | Clear query |
 | Up/Down | Move selection |
 | Page Up/Page Down | Move one visible page |
 | Home/End | First/last match |

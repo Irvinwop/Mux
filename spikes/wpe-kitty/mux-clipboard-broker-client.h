@@ -9,6 +9,7 @@
 G_BEGIN_DECLS
 
 #define MUX_CLIPBOARD_BROKER_CLIENT_TIMEOUT_MS 10000U
+#define MUX_CLIPBOARD_BROKER_CLIENT_MAX_OBSERVATIONS 25U
 
 typedef struct _MuxClipboardBrokerClient MuxClipboardBrokerClient;
 
@@ -18,6 +19,12 @@ typedef enum {
     MUX_CLIPBOARD_BROKER_CLIENT_READY,
     MUX_CLIPBOARD_BROKER_CLIENT_CLOSED
 } MuxClipboardBrokerClientState;
+
+typedef enum {
+    MUX_CLIPBOARD_BROKER_OBSERVATION_ACCEPTED,
+    MUX_CLIPBOARD_BROKER_OBSERVATION_DEGRADED,
+    MUX_CLIPBOARD_BROKER_OBSERVATION_REJECTED
+} MuxClipboardBrokerObservationResult;
 
 /* packet is a borrowed complete MXEX envelope. */
 typedef gboolean (*MuxClipboardBrokerClientOutputFunc)(
@@ -56,6 +63,13 @@ typedef void (*MuxClipboardBrokerClientFailureFunc)(
     const GError *error,
     gpointer user_data);
 
+typedef void (*MuxClipboardBrokerClientObservationFunc)(
+    MuxClipboardBrokerClient *client,
+    guint64 transaction_id,
+    MuxClipboardBrokerObservationResult result,
+    const GError *error,
+    gpointer user_data);
+
 MuxClipboardBrokerClient *mux_clipboard_broker_client_new(
     const gchar *profile,
     MuxClipboardHistoryMode mode,
@@ -71,6 +85,10 @@ MuxClipboardBrokerClient *mux_clipboard_broker_client_ref(
     MuxClipboardBrokerClient *client);
 void mux_clipboard_broker_client_unref(
     MuxClipboardBrokerClient *client);
+void mux_clipboard_broker_client_set_observation_func(
+    MuxClipboardBrokerClient *client,
+    MuxClipboardBrokerClientObservationFunc observation_func,
+    gpointer observation_data);
 
 gboolean mux_clipboard_broker_client_start(
     MuxClipboardBrokerClient *client,
@@ -81,6 +99,14 @@ gboolean mux_clipboard_broker_client_observe(
     const gchar *source_origin,
     guint64 source_view_id,
     const MuxClipboardSnapshot *snapshot,
+    GError **error);
+gboolean mux_clipboard_broker_client_observe_full(
+    MuxClipboardBrokerClient *client,
+    guint32 flags,
+    const gchar *source_origin,
+    guint64 source_view_id,
+    const MuxClipboardSnapshot *snapshot,
+    guint64 *transaction_id,
     GError **error);
 gboolean mux_clipboard_broker_client_list(
     MuxClipboardBrokerClient *client,
@@ -115,6 +141,9 @@ gboolean mux_clipboard_broker_client_handle_packet(
 guint mux_clipboard_broker_client_tick(
     MuxClipboardBrokerClient *client,
     gint64 monotonic_us);
+void mux_clipboard_broker_client_handle_disconnect(
+    MuxClipboardBrokerClient *client,
+    const GError *error);
 
 MuxClipboardBrokerClientState mux_clipboard_broker_client_get_state(
     const MuxClipboardBrokerClient *client);

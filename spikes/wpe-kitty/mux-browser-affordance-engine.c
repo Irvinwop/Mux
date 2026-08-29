@@ -8,6 +8,7 @@
 typedef struct {
     GAction *action;
     GVariant *target;
+    gchar *download_uri;
 } ContextAction;
 
 typedef struct {
@@ -16,13 +17,19 @@ typedef struct {
     WebKitAuthenticationRequest *authentication;
     WebKitOptionMenu *option_menu;
     GPtrArray *context_actions;
+    GHashTable *command_choice_ids;
+    MuxBrowserAffordanceChoiceFunc command_choice_func;
+    gpointer command_data;
+    GDestroyNotify command_data_destroy;
     gulong underlying_handler;
 } PendingAffordance;
 
 struct _MuxBrowserAffordanceBridge {
+    gatomicrefcount references;
     WebKitWebView *web_view;
     GHashTable *pending;
     MuxBrowserAffordanceSendFunc send_func;
+    MuxBrowserAffordanceDownloadFunc download_func;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     gboolean private_profile;
@@ -37,6 +44,8 @@ struct _MuxBrowserAffordanceBridge {
 static void send_cancel(MuxBrowserAffordanceBridge *bridge,
                         guint64 request_id,
                         MuxUiCancelReason reason);
+static void supersede_kind(MuxBrowserAffordanceBridge *bridge,
+                           MuxUiRequestKind kind);
 
 static guint64 *
 request_key_new(guint64 request_id)
@@ -76,6 +85,7 @@ context_action_free(ContextAction *item)
         return;
     g_clear_object(&item->action);
     g_clear_pointer(&item->target, g_variant_unref);
+    g_free(item->download_uri);
     g_free(item);
 }
 
@@ -98,8 +108,33 @@ pending_affordance_free(PendingAffordance *pending)
     g_clear_object(&pending->authentication);
     g_clear_object(&pending->option_menu);
     g_clear_pointer(&pending->context_actions, g_ptr_array_unref);
+    g_clear_pointer(&pending->command_choice_ids, g_hash_table_unref);
+    if (pending->command_data_destroy)
+        pending->command_data_destroy(pending->command_data);
     g_free(pending);
 }
+
+static MuxBrowserAffordanceBridge *
+affordance_bridge_ref(MuxBrowserAffordanceBridge *bridge)
+{
+    g_atomic_ref_count_inc(&bridge->references);
+    return bridge;
+}
+
+static void
+affordance_bridge_unref(MuxBrowserAffordanceBridge *bridge)
+{
+    if (!g_atomic_ref_count_dec(&bridge->references))
+        return;
+    g_clear_pointer(&bridge->pending, g_hash_table_unref);
+    if (bridge->user_data_destroy)
+        bridge->user_data_destroy(bridge->user_data);
+    g_clear_object(&bridge->web_view);
+    g_free(bridge);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxBrowserAffordanceBridge,
+                              affordance_bridge_unref)
 
 static gpointer
 take_hash_value(GHashTable *table, guint64 request_id)
@@ -169,7 +204,20 @@ publish_request(MuxBrowserAffordanceBridge *bridge,
                 const MuxUiRequest *request,
                 GError **error)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     g_autoptr(GBytes) payload = mux_ui_request_encode(request, error);
+    guint64 request_id = pending->request_id;
+
+    bridge = guard;
+    if (bridge->destroying) {
+        pending_affordance_free(pending);
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "browser affordance bridge is closing");
+        return FALSE;
+    }
 
     if (!payload) {
         pending_affordance_free(pending);
@@ -180,13 +228,166 @@ publish_request(MuxBrowserAffordanceBridge *bridge,
                         request_key_new(pending->request_id),
                         pending);
     if (!send_payload(bridge, payload, error)) {
+        if (bridge->destroying)
+            return FALSE;
         PendingAffordance *failed =
-            take_pending(bridge, pending->request_id);
+            take_pending(bridge, request_id);
 
         pending_affordance_free(failed);
         return FALSE;
     }
     return TRUE;
+}
+
+gboolean
+mux_browser_affordance_bridge_show_command_surface(
+    MuxBrowserAffordanceBridge *bridge,
+    const gchar *heading,
+    const gchar *message,
+    const GPtrArray *choices,
+    MuxBrowserAffordanceChoiceFunc choice_func,
+    gpointer user_data,
+    GDestroyNotify user_data_destroy,
+    GError **error)
+{
+    g_autoptr(MuxUiRequest) request =
+        mux_ui_request_new(MUX_UI_REQUEST_CONTEXT_MENU);
+    PendingAffordance *pending = g_new0(PendingAffordance, 1);
+    GHashTable *seen_ids = g_hash_table_new_full(g_int_hash,
+                                                 g_int_equal,
+                                                 g_free,
+                                                 NULL);
+    guint selectable = 0;
+    guint i;
+
+    pending->command_data = user_data;
+    pending->command_data_destroy = user_data_destroy;
+    if (!bridge || !choices || !choice_func ||
+        choices->len == 0 || choices->len > MUX_UI_MAX_CHOICES) {
+        g_set_error_literal(error,
+                            MUX_UI_ERROR,
+                            MUX_UI_ERROR_INVALID,
+                            "command surface choices are invalid");
+        g_hash_table_unref(seen_ids);
+        pending_affordance_free(pending);
+        return FALSE;
+    }
+
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
+    bridge = guard;
+    if (bridge->destroying) {
+        g_hash_table_unref(seen_ids);
+        pending_affordance_free(pending);
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "browser affordance bridge is closing");
+        return FALSE;
+    }
+
+    pending->request_id = next_request_id(bridge);
+    pending->kind = MUX_UI_REQUEST_CONTEXT_MENU;
+    pending->command_choice_func = choice_func;
+    pending->command_choice_ids = g_hash_table_new_full(g_int_hash,
+                                                        g_int_equal,
+                                                        g_free,
+                                                        NULL);
+    request->request_id = pending->request_id;
+    request->flags = bridge->private_profile
+                         ? MUX_UI_REQUEST_FLAG_PRIVATE_PROFILE
+                         : 0;
+    request->deadline_ms = 300000;
+    request->origin = view_origin(bridge->web_view);
+    request->heading = bounded_utf8(heading, 1024);
+    request->message = bounded_utf8(message, MUX_UI_MAX_MESSAGE);
+
+    for (i = 0; i < choices->len; i++) {
+        const MuxUiChoice *choice = g_ptr_array_index((GPtrArray *)choices, i);
+        guint32 *seen_key;
+
+        if (!choice || !choice->label) {
+            g_set_error_literal(error,
+                                MUX_UI_ERROR,
+                                MUX_UI_ERROR_INVALID,
+                                "command surface contains an invalid choice");
+            g_hash_table_unref(seen_ids);
+            pending_affordance_free(pending);
+            return FALSE;
+        }
+        seen_key = g_new(guint32, 1);
+        *seen_key = choice->id;
+        if (g_hash_table_contains(seen_ids, seen_key)) {
+            g_free(seen_key);
+            g_set_error_literal(error,
+                                MUX_UI_ERROR,
+                                MUX_UI_ERROR_INVALID,
+                                "command surface choice ids must be unique");
+            g_hash_table_unref(seen_ids);
+            pending_affordance_free(pending);
+            return FALSE;
+        }
+        g_hash_table_add(seen_ids, seen_key);
+        g_ptr_array_add(request->choices, mux_ui_choice_copy(choice));
+        if (!(choice->flags & (MUX_UI_CHOICE_FLAG_DISABLED |
+                              MUX_UI_CHOICE_FLAG_SEPARATOR))) {
+            guint32 *selectable_key = g_new(guint32, 1);
+
+            *selectable_key = choice->id;
+            g_hash_table_add(pending->command_choice_ids, selectable_key);
+            selectable++;
+        }
+    }
+    g_hash_table_unref(seen_ids);
+    if (!selectable) {
+        g_set_error_literal(error,
+                            MUX_UI_ERROR,
+                            MUX_UI_ERROR_INVALID,
+                            "command surface has no selectable choices");
+        pending_affordance_free(pending);
+        return FALSE;
+    }
+
+    supersede_kind(bridge, MUX_UI_REQUEST_CONTEXT_MENU);
+    return publish_request(bridge, pending, request, error);
+}
+
+gboolean
+mux_browser_affordance_bridge_show_status(
+    MuxBrowserAffordanceBridge *bridge,
+    const gchar *heading,
+    const gchar *message,
+    gboolean danger,
+    GError **error)
+{
+    g_autoptr(MuxBrowserAffordanceBridge) guard = NULL;
+    g_autoptr(MuxUiRequest) request =
+        mux_ui_request_new(MUX_UI_REQUEST_NOTIFICATION);
+    PendingAffordance *pending;
+
+    g_return_val_if_fail(bridge, FALSE);
+    guard = affordance_bridge_ref(bridge);
+    if (bridge->destroying) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "browser affordance bridge is closing");
+        return FALSE;
+    }
+    pending = g_new0(PendingAffordance, 1);
+    pending->request_id = next_request_id(bridge);
+    pending->kind = request->kind;
+    request->request_id = pending->request_id;
+    request->flags = (bridge->private_profile
+                          ? MUX_UI_REQUEST_FLAG_PRIVATE_PROFILE
+                          : 0) |
+                     (danger ? MUX_UI_REQUEST_FLAG_DANGER : 0);
+    request->deadline_ms = 15000;
+    request->origin = view_origin(bridge->web_view);
+    request->heading = bounded_utf8(heading, 1024);
+    request->message = bounded_utf8(message, MUX_UI_MAX_MESSAGE);
+    supersede_kind(bridge, MUX_UI_REQUEST_NOTIFICATION);
+    return publish_request(bridge, pending, request, error);
 }
 
 static guint64
@@ -218,9 +419,12 @@ static void
 on_authentication_cancelled(WebKitAuthenticationRequest *request,
                             MuxBrowserAffordanceBridge *bridge)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     guint64 request_id;
     PendingAffordance *pending;
 
+    bridge = guard;
     if (bridge->destroying)
         return;
     request_id = find_pending_object(bridge,
@@ -237,9 +441,12 @@ static void
 on_option_menu_closed(WebKitOptionMenu *menu,
                       MuxBrowserAffordanceBridge *bridge)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     guint64 request_id;
     PendingAffordance *pending;
 
+    bridge = guard;
     if (bridge->destroying)
         return;
     request_id = find_pending_object(bridge,
@@ -269,11 +476,14 @@ cancel_matching(MuxBrowserAffordanceBridge *bridge,
                 MuxUiCancelReason reason,
                 gboolean notify_pane)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     GHashTableIter iterator;
     gpointer value;
     GArray *request_ids = g_array_new(FALSE, FALSE, sizeof(guint64));
     guint i;
 
+    bridge = guard;
     g_hash_table_iter_init(&iterator, bridge->pending);
     while (g_hash_table_iter_next(&iterator, NULL, &value)) {
         PendingAffordance *pending = value;
@@ -295,6 +505,8 @@ cancel_matching(MuxBrowserAffordanceBridge *bridge,
             send_cancel(bridge, request_id, reason);
         resolve_cancel(pending);
         pending_affordance_free(pending);
+        if (bridge->destroying)
+            break;
     }
     g_array_unref(request_ids);
 }
@@ -324,6 +536,8 @@ on_authenticate(WebKitWebView *web_view,
                 WebKitAuthenticationRequest *authentication,
                 MuxBrowserAffordanceBridge *bridge)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_AUTHENTICATION);
     g_autoptr(GError) error = NULL;
@@ -336,6 +550,11 @@ on_authenticate(WebKitWebView *web_view,
     PendingAffordance *pending;
     guint port = webkit_authentication_request_get_port(authentication);
 
+    bridge = guard;
+    if (bridge->destroying) {
+        webkit_authentication_request_cancel(authentication);
+        return TRUE;
+    }
     request->request_id = next_request_id(bridge);
     request->flags = MUX_UI_REQUEST_FLAG_PASSWORD |
                      (bridge->private_profile
@@ -410,6 +629,13 @@ on_show_option_menu(WebKitWebView *web_view,
                     WebKitRectangle *rectangle,
                     MuxBrowserAffordanceBridge *bridge)
 {
+  g_autoptr(MuxBrowserAffordanceBridge) guard =
+    browser_affordance_bridge_ref (bridge);
+
+  bridge = guard;
+  if (bridge->destroying)
+    return FALSE;
+
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_OPTION_MENU);
     g_autoptr(GError) error = NULL;
@@ -467,6 +693,48 @@ on_show_option_menu(WebKitWebView *web_view,
         G_CALLBACK(on_option_menu_closed),
         bridge);
     return publish_request(bridge, pending, request, &error);
+}
+
+static void
+append_download_context_choice(MuxBrowserAffordanceBridge *bridge,
+                               MuxUiRequest *request,
+                               PendingAffordance *pending,
+                               const gchar *label,
+                               const gchar *uri)
+{
+    g_autofree gchar *scheme = NULL;
+    guint32 choice_id;
+    guint i;
+    ContextAction *stored;
+
+    if (!bridge->download_func || !uri || !*uri ||
+        strlen(uri) > MUX_UI_MAX_PATH || !g_utf8_validate(uri, -1, NULL) ||
+        request->choices->len >= MUX_UI_MAX_CHOICES)
+        return;
+    scheme = g_uri_parse_scheme(uri);
+    if (!scheme ||
+        !(g_ascii_strcasecmp(scheme, "http") == 0 ||
+          g_ascii_strcasecmp(scheme, "https") == 0 ||
+          g_ascii_strcasecmp(scheme, "ftp") == 0 ||
+          g_ascii_strcasecmp(scheme, "data") == 0 ||
+          g_ascii_strcasecmp(scheme, "blob") == 0 ||
+          g_ascii_strcasecmp(scheme, "file") == 0))
+        return;
+    for (i = 0; i < pending->context_actions->len; i++) {
+        const ContextAction *existing =
+            g_ptr_array_index(pending->context_actions, i);
+
+        if (existing->download_uri &&
+            g_str_equal(existing->download_uri, uri))
+            return;
+    }
+
+    choice_id = pending->context_actions->len;
+    stored = g_new0(ContextAction, 1);
+    stored->download_uri = g_strdup(uri);
+    g_ptr_array_add(pending->context_actions, stored);
+    g_ptr_array_add(request->choices,
+                    mux_ui_choice_new(choice_id, 0, label));
 }
 
 static void
@@ -554,7 +822,9 @@ context_has_selectable(const PendingAffordance *pending)
         const ContextAction *item =
             g_ptr_array_index(pending->context_actions, i);
 
-        if (item && item->action && g_action_get_enabled(item->action))
+        if (item &&
+            (item->download_uri ||
+             (item->action && g_action_get_enabled(item->action))))
             return TRUE;
     }
     return FALSE;
@@ -566,12 +836,18 @@ on_context_menu(WebKitWebView *web_view,
                 WebKitHitTestResult *hit_test,
                 MuxBrowserAffordanceBridge *bridge)
 {
+  g_autoptr(MuxBrowserAffordanceBridge) guard =
+    browser_affordance_bridge_ref (bridge);
+
+  bridge = guard;
+  if (bridge->destroying)
+    return FALSE;
+
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_CONTEXT_MENU);
     g_autoptr(GError) error = NULL;
     PendingAffordance *pending = g_new0(PendingAffordance, 1);
 
-    (void)hit_test;
     request->request_id = next_request_id(bridge);
     request->flags = bridge->private_profile
                          ? MUX_UI_REQUEST_FLAG_PRIVATE_PROFILE
@@ -585,6 +861,33 @@ on_context_menu(WebKitWebView *web_view,
     pending->kind = request->kind;
     pending->context_actions = g_ptr_array_new_with_free_func(
         (GDestroyNotify)context_action_free);
+    if (hit_test && webkit_hit_test_result_context_is_image(hit_test))
+        append_download_context_choice(
+            bridge,
+            request,
+            pending,
+            "Download image to clipboard",
+            webkit_hit_test_result_get_image_uri(hit_test));
+    if (hit_test && webkit_hit_test_result_context_is_media(hit_test))
+        append_download_context_choice(
+            bridge,
+            request,
+            pending,
+            "Download media to clipboard",
+            webkit_hit_test_result_get_media_uri(hit_test));
+    if (hit_test && webkit_hit_test_result_context_is_link(hit_test))
+        append_download_context_choice(
+            bridge,
+            request,
+            pending,
+            "Download link target to clipboard",
+            webkit_hit_test_result_get_link_uri(hit_test));
+    if (pending->context_actions->len == 0)
+        append_download_context_choice(bridge,
+                                       request,
+                                       pending,
+                                       "Download page to clipboard",
+                                       webkit_web_view_get_uri(web_view));
     append_context_menu(request, pending, menu, NULL, 0);
     if (!context_has_selectable(pending)) {
         pending_affordance_free(pending);
@@ -615,11 +918,16 @@ on_web_process_terminated(WebKitWebView *web_view,
                           WebKitWebProcessTerminationReason reason,
                           MuxBrowserAffordanceBridge *bridge)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_CRASH);
     g_autoptr(GError) error = NULL;
     PendingAffordance *pending;
 
+    bridge = guard;
+    if (bridge->destroying)
+        return;
     mux_browser_affordance_bridge_cancel_all(
         bridge,
         MUX_UI_CANCEL_UNDERLYING_GONE,
@@ -646,6 +954,12 @@ on_load_changed(WebKitWebView *web_view,
                 WebKitLoadEvent load_event,
                 MuxBrowserAffordanceBridge *bridge)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
+
+    bridge = guard;
+    if (bridge->destroying)
+        return;
     (void)web_view;
     if (load_event == WEBKIT_LOAD_COMMITTED)
         mux_browser_affordance_bridge_cancel_all(
@@ -817,14 +1131,33 @@ resolve_pending(MuxBrowserAffordanceBridge *bridge,
             return TRUE;
         if (action == MUX_UI_ACTION_SELECT &&
             parse_choice_id(value, &choice_id, error)) {
+            if (pending->command_choice_func) {
+                if (!g_hash_table_contains(pending->command_choice_ids,
+                                           &choice_id))
+                    break;
+                return pending->command_choice_func(choice_id,
+                                                    pending->command_data,
+                                                    error);
+            }
             ContextAction *item;
 
+            if (!pending->context_actions)
+                break;
             if (choice_id >= pending->context_actions->len)
                 break;
             item = g_ptr_array_index(pending->context_actions,
                                      choice_id);
-            if (!item || !item->action ||
-                !g_action_get_enabled(item->action))
+            if (!item)
+                break;
+            if (item->download_uri) {
+                if (!bridge->download_func)
+                    break;
+                return bridge->download_func(bridge->web_view,
+                                             item->download_uri,
+                                             bridge->user_data,
+                                             error);
+            }
+            if (!item->action || !g_action_get_enabled(item->action))
                 break;
             g_action_activate(item->action, item->target);
             return TRUE;
@@ -844,6 +1177,11 @@ resolve_pending(MuxBrowserAffordanceBridge *bridge,
                             g_object_unref);
             return TRUE;
         }
+        break;
+    case MUX_UI_REQUEST_NOTIFICATION:
+        if (action == MUX_UI_ACTION_ACKNOWLEDGE ||
+            action == MUX_UI_ACTION_CANCEL)
+            return TRUE;
         break;
     default:
         break;
@@ -870,6 +1208,7 @@ mux_browser_affordance_bridge_new(
     g_return_val_if_fail(send_func, NULL);
 
     bridge = g_new0(MuxBrowserAffordanceBridge, 1);
+    g_atomic_ref_count_init(&bridge->references);
     bridge->web_view = g_object_ref(web_view);
     bridge->pending = g_hash_table_new_full(
         g_int64_hash,
@@ -902,7 +1241,7 @@ mux_browser_affordance_bridge_new(
 void
 mux_browser_affordance_bridge_free(MuxBrowserAffordanceBridge *bridge)
 {
-    if (!bridge)
+    if (!bridge || bridge->destroying)
         return;
     bridge->destroying = TRUE;
     if (bridge->authenticate_handler)
@@ -924,11 +1263,7 @@ mux_browser_affordance_bridge_free(MuxBrowserAffordanceBridge *bridge)
         bridge,
         MUX_UI_CANCEL_VIEW_DESTROYED,
         FALSE);
-    g_hash_table_unref(bridge->pending);
-    if (bridge->user_data_destroy)
-        bridge->user_data_destroy(bridge->user_data);
-    g_object_unref(bridge->web_view);
-    g_free(bridge);
+    affordance_bridge_unref(bridge);
 }
 
 gboolean
@@ -938,9 +1273,18 @@ mux_browser_affordance_bridge_handle_payload(
     gsize length,
     GError **error)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(bridge, FALSE);
+    guard = affordance_bridge_ref(bridge);
+    if (bridge->destroying) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "browser affordance bridge is closing");
+        return FALSE;
+    }
     if (!mux_ui_record_type(data, length, &type, error))
         return FALSE;
 
@@ -1001,4 +1345,13 @@ mux_browser_affordance_bridge_pending_count(
 {
     g_return_val_if_fail(bridge, 0);
     return g_hash_table_size(bridge->pending);
+}
+
+void
+mux_browser_affordance_bridge_set_download_func(
+    MuxBrowserAffordanceBridge *bridge,
+    MuxBrowserAffordanceDownloadFunc download_func)
+{
+    g_return_if_fail(bridge);
+    bridge->download_func = download_func;
 }
