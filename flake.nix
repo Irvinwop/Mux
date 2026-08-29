@@ -65,7 +65,7 @@
             </fontconfig>
           '';
 
-          # nixpkgs 2.52.5 only packages the GTK port. Reuse its shared
+          # Pinned nixpkgs packages 2.52.5 of the GTK port. Reuse its shared
           # WebKit compiler, patch, and native-tool policy, while replacing
           # every port-specific input, flag, source, and package contract.
           wpeWebKit =
@@ -75,13 +75,17 @@
             }).overrideAttrs
               (_finalAttrs: previousAttrs: {
                 pname = "wpewebkit";
-                version = "2.52.5";
-                name = "wpewebkit-2.52.5";
+                version = "2.52.6";
+                name = "wpewebkit-2.52.6";
 
                 src = pkgs.fetchurl {
-                  url = "https://wpewebkit.org/releases/wpewebkit-2.52.5.tar.xz";
-                  hash = "sha256-vPxskdt2WdzyT2/3mtJ6werhvGHcoNv+4VRwaSZ0Czs=";
+                  url = "https://wpewebkit.org/releases/wpewebkit-2.52.6.tar.xz";
+                  hash = "sha256-srr+8nUWJbf99TDyMP8PVC/w7ro1kMOpidkxsqVchY4=";
                 };
+
+                patches = (previousAttrs.patches or [ ]) ++ [
+                  ./patches/wpewebkit/8f184a1bee4b-wpe-site-isolation-process-swap.patch
+                ];
 
                 # These are the common WebKit dependencies from the pinned
                 # GTK derivation plus the WPEPlatform DRM/Wayland stack.
