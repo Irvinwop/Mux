@@ -11,18 +11,12 @@ struct _MuxClipboardBrokerPeer {
     gchar *profile;
     MuxClipboardHistoryMode mode;
     MuxClipboardWireAssembler *assembler;
-    guint64 next_transaction_id;
+    guint64 pending_select_request_id;
+    guint64 pending_select_entry_id;
+    guint64 pending_select_transaction_id;
+    gint64 pending_select_deadline_us;
     gboolean closed;
 };
-
-static guint64
-next_transaction(MuxClipboardBrokerPeer *peer)
-{
-    peer->next_transaction_id++;
-    if (peer->next_transaction_id == 0)
-        peer->next_transaction_id++;
-    return peer->next_transaction_id;
-}
 
 static gboolean
 output_extension(MuxClipboardBrokerPeer *peer,
@@ -187,8 +181,6 @@ mux_clipboard_broker_peer_new(
     peer->user_data_destroy = user_data_destroy;
     peer->mode = MUX_CLIPBOARD_HISTORY_DISABLED;
     peer->assembler = mux_clipboard_wire_assembler_new(0);
-    peer->next_transaction_id =
-        ((guint64)g_random_int() << 32) | g_random_int();
     if (peer->assembler == NULL) {
         mux_clipboard_broker_peer_unref(peer);
         return NULL;
@@ -331,6 +323,16 @@ handle_select(MuxClipboardBrokerPeer *peer,
         record->flags & ~MUX_CLIPBOARD_CONTROL_FLAG_PASTE ||
         g_bytes_get_size(record->payload) != 0)
         return FALSE;
+    if (peer->pending_select_request_id != 0) {
+        operation_error = g_error_new_literal(
+            G_IO_ERROR,
+            G_IO_ERROR_BUSY,
+            "another clipboard selection is awaiting acknowledgement");
+        return send_error(peer,
+                          record->request_id,
+                          operation_error,
+                          error);
+    }
 
     snapshot = mux_clipboard_broker_select(peer->broker,
                                            peer->profile,
@@ -346,7 +348,13 @@ handle_select(MuxClipboardBrokerPeer *peer,
         flags |= MUX_CLIPBOARD_WIRE_FLAG_PASTE;
     if (peer->mode == MUX_CLIPBOARD_HISTORY_EPHEMERAL)
         flags |= MUX_CLIPBOARD_WIRE_FLAG_EPHEMERAL;
-    if (!mux_clipboard_wire_send_snapshot(next_transaction(peer),
+    peer->pending_select_request_id = record->request_id;
+    peer->pending_select_entry_id = record->entry_id;
+    peer->pending_select_transaction_id = record->request_id;
+    peer->pending_select_deadline_us =
+        g_get_monotonic_time() +
+        ((gint64)MUX_CLIPBOARD_WIRE_TIMEOUT_MS * 1000);
+    if (!mux_clipboard_wire_send_snapshot(record->request_id,
                                           flags,
                                           peer->profile,
                                           "mux-history",
@@ -355,12 +363,14 @@ handle_select(MuxClipboardBrokerPeer *peer,
                                           snapshot,
                                           output_wire,
                                           peer,
-                                          error))
+                                          error)) {
+        peer->pending_select_request_id = 0;
+        peer->pending_select_entry_id = 0;
+        peer->pending_select_transaction_id = 0;
+        peer->pending_select_deadline_us = 0;
         return FALSE;
-    return send_ok(peer,
-                   record->request_id,
-                   record->entry_id,
-                   error);
+    }
+    return TRUE;
 }
 
 static gboolean
@@ -531,16 +541,50 @@ handle_snapshot(MuxClipboardBrokerPeer *peer,
     if (!mux_clipboard_wire_record_decode(data, length, &record, error))
         return FALSE;
     if (record.type == MUX_CLIPBOARD_WIRE_ACK) {
+        guint64 request_id = peer->pending_select_request_id;
+        guint64 entry_id = peer->pending_select_entry_id;
+
+        if (record.flags != 0 || request_id == 0 ||
+            record.transaction_id !=
+                peer->pending_select_transaction_id) {
+            mux_clipboard_wire_record_clear(&record);
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_DATA,
+                                "clipboard selection ACK has no matching request");
+            return FALSE;
+        }
+        peer->pending_select_request_id = 0;
+        peer->pending_select_entry_id = 0;
+        peer->pending_select_transaction_id = 0;
+        peer->pending_select_deadline_us = 0;
         mux_clipboard_wire_record_clear(&record);
-        return TRUE;
+        return send_ok(peer, request_id, entry_id, error);
     }
     if (record.type == MUX_CLIPBOARD_WIRE_REMOTE_ERROR) {
+        guint64 request_id = peer->pending_select_request_id;
+        g_autoptr(GError) rejected = NULL;
+
+        if (request_id == 0 ||
+            record.transaction_id !=
+                peer->pending_select_transaction_id) {
+            mux_clipboard_wire_record_clear(&record);
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_DATA,
+                                "clipboard selection rejection has no matching request");
+            return FALSE;
+        }
+        rejected = g_error_new_literal(
+            G_IO_ERROR,
+            G_IO_ERROR_FAILED,
+            "clipboard client rejected broker selection");
+        peer->pending_select_request_id = 0;
+        peer->pending_select_entry_id = 0;
+        peer->pending_select_transaction_id = 0;
+        peer->pending_select_deadline_us = 0;
         mux_clipboard_wire_record_clear(&record);
-        g_set_error_literal(error,
-                            G_IO_ERROR,
-                            G_IO_ERROR_FAILED,
-                            "clipboard client rejected broker transfer");
-        return FALSE;
+        return send_error(peer, request_id, rejected, error);
     }
     feed_result = mux_clipboard_wire_assembler_feed(peer->assembler,
                                                     data,
@@ -646,7 +690,9 @@ mux_clipboard_broker_peer_tick(MuxClipboardBrokerPeer *peer,
 {
     g_return_val_if_fail(peer != NULL, FALSE);
     return mux_clipboard_wire_assembler_tick(peer->assembler,
-                                             monotonic_us);
+                                             monotonic_us) ||
+           (peer->pending_select_request_id != 0 &&
+            peer->pending_select_deadline_us <= monotonic_us);
 }
 
 const gchar *

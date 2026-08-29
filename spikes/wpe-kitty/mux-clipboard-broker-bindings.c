@@ -203,11 +203,8 @@ client_disconnected(gpointer protocol_pointer, const GError *error)
                                        "clipboard broker disconnected");
         error = fallback;
     }
-    if (binding->failure_func != NULL)
-        binding->failure_func(protocol->client,
-                              "transport",
-                              error,
-                              binding->user_data);
+    mux_clipboard_broker_client_handle_disconnect(protocol->client,
+                                                  error);
 }
 
 static void

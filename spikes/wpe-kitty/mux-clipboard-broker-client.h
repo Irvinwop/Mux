@@ -141,6 +141,9 @@ gboolean mux_clipboard_broker_client_handle_packet(
 guint mux_clipboard_broker_client_tick(
     MuxClipboardBrokerClient *client,
     gint64 monotonic_us);
+void mux_clipboard_broker_client_handle_disconnect(
+    MuxClipboardBrokerClient *client,
+    const GError *error);
 
 MuxClipboardBrokerClientState mux_clipboard_broker_client_get_state(
     const MuxClipboardBrokerClient *client);

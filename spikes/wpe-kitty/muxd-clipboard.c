@@ -8,6 +8,7 @@
 #define MUXD_CLIPBOARD_PEER_SWEEP_MS 1000u
 
 struct _MuxdClipboard {
+    gint shutdown_requested;
     GMainContext *context;
     MuxClipboardBroker *broker;
     MuxLocalListener *listener;
@@ -15,6 +16,27 @@ struct _MuxdClipboard {
     GSource *sweep_source;
     GPtrArray *peers;
 };
+
+static gboolean
+destroy_clipboard_on_context(gpointer user_data)
+{
+    MuxdClipboard *clipboard = user_data;
+
+    if (clipboard->sweep_source != NULL) {
+        g_source_destroy(clipboard->sweep_source);
+        g_source_unref(clipboard->sweep_source);
+    }
+    if (clipboard->listener_source != NULL) {
+        g_source_destroy(clipboard->listener_source);
+        g_source_unref(clipboard->listener_source);
+    }
+    g_clear_pointer(&clipboard->peers, g_ptr_array_unref);
+    g_clear_pointer(&clipboard->listener, mux_local_listener_unref);
+    g_clear_pointer(&clipboard->broker, mux_clipboard_broker_free);
+    g_clear_pointer(&clipboard->context, g_main_context_unref);
+    g_free(clipboard);
+    return G_SOURCE_REMOVE;
+}
 
 static gboolean
 accept_peer(MuxLocalListener *listener,
@@ -126,18 +148,17 @@ muxd_clipboard_free(MuxdClipboard *clipboard)
 {
     if (clipboard == NULL)
         return;
-
-    if (clipboard->sweep_source != NULL) {
-        g_source_destroy(clipboard->sweep_source);
-        g_source_unref(clipboard->sweep_source);
+    if (!g_atomic_int_compare_and_exchange(&clipboard->shutdown_requested,
+                                           0,
+                                           1))
+        return;
+    if (g_main_context_is_owner(clipboard->context)) {
+        destroy_clipboard_on_context(clipboard);
+        return;
     }
-    if (clipboard->listener_source != NULL) {
-        g_source_destroy(clipboard->listener_source);
-        g_source_unref(clipboard->listener_source);
-    }
-    g_clear_pointer(&clipboard->peers, g_ptr_array_unref);
-    g_clear_pointer(&clipboard->listener, mux_local_listener_unref);
-    g_clear_pointer(&clipboard->broker, mux_clipboard_broker_free);
-    g_clear_pointer(&clipboard->context, g_main_context_unref);
-    g_free(clipboard);
+    g_main_context_invoke_full(clipboard->context,
+                               G_PRIORITY_HIGH,
+                               destroy_clipboard_on_context,
+                               clipboard,
+                               NULL);
 }

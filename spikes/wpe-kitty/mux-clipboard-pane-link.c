@@ -16,6 +16,15 @@ typedef struct {
     gboolean rejected;
 } PendingEngineWrite;
 
+typedef struct {
+    gchar *source_origin;
+    guint64 source_view_id;
+    MuxClipboardSnapshot *snapshot;
+    gboolean paste;
+    gchar *rejection_reason;
+    gboolean rejected;
+} PendingHistoryApply;
+
 struct _MuxClipboardPaneLink {
     MuxClipboardLifetime lifetime;
     gchar *profile;
@@ -25,6 +34,7 @@ struct _MuxClipboardPaneLink {
     MuxKittyClipboard *kitty;
     MuxClipboardWireAssembler *assembler;
     PendingEngineWrite *pending_engine_write;
+    PendingHistoryApply *pending_history_apply;
     MuxClipboardPaneTerminalOutputFunc terminal_output_func;
     MuxClipboardPaneWireOutputFunc wire_output_func;
     MuxClipboardPaneObserveFunc observe_func;
@@ -56,9 +66,26 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxClipboardPaneLinkOperation,
 static void report_failure(MuxClipboardPaneLink *link,
                            const gchar *operation,
                            const GError *error);
+static gboolean send_snapshot(MuxClipboardPaneLink *link,
+                              guint32 flags,
+                              const gchar *source_origin,
+                              guint64 source_view_id,
+                              const MuxClipboardSnapshot *snapshot,
+                              GError **error);
 
 static void
 pending_engine_write_free(PendingEngineWrite *pending)
+{
+    if (pending == NULL)
+        return;
+    g_free(pending->source_origin);
+    g_free(pending->rejection_reason);
+    mux_clipboard_snapshot_unref(pending->snapshot);
+    g_free(pending);
+}
+
+static void
+pending_history_apply_free(PendingHistoryApply *pending)
 {
     if (pending == NULL)
         return;
@@ -200,6 +227,38 @@ complete_pending_engine_write(MuxClipboardPaneLink *link, GError **error)
     return result;
 }
 
+static gboolean
+complete_pending_history_apply(MuxClipboardPaneLink *link, GError **error)
+{
+    PendingHistoryApply *pending = link->pending_history_apply;
+    guint32 flags = MUX_CLIPBOARD_WIRE_FLAG_CURRENT;
+    gboolean result;
+
+    if (pending == NULL || mux_kitty_clipboard_write_pending(link->kitty))
+        return TRUE;
+    link->pending_history_apply = NULL;
+    if (pending->rejected) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            pending->rejection_reason != NULL
+                                ? pending->rejection_reason
+                                : "Kitty rejected clipboard history application");
+        pending_history_apply_free(pending);
+        return FALSE;
+    }
+    if (pending->paste)
+        flags |= MUX_CLIPBOARD_WIRE_FLAG_PASTE;
+    result = send_snapshot(link,
+                           flags,
+                           pending->source_origin,
+                           pending->source_view_id,
+                           pending->snapshot,
+                           error);
+    pending_history_apply_free(pending);
+    return result;
+}
+
 static guint64
 next_transaction(MuxClipboardPaneLink *link)
 {
@@ -258,6 +317,13 @@ kitty_failure(MuxKittyClipboard *clipboard,
         set_pending_rejection(link->pending_engine_write,
                               error != NULL ? error->message : NULL);
     }
+    if (g_strcmp0(operation, "clipboard-write") == 0 &&
+        link->pending_history_apply != NULL) {
+        g_free(link->pending_history_apply->rejection_reason);
+        link->pending_history_apply->rejection_reason =
+            bounded_failure_reason(error != NULL ? error->message : NULL);
+        link->pending_history_apply->rejected = TRUE;
+    }
     report_failure(link, operation, error);
 }
 
@@ -294,6 +360,7 @@ kitty_receive(MuxKittyClipboard *clipboard,
     g_autoptr(GError) error = NULL;
     guint32 flags = MUX_CLIPBOARD_WIRE_FLAG_CURRENT |
                     MUX_CLIPBOARD_WIRE_FLAG_HISTORY;
+    guint64 view_id = link->view_id;
 
     (void)clipboard;
     if (is_paste)
@@ -305,14 +372,14 @@ kitty_receive(MuxKittyClipboard *clipboard,
         link->observe_func(link,
                            link->profile,
                            "external",
-                           link->view_id,
+                           view_id,
                            flags,
                            snapshot,
                            link->user_data);
     if (!send_snapshot(link,
                        flags,
                        "external",
-                       link->view_id,
+                       view_id,
                        snapshot,
                        &error))
         report_failure(link, "clipboard-to-engine", error);
@@ -374,6 +441,7 @@ pane_link_destroy(MuxClipboardPaneLink *link)
     mux_kitty_clipboard_unref(link->kitty);
     mux_clipboard_wire_assembler_free(link->assembler);
     pending_engine_write_free(link->pending_engine_write);
+    pending_history_apply_free(link->pending_history_apply);
     if (link->user_data_destroy != NULL)
         link->user_data_destroy(link->user_data);
     g_free(link->profile);
@@ -414,6 +482,10 @@ mux_clipboard_pane_link_set_enabled(MuxClipboardPaneLink *link,
             link,
             "Kitty clipboard was disabled before write completion",
             &reject_error);
+    }
+    if (!enabled) {
+        g_clear_pointer(&link->pending_history_apply,
+                        pending_history_apply_free);
     }
     result = mux_kitty_clipboard_set_enabled(link->kitty, enabled, error);
     if (!rejection_sent) {
@@ -460,6 +532,8 @@ mux_clipboard_pane_link_handle_osc(MuxClipboardPaneLink *link,
                                            error);
     if (result)
         result = complete_pending_engine_write(link, error);
+    if (result)
+        result = complete_pending_history_apply(link, error);
     return result;
 }
 
@@ -522,21 +596,28 @@ mux_clipboard_pane_link_handle_packet(MuxClipboardPaneLink *link,
     if (feed_result == MUX_CLIPBOARD_WIRE_FEED_REJECTED)
         return FALSE;
 
+    transaction_id =
+        mux_clipboard_wire_transfer_get_transaction_id(transfer);
     if (mux_clipboard_wire_transfer_get_profile(transfer) == NULL ||
         !g_str_equal(mux_clipboard_wire_transfer_get_profile(transfer),
                      link->profile)) {
+        g_autoptr(GError) boundary_error = g_error_new_literal(
+            G_IO_ERROR,
+            G_IO_ERROR_PERMISSION_DENIED,
+            "clipboard transfer crossed profile boundary");
+
+        result = send_engine_result(link,
+                                    MUX_CLIPBOARD_WIRE_REMOTE_ERROR,
+                                    transaction_id,
+                                    boundary_error->message,
+                                    error);
+        report_failure(link, "clipboard-wire", boundary_error);
         mux_clipboard_wire_transfer_free(transfer);
-        g_set_error_literal(error,
-                            G_IO_ERROR,
-                            G_IO_ERROR_PERMISSION_DENIED,
-                            "clipboard transfer crossed profile boundary");
-        return FALSE;
+        return result;
     }
 
     flags = mux_clipboard_wire_transfer_get_flags(transfer);
     snapshot = mux_clipboard_wire_transfer_get_snapshot(transfer);
-    transaction_id =
-        mux_clipboard_wire_transfer_get_transaction_id(transfer);
     mux_clipboard_smoke_trace(
         MUX_CLIPBOARD_TRACE_ENGINE_TO_PANE,
         &(MuxClipboardTraceFields) {
@@ -610,6 +691,7 @@ mux_clipboard_pane_link_write_pending(const MuxClipboardPaneLink *link)
 {
     g_return_val_if_fail(link != NULL, FALSE);
     return link->pending_engine_write != NULL ||
+           link->pending_history_apply != NULL ||
            mux_kitty_clipboard_write_pending(link->kitty);
 }
 
@@ -623,13 +705,15 @@ mux_clipboard_pane_link_apply_history(
     GError **error)
 {
     g_autoptr(MuxClipboardPaneLinkOperation) operation = NULL;
-    guint32 flags = MUX_CLIPBOARD_WIRE_FLAG_CURRENT;
+    PendingHistoryApply *pending;
+    gboolean result;
 
     g_return_val_if_fail(link != NULL, FALSE);
     g_return_val_if_fail(snapshot != NULL, FALSE);
     operation = pane_link_acquire(link);
     (void)operation;
     if (link->pending_engine_write != NULL ||
+        link->pending_history_apply != NULL ||
         mux_kitty_clipboard_write_pending(link->kitty)) {
         g_set_error_literal(error,
                             G_IO_ERROR,
@@ -637,22 +721,23 @@ mux_clipboard_pane_link_apply_history(
                             "Kitty clipboard write is already pending");
         return FALSE;
     }
-    if (paste)
-        flags |= MUX_CLIPBOARD_WIRE_FLAG_PASTE;
-
-    if (!mux_kitty_clipboard_publish(link->kitty,
-                                     MUX_OSC5522_LOCATION_CLIPBOARD,
-                                     snapshot,
-                                     error))
+    pending = g_new0(PendingHistoryApply, 1);
+    pending->source_origin = g_strdup(source_origin);
+    pending->source_view_id = source_view_id;
+    pending->snapshot = mux_clipboard_snapshot_ref(
+        (MuxClipboardSnapshot *)snapshot);
+    pending->paste = paste;
+    link->pending_history_apply = pending;
+    result = mux_kitty_clipboard_publish(link->kitty,
+                                         MUX_OSC5522_LOCATION_CLIPBOARD,
+                                         snapshot,
+                                         error);
+    if (!result) {
+        link->pending_history_apply = NULL;
+        pending_history_apply_free(pending);
         return FALSE;
-    return send_snapshot(link,
-                         flags,
-                         source_origin,
-                         source_view_id != 0
-                             ? source_view_id
-                             : link->view_id,
-                         snapshot,
-                         error);
+    }
+    return complete_pending_history_apply(link, error);
 }
 
 guint
@@ -669,6 +754,10 @@ mux_clipboard_pane_link_tick(MuxClipboardPaneLink *link,
     expired = mux_kitty_clipboard_tick(link->kitty, monotonic_us);
     if (!complete_pending_engine_write(link, &error)) {
         report_failure(link, "clipboard-engine-ack", error);
+        g_clear_error(&error);
+    }
+    if (!complete_pending_history_apply(link, &error)) {
+        report_failure(link, "clipboard-history-apply", error);
         g_clear_error(&error);
     }
     if (mux_clipboard_wire_assembler_tick(link->assembler,

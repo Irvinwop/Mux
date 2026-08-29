@@ -10,10 +10,70 @@ struct _MuxWpeClipboard {
     GDestroyNotify publication_data_destroy;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
+    GMainContext *context;
     guint64 next_serial;
 };
 
+typedef struct {
+    MuxWpeClipboard *clipboard;
+    MuxClipboardSnapshot *snapshot;
+    MuxWpeClipboardPublishFunc publish_func;
+    GDestroyNotify publication_data_destroy;
+    gpointer publication_data;
+    gpointer user_data;
+} PendingPublication;
+
 G_DEFINE_TYPE(MuxWpeClipboard, mux_wpe_clipboard, WPE_TYPE_CLIPBOARD)
+
+static gboolean
+dispatch_publication(gpointer user_data)
+{
+    PendingPublication *pending = user_data;
+
+    pending->publish_func(pending->clipboard,
+                          pending->snapshot,
+                          pending->publication_data,
+                          pending->user_data);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+pending_publication_free(gpointer user_data)
+{
+    PendingPublication *pending = user_data;
+
+    if (pending->publication_data_destroy != NULL)
+        pending->publication_data_destroy(pending->publication_data);
+    mux_clipboard_snapshot_unref(pending->snapshot);
+    g_object_unref(pending->clipboard);
+    g_free(pending);
+}
+
+static void
+queue_publication(MuxWpeClipboard *clipboard,
+                  MuxClipboardSnapshot *snapshot,
+                  MuxWpeClipboardPublishFunc publish_func,
+                  GDestroyNotify publication_data_destroy,
+                  gpointer publication_data,
+                  gpointer user_data)
+{
+    PendingPublication *pending = g_new0(PendingPublication, 1);
+    GSource *source = g_idle_source_new();
+
+    pending->clipboard = g_object_ref(clipboard);
+    pending->snapshot = mux_clipboard_snapshot_ref(snapshot);
+    pending->publish_func = publish_func;
+    pending->publication_data_destroy = publication_data_destroy;
+    pending->publication_data = publication_data;
+    pending->user_data = user_data;
+    g_source_set_callback(source,
+                          dispatch_publication,
+                          pending,
+                          pending_publication_free);
+    g_source_set_name(source, "mux-wpe-clipboard-publication");
+    g_source_attach(source, clipboard->context);
+    g_source_unref(source);
+}
 
 static gpointer
 bounded_realloc(gpointer data, gsize size)
@@ -86,6 +146,8 @@ snapshot_from_content(MuxWpeClipboard *clipboard,
     MuxClipboardSnapshotItem items[MUX_CLIPBOARD_MAX_ITEMS] = { 0 };
     g_autoptr(GHashTable) seen = NULL;
     g_autoptr(GPtrArray) selected = NULL;
+    g_autoptr(GPtrArray) text_selected = NULL;
+    g_autoptr(GPtrArray) other_selected = NULL;
     MuxClipboardSnapshot *snapshot = NULL;
     gsize total = 0;
     guint item_count = 0;
@@ -105,6 +167,8 @@ snapshot_from_content(MuxWpeClipboard *clipboard,
 
     seen = g_hash_table_new(g_str_hash, g_str_equal);
     selected = g_ptr_array_new();
+    text_selected = g_ptr_array_new();
+    other_selected = g_ptr_array_new();
 
     for (i = 0; i < formats->len; i++) {
         const gchar *format = g_ptr_array_index(formats, i);
@@ -117,12 +181,22 @@ snapshot_from_content(MuxWpeClipboard *clipboard,
         }
         if (g_hash_table_contains(seen, format))
             continue;
-        if (selected->len >= MUX_CLIPBOARD_MAX_ITEMS) {
-            g_warning("WebKit clipboard omitted excess MIME variants");
-            break;
-        }
         g_hash_table_add(seen, (gpointer)format);
-        g_ptr_array_add(selected, (gpointer)format);
+        if (g_ascii_strncasecmp(format, "text/", 5) == 0) {
+            if (text_selected->len < MUX_CLIPBOARD_MAX_ITEMS)
+                g_ptr_array_add(text_selected, (gpointer)format);
+        } else if (other_selected->len < MUX_CLIPBOARD_MAX_ITEMS) {
+            g_ptr_array_add(other_selected, (gpointer)format);
+        }
+    }
+    for (i = 0; i < text_selected->len &&
+                selected->len < MUX_CLIPBOARD_MAX_ITEMS; i++)
+        g_ptr_array_add(selected, g_ptr_array_index(text_selected, i));
+    for (i = 0; i < other_selected->len &&
+                selected->len < MUX_CLIPBOARD_MAX_ITEMS; i++)
+        g_ptr_array_add(selected, g_ptr_array_index(other_selected, i));
+    if (text_selected->len + other_selected->len > selected->len) {
+        g_warning("WebKit clipboard omitted excess MIME variants");
     }
 
     /* Prefer text when bounded policy requires omitting MIME variants. */
@@ -211,23 +285,31 @@ mux_wpe_clipboard_changed(WPEClipboard *base,
     if (should_publish && clipboard->publish_begin_func != NULL)
         publication_data = clipboard->publish_begin_func(clipboard,
                                                          user_data);
-
-    parent_class->changed(base, formats, is_local, content);
-    if (!should_publish)
-        return;
-
-    snapshot = snapshot_from_content(clipboard, formats, content, &error);
-    if (snapshot == NULL) {
-        if (error != NULL)
-            g_warning("WebKit clipboard publication rejected: %s",
-                      error->message);
-        goto out;
+    if (is_local)
+        snapshot = snapshot_from_content(clipboard,
+                                         formats,
+                                         content,
+                                         &error);
+    if (snapshot != NULL) {
+        g_clear_pointer(&clipboard->external,
+                        mux_clipboard_snapshot_unref);
+        clipboard->external = mux_clipboard_snapshot_ref(snapshot);
     }
-    publish_func(clipboard, snapshot, publication_data, user_data);
-
-out:
-    if (publication_data_destroy != NULL)
+    if (should_publish && snapshot != NULL) {
+        queue_publication(clipboard,
+                          snapshot,
+                          publish_func,
+                          publication_data_destroy,
+                          publication_data,
+                          user_data);
+        publication_data = NULL;
+    } else if (should_publish && error != NULL) {
+        g_warning("WebKit clipboard publication rejected: %s",
+                  error->message);
+    }
+    if (publication_data != NULL && publication_data_destroy != NULL)
         publication_data_destroy(publication_data);
+    parent_class->changed(base, formats, is_local, content);
 }
 
 static void
@@ -238,6 +320,7 @@ mux_wpe_clipboard_finalize(GObject *object)
     g_clear_pointer(&clipboard->external, mux_clipboard_snapshot_unref);
     if (clipboard->user_data_destroy != NULL)
         clipboard->user_data_destroy(clipboard->user_data);
+    g_clear_pointer(&clipboard->context, g_main_context_unref);
 
     G_OBJECT_CLASS(mux_wpe_clipboard_parent_class)->finalize(object);
 }
@@ -280,6 +363,7 @@ mux_wpe_clipboard_new(WPEDisplay *display,
     clipboard->publication_data_destroy = publication_data_destroy;
     clipboard->user_data = user_data;
     clipboard->user_data_destroy = user_data_destroy;
+    clipboard->context = g_main_context_ref_thread_default();
     return clipboard;
 }
 
@@ -301,12 +385,12 @@ mux_wpe_clipboard_set_external(MuxWpeClipboard *clipboard,
     g_clear_pointer(&clipboard->external, mux_clipboard_snapshot_unref);
     clipboard->external = copy;
 
-    formats = g_ptr_array_new();
+    formats = g_ptr_array_new_with_free_func(g_free);
     for (i = 0; i < mux_clipboard_snapshot_get_count(copy); i++) {
         const gchar *mime = NULL;
 
         mux_clipboard_snapshot_get_item(copy, i, &mime, NULL);
-        g_ptr_array_add(formats, (gpointer)g_intern_string(mime));
+        g_ptr_array_add(formats, g_strdup(mime));
     }
     g_ptr_array_add(formats, NULL);
 
