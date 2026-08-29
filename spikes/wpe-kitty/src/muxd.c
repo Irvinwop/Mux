@@ -2250,7 +2250,9 @@ static gboolean secure_runtime_directory(const gchar *directory)
     int directory_fd;
 
     if (lstat(directory, &status) < 0) {
-        if (errno != ENOENT || mkdir(directory, 0700) < 0)
+        if (errno != ENOENT)
+            return FALSE;
+        if (mkdir(directory, 0700) < 0 && errno != EEXIST)
             return FALSE;
     }
 
@@ -2481,9 +2483,15 @@ static int run_server(void)
                           client_count + 1,
                           pending_move_poll_timeout(&server, 50));
         } while (result < 0 && errno == EINTR && !stop_requested);
+        int poll_error = result < 0 ? errno : 0;
 
         while (g_main_context_iteration(server.main_context, FALSE))
             ;
+        if (result < 0 && !(poll_error == EINTR && stop_requested)) {
+            g_printerr("muxd: poll failed: %s\n", g_strerror(poll_error));
+            server.stop_cleanup_failed = TRUE;
+            server.running = FALSE;
+        }
         if (result > 0) {
             if (poll_fds[0].revents & POLLIN)
                 accept_client(&server);
@@ -2507,20 +2515,18 @@ static int run_server(void)
         update_controlled_stop(&server);
     }
 
-    if (server.session_dirty && !persist_session_now(&server) &&
-        server.stopping)
+    if (server.session_dirty && !persist_session_now(&server))
         server.stop_cleanup_failed = TRUE;
-    if (!pending_moves_shutdown(&server) && server.stopping)
+    if (!pending_moves_shutdown(&server))
         server.stop_cleanup_failed = TRUE;
     muxd_clipboard_free(server.clipboard);
     g_main_context_unref(server.main_context);
     if (server.listener >= 0)
         close(server.listener);
-    if (unlink(server.socket_path) < 0 && errno != ENOENT &&
-        server.stopping)
+    if (unlink(server.socket_path) < 0 && errno != ENOENT)
         server.stop_cleanup_failed = TRUE;
     if (server.lock_fd >= 0) {
-        if (close(server.lock_fd) < 0 && server.stopping)
+        if (close(server.lock_fd) < 0)
             server.stop_cleanup_failed = TRUE;
         server.lock_fd = -1;
     }
@@ -2534,7 +2540,7 @@ static int run_server(void)
     g_free(server.current_layer);
     g_free(server.session_path);
     mux_session_state_free(server.session);
-    return EXIT_SUCCESS;
+    return server.stop_cleanup_failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 static gboolean daemon_alive_with_timeout(gint timeout_ms)
@@ -2639,6 +2645,30 @@ static gboolean terminate_and_reap_ensure_child(pid_t pid)
     return FALSE;
 }
 
+static gboolean terminate_and_cleanup_ensure_child(pid_t pid)
+{
+    EnsureOwnedSocket owned = { 0 };
+
+    ensure_owned_socket_capture(&owned, pid);
+    if (!terminate_and_reap_ensure_child(pid)) {
+        g_printerr("muxd: failed to terminate startup child %ld\n", (long)pid);
+        g_clear_pointer(&owned.path, g_free);
+        return FALSE;
+    }
+    ensure_owned_socket_cleanup(&owned);
+    return TRUE;
+}
+
+static void close_inherited_daemon_fds(void)
+{
+    long maximum_fd = sysconf(_SC_OPEN_MAX);
+
+    if (maximum_fd < 0)
+        maximum_fd = 1024;
+    for (long fd = STDERR_FILENO + 1; fd < maximum_fd; fd++)
+        close((int)fd);
+}
+
 static int ensure_daemon(void)
 {
     if (daemon_alive())
@@ -2653,20 +2683,25 @@ static int ensure_daemon(void)
     if (pid == 0) {
         if (setsid() < 0)
             _exit(EXIT_FAILURE);
-        int null_fd = open("/dev/null", O_RDWR);
-        if (null_fd >= 0) {
-            dup2(null_fd, STDIN_FILENO);
-            dup2(null_fd, STDOUT_FILENO);
-            dup2(null_fd, STDERR_FILENO);
+        int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (null_fd < 0 ||
+            dup2(null_fd, STDIN_FILENO) < 0 ||
+            dup2(null_fd, STDOUT_FILENO) < 0 ||
+            dup2(null_fd, STDERR_FILENO) < 0) {
             if (null_fd > STDERR_FILENO)
                 close(null_fd);
+            _exit(EXIT_FAILURE);
         }
+        if (null_fd > STDERR_FILENO)
+            close(null_fd);
+        close_inherited_daemon_fds();
         _exit(run_server());
     }
 
     gint64 startup_deadline_us =
         g_get_monotonic_time() +
         ((gint64)ENSURE_STARTUP_TIMEOUT_MS * 1000);
+    gboolean child_reaped = FALSE;
 
     while (g_get_monotonic_time() < startup_deadline_us) {
         int status;
@@ -2674,28 +2709,28 @@ static int ensure_daemon(void)
 
         if (daemon_alive_with_timeout(ENSURE_PING_TIMEOUT_MS))
             return EXIT_SUCCESS;
-        wait_result = waitpid(pid, &status, WNOHANG);
-        if (wait_result == pid) {
-            g_printerr("muxd: daemon exited before becoming ready\n");
-            return EXIT_FAILURE;
-        }
-        if (wait_result < 0 && errno != EINTR) {
-            g_printerr("muxd: cannot monitor daemon startup: %s\n",
-                       g_strerror(errno));
-            return EXIT_FAILURE;
+        if (!child_reaped) {
+            wait_result = waitpid(pid, &status, WNOHANG);
+            if (wait_result == pid) {
+                child_reaped = TRUE;
+            } else if (wait_result < 0 && errno != EINTR) {
+                if (errno == ECHILD) {
+                    child_reaped = TRUE;
+                } else {
+                    int saved_errno = errno;
+
+                    (void)terminate_and_cleanup_ensure_child(pid);
+                    g_printerr("muxd: cannot monitor daemon startup: %s\n",
+                               g_strerror(saved_errno));
+                    return EXIT_FAILURE;
+                }
+            }
         }
         g_usleep(ENSURE_STARTUP_POLL_US);
     }
 
-    EnsureOwnedSocket owned = { 0 };
-
-    ensure_owned_socket_capture(&owned, pid);
-    if (!terminate_and_reap_ensure_child(pid)) {
-        g_printerr("muxd: failed to terminate startup child %ld\n", (long)pid);
-        g_clear_pointer(&owned.path, g_free);
-    } else {
-        ensure_owned_socket_cleanup(&owned);
-    }
+    if (!child_reaped)
+        (void)terminate_and_cleanup_ensure_child(pid);
     g_printerr("muxd: daemon did not become ready\n");
     return EXIT_FAILURE;
 }
