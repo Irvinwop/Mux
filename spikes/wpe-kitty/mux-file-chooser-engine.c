@@ -20,6 +20,8 @@
 #define MUX_UPLOAD_WORKER_THREADS 2
 #define MUX_UPLOAD_MAX_SCHEDULED_JOBS 8u
 #define MUX_UPLOAD_TEMP_NAME ".mux-upload.tmp"
+#define MUX_UPLOAD_RETIRED_TTL_MS 30000u
+#define MUX_UPLOAD_CLEANUP_INTERVAL_MS 5000u
 
 #ifndef RENAME_NOREPLACE
 #define RENAME_NOREPLACE (1 << 0)
@@ -41,6 +43,7 @@ typedef struct {
     GPtrArray *file_paths;
     GPtrArray *item_directories;
     guint64 bytes;
+    gint64 retired_us;
 } StagedSelection;
 
 typedef struct {
@@ -66,6 +69,8 @@ struct _MuxFileChooserBridge {
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     gulong run_file_chooser_handler;
+    gulong load_changed_handler;
+    GSource *cleanup_source;
     gboolean disposing;
     gboolean disposed;
 };
@@ -205,6 +210,75 @@ queue_staged_selection_cleanup(StagedSelection *staged)
                                           : "worker pool unavailable"));
     g_clear_error(&error);
     /* Never move potentially blocking cleanup back onto the engine thread. */
+}
+
+static void
+remove_staged_selection(MuxFileChooserBridge *bridge, guint index)
+{
+    StagedSelection *staged;
+
+    if (!bridge->staged_selections ||
+        index >= bridge->staged_selections->len)
+        return;
+    staged = g_ptr_array_index(bridge->staged_selections, index);
+    g_ptr_array_remove_index(bridge->staged_selections, index);
+    g_mutex_lock(&bridge->quota_lock);
+    g_assert_cmpuint(bridge->staged_selection_count, >, 0);
+    g_assert_cmpuint(bridge->staged_file_count,
+                     >=,
+                     staged->file_paths->len);
+    g_assert_cmpuint(bridge->staged_bytes, >=, staged->bytes);
+    bridge->staged_selection_count--;
+    bridge->staged_file_count -= staged->file_paths->len;
+    bridge->staged_bytes -= staged->bytes;
+    g_mutex_unlock(&bridge->quota_lock);
+    queue_staged_selection_cleanup(staged);
+}
+
+static gboolean
+cleanup_retired_staged_selections(gpointer data)
+{
+    MuxFileChooserBridge *bridge = data;
+    gint64 now = g_get_monotonic_time();
+    guint index = 0;
+
+    if (bridge->disposing || bridge->disposed)
+        return G_SOURCE_CONTINUE;
+    while (index < bridge->staged_selections->len) {
+        StagedSelection *staged =
+            g_ptr_array_index(bridge->staged_selections, index);
+
+        if (staged->retired_us > 0 &&
+            now - staged->retired_us >=
+                MUX_UPLOAD_RETIRED_TTL_MS *
+                    (gint64)G_TIME_SPAN_MILLISECOND) {
+            remove_staged_selection(bridge, index);
+            continue;
+        }
+        index++;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+on_upload_load_changed(WebKitWebView *web_view,
+                       WebKitLoadEvent load_event,
+                       MuxFileChooserBridge *bridge)
+{
+    gint64 now;
+    guint i;
+
+    (void)web_view;
+    if (load_event != WEBKIT_LOAD_COMMITTED)
+        return;
+    now = g_get_monotonic_time();
+    for (i = 0; i < bridge->staged_selections->len; i++) {
+        StagedSelection *staged =
+            g_ptr_array_index(bridge->staged_selections, i);
+
+        if (staged->retired_us == 0)
+            staged->retired_us = now;
+    }
 }
 
 static void
@@ -470,6 +544,20 @@ mux_file_chooser_bridge_new(WebKitWebView *web_view,
                          "run-file-chooser",
                          G_CALLBACK(on_run_file_chooser),
                          bridge);
+    bridge->load_changed_handler =
+        g_signal_connect(web_view,
+                         "load-changed",
+                         G_CALLBACK(on_upload_load_changed),
+                         bridge);
+    bridge->cleanup_source =
+        g_timeout_source_new(MUX_UPLOAD_CLEANUP_INTERVAL_MS);
+    g_source_set_callback(bridge->cleanup_source,
+                          cleanup_retired_staged_selections,
+                          bridge,
+                          NULL);
+    g_source_set_name(bridge->cleanup_source,
+                      "mux-upload-retired-cleanup");
+    g_source_attach(bridge->cleanup_source, bridge->context);
     return bridge;
 }
 
@@ -1639,6 +1727,16 @@ mux_file_chooser_bridge_free(MuxFileChooserBridge *bridge)
         g_signal_handler_disconnect(bridge->web_view,
                                     bridge->run_file_chooser_handler);
         bridge->run_file_chooser_handler = 0;
+    }
+    if (bridge->load_changed_handler && bridge->web_view) {
+        g_signal_handler_disconnect(bridge->web_view,
+                                    bridge->load_changed_handler);
+        bridge->load_changed_handler = 0;
+    }
+    if (bridge->cleanup_source) {
+        g_source_destroy(bridge->cleanup_source);
+        g_source_unref(bridge->cleanup_source);
+        bridge->cleanup_source = NULL;
     }
     mux_file_chooser_bridge_cancel_all(
         bridge, MUX_UI_CANCEL_VIEW_DESTROYED, TRUE);

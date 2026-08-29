@@ -1817,6 +1817,40 @@ download_output(WebKitWebView *source_view,
     return FALSE;
 }
 
+static void
+download_event(const MuxDownloadEvent *event, gpointer data)
+{
+    Engine *engine = data;
+    EngineView *view;
+    g_autoptr(GError) error = NULL;
+    const gchar *heading;
+    const gchar *message;
+    gboolean danger;
+
+    if (!event ||
+        (event->type != MUX_DOWNLOAD_EVENT_CLIPBOARD_READY &&
+         event->type != MUX_DOWNLOAD_EVENT_CLIPBOARD_FAILED))
+        return;
+    view = view_for_web_view(engine, event->source_view);
+    if (!view || !view->affordance_bridge)
+        return;
+    danger = event->type == MUX_DOWNLOAD_EVENT_CLIPBOARD_FAILED;
+    heading = danger ? "Download to clipboard failed"
+                     : "Copied download to clipboard";
+    message = danger
+                  ? (event->message ? event->message
+                                    : "Clipboard publication failed.")
+                  : "The downloaded file is now the current clipboard item.";
+    if (!mux_browser_affordance_bridge_show_status(
+            view->affordance_bridge,
+            heading,
+            message,
+            danger,
+            &error))
+        g_warning("download clipboard status failed: %s",
+                  error ? error->message : "unknown error");
+}
+
 static gboolean
 add_download_clipboard_text(MuxClipboardSnapshot *snapshot,
                             const gchar *mime,
@@ -1832,11 +1866,13 @@ add_download_clipboard_text(MuxClipboardSnapshot *snapshot,
 }
 
 static MuxClipboardSnapshot *
-download_clipboard_snapshot(const gchar *path,
+download_clipboard_snapshot(const gchar *local_path,
+                            const gchar *public_path,
                             const gchar *mime_type,
                             GError **error)
 {
-    g_autofree gchar *uri = g_filename_to_uri(path, NULL, error);
+    g_autofree gchar *uri =
+        g_filename_to_uri(public_path, NULL, error);
     g_autofree gchar *uri_list = NULL;
     g_autofree gchar *gnome_files = NULL;
     MuxClipboardSnapshot *snapshot;
@@ -1869,13 +1905,13 @@ download_clipboard_snapshot(const gchar *path,
                                      error) ||
         !add_download_clipboard_text(snapshot,
                                      "text/plain;charset=utf-8",
-                                     path,
+                                     public_path,
                                      error)) {
         mux_clipboard_snapshot_unref(snapshot);
         return NULL;
     }
 
-    if (stat(path, &status) == 0 && S_ISREG(status.st_mode) &&
+    if (stat(local_path, &status) == 0 && S_ISREG(status.st_mode) &&
         status.st_size >= 0 &&
         (guint64)status.st_size <= MUX_CLIPBOARD_MAX_ITEM_BYTES &&
         !mux_clipboard_snapshot_find(snapshot, content_mime)) {
@@ -1885,7 +1921,7 @@ download_clipboard_snapshot(const gchar *path,
         if (status.st_size == 0) {
             bytes = g_bytes_new_static("", 0);
         } else {
-            mapped = g_mapped_file_new(path, FALSE, NULL);
+            mapped = g_mapped_file_new(local_path, FALSE, NULL);
             if (mapped)
                 bytes = g_mapped_file_get_bytes(mapped);
         }
@@ -1910,7 +1946,8 @@ download_clipboard_snapshot(const gchar *path,
 
 static gboolean
 download_clipboard_output(WebKitWebView *source_view,
-                          const gchar *path,
+                          const gchar *local_path,
+                          const gchar *public_path,
                           const gchar *mime_type,
                           gpointer data,
                           GError **error)
@@ -1928,7 +1965,10 @@ download_clipboard_output(WebKitWebView *source_view,
                             "clipboard download source pane is unavailable");
         return FALSE;
     }
-    snapshot = download_clipboard_snapshot(path, mime_type, error);
+    snapshot = download_clipboard_snapshot(local_path,
+                                           public_path,
+                                           mime_type,
+                                           error);
     if (!snapshot)
         return FALSE;
     origin = clipboard_origin(view);
@@ -1992,7 +2032,7 @@ engine_view_prepare_private_network(EngineView *view, GError **error)
     }
     view->download_manager = mux_download_manager_new(view->network_session,
                                                       download_output,
-                                                      NULL,
+                                                      download_event,
                                                       view->engine,
                                                       NULL);
     if (!view->download_manager) {
@@ -5860,7 +5900,7 @@ initialize_browser(Engine *engine, GError **error)
     engine->download_manager = mux_download_manager_new(
         engine->persistent_session,
         download_output,
-        NULL,
+        download_event,
         engine,
         NULL);
     if (!engine->download_manager) {

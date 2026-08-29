@@ -61,6 +61,13 @@ gboolean mux_browser_affordance_bridge_show_command_surface(
     GDestroyNotify user_data_destroy,
     GError **error);
 
+gboolean mux_browser_affordance_bridge_show_status(
+    MuxBrowserAffordanceBridge *bridge,
+    const gchar *heading,
+    const gchar *message,
+    gboolean danger,
+    GError **error);
+
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxBrowserAffordanceBridge,
                               mux_browser_affordance_bridge_free)
 

@@ -10,6 +10,7 @@ struct _MuxClipboardHistoryEntry {
     gchar *source_origin;
     guint64 source_view_id;
     MuxClipboardSnapshot *snapshot;
+    gchar *semantic_digest;
     gboolean pinned;
 };
 
@@ -32,6 +33,7 @@ history_entry_free(MuxClipboardHistoryEntry *entry)
     g_free(entry->profile);
     g_free(entry->storage_namespace);
     g_free(entry->source_origin);
+    g_free(entry->semantic_digest);
     mux_clipboard_snapshot_unref(entry->snapshot);
     g_free(entry);
 }
@@ -88,6 +90,83 @@ scope_name(MuxClipboardHistoryScope scope)
     }
 }
 
+static gboolean mime_has_base(const gchar *mime, const gchar *base);
+
+static guint
+history_mime_priority(const gchar *mime)
+{
+    if (mime_has_base(mime, "text/plain"))
+        return 0;
+    if (mime_has_base(mime, "text/uri-list"))
+        return 1;
+    if (mime_has_base(mime, "text/html"))
+        return 2;
+    if (g_ascii_strncasecmp(mime, "text/", 5) == 0)
+        return 3;
+    return 4;
+}
+
+typedef struct {
+    const gchar *mime;
+    GBytes *bytes;
+} HistoryDigestItem;
+
+static gint
+history_digest_item_compare(gconstpointer left, gconstpointer right)
+{
+    const HistoryDigestItem *left_item =
+        *(HistoryDigestItem * const *)left;
+    const HistoryDigestItem *right_item =
+        *(HistoryDigestItem * const *)right;
+
+    return g_strcmp0(left_item->mime, right_item->mime);
+}
+
+static gchar *
+history_semantic_digest(const MuxClipboardSnapshot *snapshot)
+{
+    g_autoptr(GPtrArray) items =
+        g_ptr_array_new_with_free_func(g_free);
+    GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    guint64 count = GUINT64_TO_BE(
+        mux_clipboard_snapshot_get_count(snapshot));
+    gchar *digest;
+    guint i;
+
+    g_checksum_update(checksum, (const guchar *)&count, sizeof(count));
+    for (i = 0; i < mux_clipboard_snapshot_get_count(snapshot); i++) {
+        HistoryDigestItem *item = g_new0(HistoryDigestItem, 1);
+
+        mux_clipboard_snapshot_get_item(snapshot,
+                                        i,
+                                        &item->mime,
+                                        &item->bytes);
+        g_ptr_array_add(items, item);
+    }
+    g_ptr_array_sort(items, history_digest_item_compare);
+    for (i = 0; i < items->len; i++) {
+        HistoryDigestItem *item = g_ptr_array_index(items, i);
+        gsize length = 0;
+        const guint8 *data = g_bytes_get_data(item->bytes, &length);
+        guint64 mime_length = GUINT64_TO_BE(strlen(item->mime));
+        guint64 data_length = GUINT64_TO_BE(length);
+
+        g_checksum_update(checksum,
+                          (const guchar *)&mime_length,
+                          sizeof(mime_length));
+        g_checksum_update(checksum,
+                          (const guchar *)item->mime,
+                          strlen(item->mime));
+        g_checksum_update(checksum,
+                          (const guchar *)&data_length,
+                          sizeof(data_length));
+        g_checksum_update(checksum, data, length);
+    }
+    digest = g_strdup(g_checksum_get_string(checksum));
+    g_checksum_free(checksum);
+    return digest;
+}
+
 static MuxClipboardSnapshot *
 history_snapshot(const MuxClipboardSnapshot *source,
                  gboolean *degraded,
@@ -95,21 +174,19 @@ history_snapshot(const MuxClipboardSnapshot *source,
 {
     MuxClipboardSnapshot *copy;
     gboolean omitted = FALSE;
-    guint pass;
+    guint priority;
     guint i;
 
     copy = mux_clipboard_snapshot_new(
         mux_clipboard_snapshot_get_serial(source));
-    for (pass = 0; pass < 2; pass++) {
+    for (priority = 0; priority < 5; priority++) {
         for (i = 0; i < mux_clipboard_snapshot_get_count(source); i++) {
             const gchar *mime = NULL;
             GBytes *bytes = NULL;
-            gboolean is_text;
             gsize length;
 
             mux_clipboard_snapshot_get_item(source, i, &mime, &bytes);
-            is_text = g_ascii_strncasecmp(mime, "text/", 5) == 0;
-            if (is_text != (pass == 0))
+            if (history_mime_priority(mime) != priority)
                 continue;
 
             length = g_bytes_get_size(bytes);
@@ -316,6 +393,7 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
     MuxClipboardSnapshot *filtered;
     GList *link;
     MuxClipboardHistoryEntry *entry;
+    g_autofree gchar *semantic_digest = NULL;
     gsize bytes;
     gboolean degraded = FALSE;
 
@@ -336,13 +414,15 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
         return MUX_CLIPBOARD_HISTORY_IGNORED;
     }
 
+    semantic_digest = history_semantic_digest(snapshot);
     filtered = history_snapshot(snapshot, &degraded, error);
     if (filtered == NULL)
         return MUX_CLIPBOARD_HISTORY_IGNORED;
 
     for (link = history->entries.head; link != NULL; link = link->next) {
         entry = link->data;
-        if (!snapshots_equal(entry->snapshot, filtered))
+        if (!g_str_equal(entry->semantic_digest, semantic_digest) ||
+            !snapshots_equal(entry->snapshot, filtered))
             continue;
 
         entry->created_us = created_us > 0
@@ -379,6 +459,7 @@ mux_clipboard_history_add(MuxClipboardHistory *history,
     entry->source_origin = g_strdup(source_origin);
     entry->source_view_id = source_view_id;
     entry->snapshot = filtered;
+    entry->semantic_digest = g_steal_pointer(&semantic_digest);
     g_queue_push_head(&history->entries, entry);
     history->total_bytes += bytes;
     if (entry_id != NULL)

@@ -14,6 +14,8 @@ typedef struct _MuxDownloadManager MuxDownloadManager;
 #define MUX_DOWNLOAD_MAX_ACTIVE_PER_VIEW 4U
 #define MUX_DOWNLOAD_MAX_ACTIVE_GLOBAL 16U
 #define MUX_DOWNLOAD_DESTINATION_TIMEOUT_MS 120000U
+#define MUX_DOWNLOAD_CLIPBOARD_MAX_FILES 64U
+#define MUX_DOWNLOAD_CLIPBOARD_MAX_BYTES ((guint64)512 * 1024 * 1024)
 
 typedef enum {
     MUX_DOWNLOAD_EVENT_STARTED,
@@ -22,6 +24,8 @@ typedef enum {
     MUX_DOWNLOAD_EVENT_FINISHED,
     MUX_DOWNLOAD_EVENT_FAILED,
     MUX_DOWNLOAD_EVENT_CANCELLED,
+    MUX_DOWNLOAD_EVENT_CLIPBOARD_READY,
+    MUX_DOWNLOAD_EVENT_CLIPBOARD_FAILED,
 } MuxDownloadEventType;
 
 typedef struct {
@@ -47,7 +51,8 @@ typedef void (*MuxDownloadEventFunc)(const MuxDownloadEvent *event,
                                      gpointer user_data);
 
 typedef gboolean (*MuxDownloadClipboardFunc)(WebKitWebView *source_view,
-                                              const gchar *path,
+                                              const gchar *local_path,
+                                              const gchar *public_path,
                                               const gchar *mime_type,
                                               gpointer user_data,
                                               GError **error);

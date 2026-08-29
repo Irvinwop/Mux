@@ -63,6 +63,11 @@ typedef struct {
     gulong finished_handler;
 } PendingDownload;
 
+typedef struct {
+    guint64 size;
+    gchar *public_path;
+} ClipboardFileRecord;
+
 struct _MuxDownloadManager {
     WebKitNetworkSession *network_session;
     GHashTable *by_download;
@@ -79,10 +84,22 @@ struct _MuxDownloadManager {
     gulong download_started_handler;
     GHashTable *clipboard_requests;
     GPtrArray *clipboard_paths;
+    GHashTable *clipboard_files;
+    guint64 clipboard_bytes;
     gchar *clipboard_directory;
+    gchar *clipboard_host_directory;
 };
 
 static gboolean safe_destination_directory(const struct stat *status);
+
+static void
+clipboard_file_record_free(ClipboardFileRecord *record)
+{
+    if (!record)
+        return;
+    g_free(record->public_path);
+    g_free(record);
+}
 
 static gpointer
 download_view_key(MuxDownloadManager *manager,
@@ -269,15 +286,67 @@ default_download_directory(void)
     return g_build_filename(g_get_home_dir(), "Downloads", NULL);
 }
 
+static gchar *
+configured_absolute_path(const gchar *variable)
+{
+    const gchar *value = g_getenv(variable);
+    const gchar *cursor;
+
+    if (!value || !*value || !g_path_is_absolute(value) ||
+        !g_utf8_validate(value, -1, NULL))
+        return NULL;
+    for (cursor = value; *cursor; cursor = g_utf8_next_char(cursor)) {
+        if (g_unichar_iscntrl(g_utf8_get_char(cursor)))
+            return NULL;
+    }
+    return g_canonicalize_filename(value, NULL);
+}
+
 static gboolean
-ensure_clipboard_directory(MuxDownloadManager *manager, GError **error)
+ensure_secure_export_root(const gchar *path)
 {
     struct stat status;
 
+    if (g_mkdir_with_parents(path, 0700) < 0 ||
+        g_chmod(path, 0700) < 0 ||
+        g_stat(path, &status) < 0)
+        return FALSE;
+    return safe_destination_directory(&status) &&
+           (status.st_mode & 0777) == 0700;
+}
+
+static gboolean
+ensure_clipboard_directory(MuxDownloadManager *manager, GError **error)
+{
+    g_autofree gchar *export_root = NULL;
+    g_autofree gchar *host_root = NULL;
+    g_autofree gchar *directory_template = NULL;
+    g_autofree gchar *directory_name = NULL;
+    struct stat status;
+    gboolean exported = FALSE;
+
     if (manager->clipboard_directory)
         return TRUE;
-    manager->clipboard_directory =
-        g_dir_make_tmp("mux-download-clipboard-XXXXXX", error);
+
+    export_root = configured_absolute_path("MUX_CLIPBOARD_EXPORT_ROOT");
+    if (export_root && ensure_secure_export_root(export_root)) {
+        directory_template = g_build_filename(
+            export_root, "mux-download-clipboard-XXXXXX", NULL);
+        if (g_mkdtemp_full(directory_template, 0700)) {
+            manager->clipboard_directory =
+                g_steal_pointer(&directory_template);
+            exported = TRUE;
+        } else {
+            g_warning("cannot create configured clipboard export directory: %s",
+                      g_strerror(errno));
+        }
+    } else if (export_root) {
+        g_warning("ignoring unsafe MUX_CLIPBOARD_EXPORT_ROOT");
+    }
+
+    if (!manager->clipboard_directory)
+        manager->clipboard_directory =
+            g_dir_make_tmp("mux-download-clipboard-XXXXXX", error);
     if (!manager->clipboard_directory)
         return FALSE;
     errno = 0;
@@ -296,6 +365,17 @@ ensure_clipboard_directory(MuxDownloadManager *manager, GError **error)
                     g_strerror(saved_errno));
         return FALSE;
     }
+
+    if (exported) {
+        host_root = configured_absolute_path(
+            "MUX_CLIPBOARD_HOST_EXPORT_ROOT");
+        if (host_root) {
+            directory_name = g_path_get_basename(
+                manager->clipboard_directory);
+            manager->clipboard_host_directory = g_build_filename(
+                host_root, directory_name, NULL);
+        }
+    }
     return TRUE;
 }
 
@@ -313,6 +393,10 @@ cleanup_clipboard_directory(MuxDownloadManager *manager)
         g_rmdir(manager->clipboard_directory);
         g_clear_pointer(&manager->clipboard_directory, g_free);
     }
+    if (manager->clipboard_files)
+        g_hash_table_remove_all(manager->clipboard_files);
+    manager->clipboard_bytes = 0;
+    g_clear_pointer(&manager->clipboard_host_directory, g_free);
 }
 
 static gchar *
@@ -473,6 +557,211 @@ safe_owned_regular(const struct stat *status)
 {
     return S_ISREG(status->st_mode) && status->st_uid == geteuid() &&
            status->st_nlink == 1;
+}
+
+static gchar *
+clipboard_file_sha256(const gchar *path,
+                      guint64 *size_out,
+                      GError **error)
+{
+    g_autofree guint8 *buffer = g_malloc(128U * 1024U);
+    GChecksum *checksum = NULL;
+    struct stat before;
+    struct stat after;
+    gchar *digest = NULL;
+    gint descriptor;
+
+    descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "cannot open clipboard download for hashing: %s",
+                    g_strerror(errno));
+        return NULL;
+    }
+    if (fstat(descriptor, &before) < 0 ||
+        !safe_owned_regular(&before) || before.st_size < 0) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_DATA,
+                            "clipboard download is not a stable owned file");
+        close(descriptor);
+        return NULL;
+    }
+    if ((guint64)before.st_size > MUX_DOWNLOAD_CLIPBOARD_MAX_BYTES) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "clipboard download exceeds the 512 MiB store limit");
+        close(descriptor);
+        return NULL;
+    }
+
+    checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    for (;;) {
+        ssize_t received = read(descriptor, buffer, 128U * 1024U);
+
+        if (received > 0) {
+            g_checksum_update(checksum, buffer, (gsize)received);
+            continue;
+        }
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received < 0) {
+            g_set_error(error,
+                        G_FILE_ERROR,
+                        g_file_error_from_errno(errno),
+                        "cannot hash clipboard download: %s",
+                        g_strerror(errno));
+            goto out;
+        }
+        break;
+    }
+    if (fstat(descriptor, &after) < 0 ||
+        !same_inode(&before, &after) || before.st_size != after.st_size ||
+        before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+        before.st_mtim.tv_nsec != after.st_mtim.tv_nsec) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_BUSY,
+                            "clipboard download changed while it was hashed");
+        goto out;
+    }
+    digest = g_strdup(g_checksum_get_string(checksum));
+    if (size_out)
+        *size_out = (guint64)before.st_size;
+
+out:
+    g_checksum_free(checksum);
+    close(descriptor);
+    return digest;
+}
+
+static gchar *
+clipboard_stable_filename(const gchar *digest, const gchar *suggested)
+{
+    g_autofree gchar *safe = sanitize_filename(suggested);
+    gsize length = MIN(strlen(safe), (gsize)180);
+
+    while (length && !g_utf8_validate(safe, length, NULL))
+        length--;
+    return g_strdup_printf("%s-%.*s", digest, (gint)length, safe);
+}
+
+static gboolean
+prepare_clipboard_file(PendingDownload *pending,
+                       gchar **local_path_out,
+                       gchar **public_path_out,
+                       guint64 *size_out,
+                       gboolean *already_retained_out,
+                       GError **error)
+{
+    MuxDownloadManager *manager = pending->manager;
+    g_autofree gchar *digest = NULL;
+    g_autofree gchar *filename = NULL;
+    g_autofree gchar *stable_path = NULL;
+    g_autofree gchar *public_path = NULL;
+    ClipboardFileRecord *record;
+    struct stat status;
+    guint64 size = 0;
+
+    digest = clipboard_file_sha256(pending->final_path, &size, error);
+    if (!digest)
+        return FALSE;
+    filename = clipboard_stable_filename(
+        digest,
+        pending->suggested_filename ? pending->suggested_filename
+                                    : pending->final_name);
+    stable_path = g_build_filename(manager->clipboard_directory,
+                                   filename,
+                                   NULL);
+    record = manager->clipboard_files
+                 ? g_hash_table_lookup(manager->clipboard_files, stable_path)
+                 : NULL;
+    if (record) {
+        if (record->size != size || g_stat(stable_path, &status) < 0 ||
+            !safe_owned_regular(&status) || (guint64)status.st_size != size) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_DATA,
+                                "retained clipboard download failed validation");
+            return FALSE;
+        }
+        if (g_unlink(pending->final_path) < 0) {
+            g_set_error(error,
+                        G_FILE_ERROR,
+                        g_file_error_from_errno(errno),
+                        "cannot discard duplicate clipboard download: %s",
+                        g_strerror(errno));
+            return FALSE;
+        }
+        g_free(pending->final_path);
+        pending->final_path = g_strdup(stable_path);
+        *local_path_out = g_strdup(stable_path);
+        *public_path_out = g_strdup(record->public_path);
+        *size_out = size;
+        *already_retained_out = TRUE;
+        return TRUE;
+    }
+
+    if ((manager->clipboard_files &&
+         g_hash_table_size(manager->clipboard_files) >=
+             MUX_DOWNLOAD_CLIPBOARD_MAX_FILES) ||
+        manager->clipboard_bytes > MUX_DOWNLOAD_CLIPBOARD_MAX_BYTES ||
+        size > MUX_DOWNLOAD_CLIPBOARD_MAX_BYTES -
+                   manager->clipboard_bytes) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "clipboard download store is full");
+        return FALSE;
+    }
+    if (g_file_test(stable_path, G_FILE_TEST_EXISTS)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_EXISTS,
+                            "clipboard content-addressed path already exists");
+        return FALSE;
+    }
+    if (g_rename(pending->final_path, stable_path) < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "cannot publish content-addressed clipboard download: %s",
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (manager->clipboard_host_directory)
+        public_path = g_build_filename(manager->clipboard_host_directory,
+                                       filename,
+                                       NULL);
+    else
+        public_path = g_strdup(stable_path);
+    g_free(pending->final_path);
+    pending->final_path = g_strdup(stable_path);
+    *local_path_out = g_steal_pointer(&stable_path);
+    *public_path_out = g_steal_pointer(&public_path);
+    *size_out = size;
+    *already_retained_out = FALSE;
+    return TRUE;
+}
+
+static void
+retain_clipboard_file(MuxDownloadManager *manager,
+                      const gchar *local_path,
+                      const gchar *public_path,
+                      guint64 size)
+{
+    ClipboardFileRecord *record = g_new0(ClipboardFileRecord, 1);
+
+    record->size = size;
+    record->public_path = g_strdup(public_path);
+    g_hash_table_insert(manager->clipboard_files,
+                        g_strdup(local_path),
+                        record);
+    g_ptr_array_add(manager->clipboard_paths, g_strdup(local_path));
+    manager->clipboard_bytes += size;
 }
 
 static gboolean
@@ -1303,47 +1592,71 @@ on_finished(WebKitDownload *download, PendingDownload *pending)
             g_autofree gchar *mime_type = g_strdup(
                 response ? webkit_uri_response_get_mime_type(response)
                          : NULL);
-            g_autofree gchar *path = g_strdup(pending->final_path);
+            g_autofree gchar *local_path = NULL;
+            g_autofree gchar *public_path = NULL;
             WebKitWebView *view = pending->source_view
                                       ? g_object_ref(pending->source_view)
                                       : NULL;
             gpointer callback_data = manager->user_data;
+            guint64 clipboard_size = 0;
+            gboolean already_retained = FALSE;
+            gboolean published = FALSE;
 
-            if (g_chmod(path, 0600) < 0 || !clipboard_func) {
-                g_autofree gchar *message = !clipboard_func
-                    ? g_strdup("clipboard publication is unavailable")
-                    : g_strdup_printf("cannot secure clipboard file: %s",
-                                      g_strerror(errno));
-
-                g_unlink(path);
-                pending->state = DOWNLOAD_STATE_FAILED;
-                remove_pending(pending);
-                if (view)
-                    g_object_unref(view);
-                g_warning("download to clipboard failed: %s", message);
-                return;
+            if (g_chmod(pending->final_path, 0600) < 0) {
+                g_set_error(&error,
+                            G_FILE_ERROR,
+                            g_file_error_from_errno(errno),
+                            "cannot secure clipboard file: %s",
+                            g_strerror(errno));
+            } else if (!clipboard_func) {
+                g_set_error_literal(&error,
+                                    G_IO_ERROR,
+                                    G_IO_ERROR_NOT_SUPPORTED,
+                                    "clipboard publication is unavailable");
+            } else if (prepare_clipboard_file(pending,
+                                              &local_path,
+                                              &public_path,
+                                              &clipboard_size,
+                                              &already_retained,
+                                              &error)) {
+                published = clipboard_func(view,
+                                           local_path,
+                                           public_path,
+                                           mime_type,
+                                           callback_data,
+                                           &error);
             }
+            if (published && !already_retained)
+                retain_clipboard_file(manager,
+                                      local_path,
+                                      public_path,
+                                      clipboard_size);
+            if (!published && local_path && !already_retained)
+                g_unlink(local_path);
+            if (!published && !local_path)
+                g_unlink(pending->final_path);
 
-            pending->state = DOWNLOAD_STATE_FINISHED;
-            g_ptr_array_add(manager->clipboard_paths, g_strdup(path));
-            remove_pending(pending);
-            if (!clipboard_func(view,
-                                path,
-                                mime_type,
-                                callback_data,
-                                &error))
-                g_warning("download to clipboard publication failed: %s",
-                          error ? error->message : "unknown error");
+            pending->state = published ? DOWNLOAD_STATE_FINISHED
+                                       : DOWNLOAD_STATE_FAILED;
+            event.type = published
+                             ? MUX_DOWNLOAD_EVENT_CLIPBOARD_READY
+                             : MUX_DOWNLOAD_EVENT_CLIPBOARD_FAILED;
+            if (!published)
+                event_message = g_strdup(
+                    error ? error->message
+                          : "clipboard publication failed");
+            emit_terminal = TRUE;
             if (view)
                 g_object_unref(view);
-            return;
         } else if (!error) {
             pending->state = DOWNLOAD_STATE_FINISHED;
             event.type = MUX_DOWNLOAD_EVENT_FINISHED;
         } else {
             pending->state = DOWNLOAD_STATE_FAILED;
             cleanup_files(pending);
-            event.type = MUX_DOWNLOAD_EVENT_FAILED;
+            event.type = pending->clipboard_target
+                             ? MUX_DOWNLOAD_EVENT_CLIPBOARD_FAILED
+                             : MUX_DOWNLOAD_EVENT_FAILED;
             event_message = g_strdup(error->message);
         }
         emit_terminal = TRUE;
@@ -1464,6 +1777,11 @@ mux_download_manager_new(WebKitNetworkSession *network_session,
                                                         g_object_unref,
                                                         NULL);
     manager->clipboard_paths = g_ptr_array_new_with_free_func(g_free);
+    manager->clipboard_files = g_hash_table_new_full(
+        g_str_hash,
+        g_str_equal,
+        g_free,
+        (GDestroyNotify)clipboard_file_record_free);
     manager->send_func = send_func;
     manager->event_func = event_func;
     manager->user_data = user_data;
@@ -1504,6 +1822,7 @@ mux_download_manager_free(MuxDownloadManager *manager)
     g_clear_pointer(&manager->active_by_view, g_hash_table_unref);
     g_clear_pointer(&manager->clipboard_requests, g_hash_table_unref);
     cleanup_clipboard_directory(manager);
+    g_clear_pointer(&manager->clipboard_files, g_hash_table_unref);
     g_clear_pointer(&manager->clipboard_paths, g_ptr_array_unref);
     if (manager->user_data_destroy)
         manager->user_data_destroy(manager->user_data);

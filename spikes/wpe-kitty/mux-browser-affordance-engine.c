@@ -301,6 +301,35 @@ mux_browser_affordance_bridge_show_command_surface(
     return publish_request(bridge, pending, request, error);
 }
 
+gboolean
+mux_browser_affordance_bridge_show_status(
+    MuxBrowserAffordanceBridge *bridge,
+    const gchar *heading,
+    const gchar *message,
+    gboolean danger,
+    GError **error)
+{
+    g_autoptr(MuxUiRequest) request =
+        mux_ui_request_new(MUX_UI_REQUEST_NOTIFICATION);
+    PendingAffordance *pending;
+
+    g_return_val_if_fail(bridge, FALSE);
+    pending = g_new0(PendingAffordance, 1);
+    pending->request_id = next_request_id(bridge);
+    pending->kind = request->kind;
+    request->request_id = pending->request_id;
+    request->flags = (bridge->private_profile
+                          ? MUX_UI_REQUEST_FLAG_PRIVATE_PROFILE
+                          : 0) |
+                     (danger ? MUX_UI_REQUEST_FLAG_DANGER : 0);
+    request->deadline_ms = 15000;
+    request->origin = view_origin(bridge->web_view);
+    request->heading = bounded_utf8(heading, 1024);
+    request->message = bounded_utf8(message, MUX_UI_MAX_MESSAGE);
+    supersede_kind(bridge, MUX_UI_REQUEST_NOTIFICATION);
+    return publish_request(bridge, pending, request, error);
+}
+
 static guint64
 find_pending_object(MuxBrowserAffordanceBridge *bridge,
                     MuxUiRequestKind kind,
@@ -1045,6 +1074,11 @@ resolve_pending(MuxBrowserAffordanceBridge *bridge,
                             g_object_unref);
             return TRUE;
         }
+        break;
+    case MUX_UI_REQUEST_NOTIFICATION:
+        if (action == MUX_UI_ACTION_ACKNOWLEDGE ||
+            action == MUX_UI_ACTION_CANCEL)
+            return TRUE;
         break;
     default:
         break;
