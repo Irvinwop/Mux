@@ -3,6 +3,7 @@
 #include <string.h>
 
 struct _MuxUiPaneBridge {
+    gatomicrefcount references;
     MuxPaneOverlay *overlay;
     MuxUiPaneSendFunc send_func;
     MuxUiPaneWriteFunc write_func;
@@ -11,7 +12,28 @@ struct _MuxUiPaneBridge {
     guint columns;
     guint rows;
     gboolean painted;
+    gboolean disposing;
 };
+
+static MuxUiPaneBridge *
+ui_pane_bridge_ref(MuxUiPaneBridge *bridge)
+{
+    g_atomic_ref_count_inc(&bridge->references);
+    return bridge;
+}
+
+static void
+ui_pane_bridge_unref(MuxUiPaneBridge *bridge)
+{
+    if (!g_atomic_ref_count_dec(&bridge->references))
+        return;
+    mux_pane_overlay_free(bridge->overlay);
+    if (bridge->user_data_destroy)
+        bridge->user_data_destroy(bridge->user_data);
+    g_free(bridge);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxUiPaneBridge, ui_pane_bridge_unref)
 
 static gboolean
 write_ansi(MuxUiPaneBridge *bridge,
@@ -63,6 +85,7 @@ mux_ui_pane_bridge_new(MuxUiPaneSendFunc send_func,
     g_return_val_if_fail(write_func, NULL);
 
     bridge = g_new0(MuxUiPaneBridge, 1);
+    g_atomic_ref_count_init(&bridge->references);
     bridge->overlay = mux_pane_overlay_new();
     bridge->send_func = send_func;
     bridge->write_func = write_func;
@@ -74,18 +97,16 @@ mux_ui_pane_bridge_new(MuxUiPaneSendFunc send_func,
 void
 mux_ui_pane_bridge_free(MuxUiPaneBridge *bridge)
 {
-    if (!bridge)
+    if (!bridge || bridge->disposing)
         return;
+    bridge->disposing = TRUE;
     if (bridge->painted && bridge->rows) {
         g_autofree gchar *clear =
             mux_pane_overlay_render_clear(bridge->rows);
 
         write_ansi(bridge, clear, NULL);
     }
-    mux_pane_overlay_free(bridge->overlay);
-    if (bridge->user_data_destroy)
-        bridge->user_data_destroy(bridge->user_data);
-    g_free(bridge);
+    ui_pane_bridge_unref(bridge);
 }
 
 gboolean
@@ -93,9 +114,13 @@ mux_ui_pane_bridge_repaint(MuxUiPaneBridge *bridge,
                            gint64 monotonic_us,
                            GError **error)
 {
+    g_autoptr(MuxUiPaneBridge) guard = NULL;
     g_autofree gchar *sequence = NULL;
 
     g_return_val_if_fail(bridge, FALSE);
+    guard = ui_pane_bridge_ref(bridge);
+    if (bridge->disposing)
+        return FALSE;
     if (!bridge->columns || !bridge->rows)
         return TRUE;
 
@@ -104,7 +129,7 @@ mux_ui_pane_bridge_repaint(MuxUiPaneBridge *bridge,
                                            bridge->columns,
                                            bridge->rows,
                                            monotonic_us);
-        if (!write_ansi(bridge, sequence, error))
+        if (!write_ansi(bridge, sequence, error) || bridge->disposing)
             return FALSE;
         bridge->painted = TRUE;
         return TRUE;
@@ -113,7 +138,7 @@ mux_ui_pane_bridge_repaint(MuxUiPaneBridge *bridge,
     if (!bridge->painted)
         return TRUE;
     sequence = mux_pane_overlay_render_clear(bridge->rows);
-    if (!write_ansi(bridge, sequence, error))
+    if (!write_ansi(bridge, sequence, error) || bridge->disposing)
         return FALSE;
     bridge->painted = FALSE;
     return TRUE;
@@ -125,9 +150,13 @@ mux_ui_pane_bridge_handle_payload(MuxUiPaneBridge *bridge,
                                   gsize length,
                                   GError **error)
 {
+    g_autoptr(MuxUiPaneBridge) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(bridge, FALSE);
+    guard = ui_pane_bridge_ref(bridge);
+    if (bridge->disposing)
+        return FALSE;
     if (!mux_ui_record_type(data, length, &type, error))
         return FALSE;
 
@@ -179,12 +208,18 @@ finish_response(MuxUiPaneBridge *bridge,
                 gint64 monotonic_us,
                 GError **error)
 {
+    g_autoptr(MuxUiPaneBridge) guard = ui_pane_bridge_ref(bridge);
     g_autoptr(MuxUiResponse) owned_response = response;
     g_autoptr(GError) send_error = NULL;
     gboolean sent;
     gboolean painted;
 
+    bridge = guard;
+    if (bridge->disposing)
+        return FALSE;
     sent = send_response(bridge, owned_response, &send_error);
+    if (bridge->disposing)
+        return FALSE;
     painted = mux_ui_pane_bridge_repaint(
         bridge, monotonic_us, sent ? error : NULL);
     if (!sent) {

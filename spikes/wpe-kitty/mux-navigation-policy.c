@@ -27,6 +27,7 @@ typedef struct {
 } PendingDecision;
 
 struct _MuxNavigationPolicy {
+    gatomicrefcount references;
     WebKitWebView *web_view;
     gboolean private_profile;
     MuxNavigationPolicyOutputFunc output;
@@ -36,6 +37,7 @@ struct _MuxNavigationPolicy {
     guint64 navigation_epoch;
     guint64 tls_epoch;
     gchar *navigation_uri;
+    gboolean disposing;
 };
 
 static void
@@ -78,6 +80,28 @@ pending_decision_free(gpointer data)
     g_free(pending);
 }
 
+static MuxNavigationPolicy *
+navigation_policy_ref(MuxNavigationPolicy *policy)
+{
+    g_atomic_ref_count_inc(&policy->references);
+    return policy;
+}
+
+static void
+navigation_policy_unref(MuxNavigationPolicy *policy)
+{
+    if (!g_atomic_ref_count_dec(&policy->references))
+        return;
+    g_clear_pointer(&policy->pending, g_hash_table_unref);
+    if (policy->output_destroy)
+        policy->output_destroy(policy->output_data);
+    g_free(policy->navigation_uri);
+    g_clear_object(&policy->web_view);
+    g_free(policy);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxNavigationPolicy, navigation_policy_unref)
+
 static void
 invalidate_pending_tls(MuxNavigationPolicy *policy)
 {
@@ -108,7 +132,11 @@ load_changed(WebKitWebView *web_view,
              gpointer data)
 {
     MuxNavigationPolicy *policy = data;
+    g_autoptr(MuxNavigationPolicy) guard = navigation_policy_ref(policy);
 
+    policy = guard;
+    if (policy->disposing)
+        return;
     if (load_event == WEBKIT_LOAD_STARTED ||
         load_event == WEBKIT_LOAD_REDIRECTED)
         navigation_changed(policy, webkit_web_view_get_uri(web_view));
@@ -143,6 +171,15 @@ send_request(MuxNavigationPolicy *policy,
                               ? pending->uri
                               : current_uri;
 
+    gboolean sent;
+
+    if (policy->disposing) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "navigation policy is closing");
+        return FALSE;
+    }
     request->request_id = pending->request_id;
     request->flags = flags;
     if (policy->private_profile)
@@ -155,7 +192,8 @@ send_request(MuxNavigationPolicy *policy,
     payload = mux_ui_request_encode(request, error);
     if (!payload)
         return FALSE;
-    return policy->output(payload, policy->output_data, error);
+    sent = policy->output(payload, policy->output_data, error);
+    return sent && !policy->disposing;
 }
 
 static gchar *
@@ -203,6 +241,7 @@ load_failed_with_tls_errors(WebKitWebView *web_view,
                             gpointer data)
 {
     MuxNavigationPolicy *policy = data;
+    g_autoptr(MuxNavigationPolicy) guard = navigation_policy_ref(policy);
     g_autoptr(GUri) parsed = NULL;
     g_autofree gchar *error_summary = NULL;
     g_autofree gchar *message = NULL;
@@ -212,7 +251,10 @@ load_failed_with_tls_errors(WebKitWebView *web_view,
     const gchar *host;
     guint64 *key;
 
+    policy = guard;
     (void)web_view;
+    if (policy->disposing)
+        return FALSE;
     parsed = g_uri_parse(failing_uri, G_URI_FLAGS_NONE, NULL);
     if (!parsed)
         return FALSE;
@@ -283,6 +325,7 @@ decide_policy(WebKitWebView *web_view,
               gpointer data)
 {
     MuxNavigationPolicy *policy = data;
+    g_autoptr(MuxNavigationPolicy) guard = navigation_policy_ref(policy);
     WebKitNavigationAction *navigation;
     WebKitURIRequest *request;
     const gchar *uri;
@@ -293,7 +336,10 @@ decide_policy(WebKitWebView *web_view,
     g_autofree gchar *message = NULL;
     g_autoptr(GError) send_error = NULL;
 
+    policy = guard;
     (void)web_view;
+    if (policy->disposing)
+        return TRUE;
     if (decision_type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION &&
         decision_type != WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION)
         return FALSE;
@@ -368,6 +414,7 @@ mux_navigation_policy_new(WebKitWebView *web_view,
     g_return_val_if_fail(WEBKIT_IS_WEB_VIEW(web_view), NULL);
     g_return_val_if_fail(output, NULL);
     policy = g_new0(MuxNavigationPolicy, 1);
+    g_atomic_ref_count_init(&policy->references);
     policy->web_view = g_object_ref(web_view);
     policy->private_profile = private_profile;
     policy->output = output;
@@ -401,11 +448,20 @@ mux_navigation_policy_handle_payload(MuxNavigationPolicy *policy,
                                      gsize length,
                                      GError **error)
 {
+    g_autoptr(MuxNavigationPolicy) guard = NULL;
     MuxUiRecordType record_type;
     g_autoptr(MuxUiResponse) response = NULL;
     PendingDecision *pending;
 
     g_return_val_if_fail(policy, FALSE);
+    guard = navigation_policy_ref(policy);
+    if (policy->disposing) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "navigation policy is closing");
+        return FALSE;
+    }
     if (!mux_ui_record_type(data, length, &record_type, error))
         return FALSE;
     if (record_type != MUX_UI_RECORD_RESPONSE)
@@ -466,13 +522,9 @@ mux_navigation_policy_handle_payload(MuxNavigationPolicy *policy,
 void
 mux_navigation_policy_free(MuxNavigationPolicy *policy)
 {
-    if (!policy)
+    if (!policy || policy->disposing)
         return;
+    policy->disposing = TRUE;
     g_signal_handlers_disconnect_by_data(policy->web_view, policy);
-    g_clear_pointer(&policy->pending, g_hash_table_unref);
-    if (policy->output_destroy)
-        policy->output_destroy(policy->output_data);
-    g_free(policy->navigation_uri);
-    g_clear_object(&policy->web_view);
-    g_free(policy);
+    navigation_policy_unref(policy);
 }

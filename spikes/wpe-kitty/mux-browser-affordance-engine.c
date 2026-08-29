@@ -25,6 +25,7 @@ typedef struct {
 } PendingAffordance;
 
 struct _MuxBrowserAffordanceBridge {
+    gatomicrefcount references;
     WebKitWebView *web_view;
     GHashTable *pending;
     MuxBrowserAffordanceSendFunc send_func;
@@ -113,6 +114,28 @@ pending_affordance_free(PendingAffordance *pending)
     g_free(pending);
 }
 
+static MuxBrowserAffordanceBridge *
+affordance_bridge_ref(MuxBrowserAffordanceBridge *bridge)
+{
+    g_atomic_ref_count_inc(&bridge->references);
+    return bridge;
+}
+
+static void
+affordance_bridge_unref(MuxBrowserAffordanceBridge *bridge)
+{
+    if (!g_atomic_ref_count_dec(&bridge->references))
+        return;
+    g_clear_pointer(&bridge->pending, g_hash_table_unref);
+    if (bridge->user_data_destroy)
+        bridge->user_data_destroy(bridge->user_data);
+    g_clear_object(&bridge->web_view);
+    g_free(bridge);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxBrowserAffordanceBridge,
+                              affordance_bridge_unref)
+
 static gpointer
 take_hash_value(GHashTable *table, guint64 request_id)
 {
@@ -181,7 +204,20 @@ publish_request(MuxBrowserAffordanceBridge *bridge,
                 const MuxUiRequest *request,
                 GError **error)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     g_autoptr(GBytes) payload = mux_ui_request_encode(request, error);
+    guint64 request_id = pending->request_id;
+
+    bridge = guard;
+    if (bridge->destroying) {
+        pending_affordance_free(pending);
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "browser affordance bridge is closing");
+        return FALSE;
+    }
 
     if (!payload) {
         pending_affordance_free(pending);
@@ -192,8 +228,10 @@ publish_request(MuxBrowserAffordanceBridge *bridge,
                         request_key_new(pending->request_id),
                         pending);
     if (!send_payload(bridge, payload, error)) {
+        if (bridge->destroying)
+            return FALSE;
         PendingAffordance *failed =
-            take_pending(bridge, pending->request_id);
+            take_pending(bridge, request_id);
 
         pending_affordance_free(failed);
         return FALSE;
@@ -232,6 +270,19 @@ mux_browser_affordance_bridge_show_command_surface(
                             "command surface choices are invalid");
         g_hash_table_unref(seen_ids);
         pending_affordance_free(pending);
+        return FALSE;
+    }
+
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
+    bridge = guard;
+    if (bridge->destroying) {
+        g_hash_table_unref(seen_ids);
+        pending_affordance_free(pending);
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "browser affordance bridge is closing");
         return FALSE;
     }
 
@@ -309,11 +360,20 @@ mux_browser_affordance_bridge_show_status(
     gboolean danger,
     GError **error)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard = NULL;
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_NOTIFICATION);
     PendingAffordance *pending;
 
     g_return_val_if_fail(bridge, FALSE);
+    guard = affordance_bridge_ref(bridge);
+    if (bridge->destroying) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "browser affordance bridge is closing");
+        return FALSE;
+    }
     pending = g_new0(PendingAffordance, 1);
     pending->request_id = next_request_id(bridge);
     pending->kind = request->kind;
@@ -359,9 +419,12 @@ static void
 on_authentication_cancelled(WebKitAuthenticationRequest *request,
                             MuxBrowserAffordanceBridge *bridge)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     guint64 request_id;
     PendingAffordance *pending;
 
+    bridge = guard;
     if (bridge->destroying)
         return;
     request_id = find_pending_object(bridge,
@@ -378,9 +441,12 @@ static void
 on_option_menu_closed(WebKitOptionMenu *menu,
                       MuxBrowserAffordanceBridge *bridge)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     guint64 request_id;
     PendingAffordance *pending;
 
+    bridge = guard;
     if (bridge->destroying)
         return;
     request_id = find_pending_object(bridge,
@@ -410,11 +476,14 @@ cancel_matching(MuxBrowserAffordanceBridge *bridge,
                 MuxUiCancelReason reason,
                 gboolean notify_pane)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     GHashTableIter iterator;
     gpointer value;
     GArray *request_ids = g_array_new(FALSE, FALSE, sizeof(guint64));
     guint i;
 
+    bridge = guard;
     g_hash_table_iter_init(&iterator, bridge->pending);
     while (g_hash_table_iter_next(&iterator, NULL, &value)) {
         PendingAffordance *pending = value;
@@ -436,6 +505,8 @@ cancel_matching(MuxBrowserAffordanceBridge *bridge,
             send_cancel(bridge, request_id, reason);
         resolve_cancel(pending);
         pending_affordance_free(pending);
+        if (bridge->destroying)
+            break;
     }
     g_array_unref(request_ids);
 }
@@ -465,6 +536,8 @@ on_authenticate(WebKitWebView *web_view,
                 WebKitAuthenticationRequest *authentication,
                 MuxBrowserAffordanceBridge *bridge)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_AUTHENTICATION);
     g_autoptr(GError) error = NULL;
@@ -477,6 +550,11 @@ on_authenticate(WebKitWebView *web_view,
     PendingAffordance *pending;
     guint port = webkit_authentication_request_get_port(authentication);
 
+    bridge = guard;
+    if (bridge->destroying) {
+        webkit_authentication_request_cancel(authentication);
+        return TRUE;
+    }
     request->request_id = next_request_id(bridge);
     request->flags = MUX_UI_REQUEST_FLAG_PASSWORD |
                      (bridge->private_profile
@@ -551,6 +629,13 @@ on_show_option_menu(WebKitWebView *web_view,
                     WebKitRectangle *rectangle,
                     MuxBrowserAffordanceBridge *bridge)
 {
+  g_autoptr(MuxBrowserAffordanceBridge) guard =
+    browser_affordance_bridge_ref (bridge);
+
+  bridge = guard;
+  if (bridge->destroying)
+    return FALSE;
+
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_OPTION_MENU);
     g_autoptr(GError) error = NULL;
@@ -751,6 +836,13 @@ on_context_menu(WebKitWebView *web_view,
                 WebKitHitTestResult *hit_test,
                 MuxBrowserAffordanceBridge *bridge)
 {
+  g_autoptr(MuxBrowserAffordanceBridge) guard =
+    browser_affordance_bridge_ref (bridge);
+
+  bridge = guard;
+  if (bridge->destroying)
+    return FALSE;
+
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_CONTEXT_MENU);
     g_autoptr(GError) error = NULL;
@@ -826,11 +918,16 @@ on_web_process_terminated(WebKitWebView *web_view,
                           WebKitWebProcessTerminationReason reason,
                           MuxBrowserAffordanceBridge *bridge)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_CRASH);
     g_autoptr(GError) error = NULL;
     PendingAffordance *pending;
 
+    bridge = guard;
+    if (bridge->destroying)
+        return;
     mux_browser_affordance_bridge_cancel_all(
         bridge,
         MUX_UI_CANCEL_UNDERLYING_GONE,
@@ -857,6 +954,12 @@ on_load_changed(WebKitWebView *web_view,
                 WebKitLoadEvent load_event,
                 MuxBrowserAffordanceBridge *bridge)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard =
+        affordance_bridge_ref(bridge);
+
+    bridge = guard;
+    if (bridge->destroying)
+        return;
     (void)web_view;
     if (load_event == WEBKIT_LOAD_COMMITTED)
         mux_browser_affordance_bridge_cancel_all(
@@ -1105,6 +1208,7 @@ mux_browser_affordance_bridge_new(
     g_return_val_if_fail(send_func, NULL);
 
     bridge = g_new0(MuxBrowserAffordanceBridge, 1);
+    g_atomic_ref_count_init(&bridge->references);
     bridge->web_view = g_object_ref(web_view);
     bridge->pending = g_hash_table_new_full(
         g_int64_hash,
@@ -1137,7 +1241,7 @@ mux_browser_affordance_bridge_new(
 void
 mux_browser_affordance_bridge_free(MuxBrowserAffordanceBridge *bridge)
 {
-    if (!bridge)
+    if (!bridge || bridge->destroying)
         return;
     bridge->destroying = TRUE;
     if (bridge->authenticate_handler)
@@ -1159,11 +1263,7 @@ mux_browser_affordance_bridge_free(MuxBrowserAffordanceBridge *bridge)
         bridge,
         MUX_UI_CANCEL_VIEW_DESTROYED,
         FALSE);
-    g_hash_table_unref(bridge->pending);
-    if (bridge->user_data_destroy)
-        bridge->user_data_destroy(bridge->user_data);
-    g_object_unref(bridge->web_view);
-    g_free(bridge);
+    affordance_bridge_unref(bridge);
 }
 
 gboolean
@@ -1173,9 +1273,18 @@ mux_browser_affordance_bridge_handle_payload(
     gsize length,
     GError **error)
 {
+    g_autoptr(MuxBrowserAffordanceBridge) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(bridge, FALSE);
+    guard = affordance_bridge_ref(bridge);
+    if (bridge->destroying) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "browser affordance bridge is closing");
+        return FALSE;
+    }
     if (!mux_ui_record_type(data, length, &type, error))
         return FALSE;
 

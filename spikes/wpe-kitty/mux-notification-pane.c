@@ -11,12 +11,35 @@ typedef struct {
 } PaneNotification;
 
 struct _MuxNotificationPane {
+    gatomicrefcount references;
     GHashTable *pending;
     MuxNotificationPaneSendFunc send_func;
     MuxNotificationPaneWriteFunc write_func;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
+    gboolean disposing;
 };
+
+static MuxNotificationPane *
+notification_pane_ref(MuxNotificationPane *pane)
+{
+    g_atomic_ref_count_inc(&pane->references);
+    return pane;
+}
+
+static void
+notification_pane_unref(MuxNotificationPane *pane)
+{
+    if (!g_atomic_ref_count_dec(&pane->references))
+        return;
+    g_clear_pointer(&pane->pending, g_hash_table_unref);
+    if (pane->user_data_destroy)
+        pane->user_data_destroy(pane->user_data);
+    g_free(pane);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxNotificationPane,
+                              notification_pane_unref)
 
 static guint64 *
 request_key_new(guint64 request_id)
@@ -39,11 +62,13 @@ write_sequence(MuxNotificationPane *pane,
                const gchar *sequence,
                GError **error)
 {
-    return pane->write_func &&
-           pane->write_func((const guint8 *)sequence,
-                            strlen(sequence),
-                            pane->user_data,
-                            error);
+    gboolean written = pane->write_func &&
+        pane->write_func((const guint8 *)sequence,
+                         strlen(sequence),
+                         pane->user_data,
+                         error);
+
+    return written && !pane->disposing;
 }
 
 static gboolean
@@ -162,8 +187,10 @@ send_action(MuxNotificationPane *pane,
         mux_ui_response_new(request_id, action);
     g_autoptr(GBytes) payload = mux_ui_response_encode(response, error);
 
-    return payload && pane->send_func &&
-           pane->send_func(payload, pane->user_data, error);
+    gboolean sent = payload && pane->send_func &&
+        pane->send_func(payload, pane->user_data, error);
+
+    return sent && !pane->disposing;
 }
 
 MuxNotificationPane *
@@ -177,6 +204,7 @@ mux_notification_pane_new(MuxNotificationPaneSendFunc send_func,
     g_return_val_if_fail(send_func, NULL);
     g_return_val_if_fail(write_func, NULL);
     pane = g_new0(MuxNotificationPane, 1);
+    g_atomic_ref_count_init(&pane->references);
     pane->pending = g_hash_table_new_full(g_int64_hash,
                                          g_int64_equal,
                                          g_free,
@@ -194,18 +222,16 @@ mux_notification_pane_free(MuxNotificationPane *pane)
     GHashTableIter iterator;
     gpointer value;
 
-    if (!pane)
+    if (!pane || pane->disposing)
         return;
+    pane->disposing = TRUE;
     g_hash_table_iter_init(&iterator, pane->pending);
     while (g_hash_table_iter_next(&iterator, NULL, &value)) {
         PaneNotification *pending = value;
 
         (void)close_notification(pane, pending->request_id, NULL);
     }
-    g_hash_table_unref(pane->pending);
-    if (pane->user_data_destroy)
-        pane->user_data_destroy(pane->user_data);
-    g_free(pane);
+    notification_pane_unref(pane);
 }
 
 gboolean
@@ -215,9 +241,13 @@ mux_notification_pane_handle_payload(MuxNotificationPane *pane,
                                      gboolean *consumed,
                                      GError **error)
 {
+    g_autoptr(MuxNotificationPane) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(pane, FALSE);
+    guard = notification_pane_ref(pane);
+    if (pane->disposing)
+        return FALSE;
     g_return_val_if_fail(consumed, FALSE);
     *consumed = FALSE;
     if (!mux_ui_record_type(data, length, &type, error))
@@ -289,6 +319,7 @@ mux_notification_pane_handle_payload(MuxNotificationPane *pane,
 static gboolean
 parse_identifier(const gchar *value, guint64 *request_id)
 {
+    g_autoptr(MuxNotificationPane) guard = NULL;
     const gchar *digits;
     gchar *end = NULL;
     guint64 parsed;
@@ -324,6 +355,9 @@ mux_notification_pane_handle_osc(MuxNotificationPane *pane,
     guint i;
 
     g_return_val_if_fail(pane, FALSE);
+    guard = notification_pane_ref(pane);
+    if (pane->disposing)
+        return FALSE;
     if (!data || length < 8 || memcmp(data, "\033]99;", 5) != 0) {
         g_set_error_literal(error,
                             G_IO_ERROR,
