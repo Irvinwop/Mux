@@ -503,10 +503,14 @@ test_legacy_protocol_version_rejected(void)
 {
     guint8 packet[MUX_ENGINE_HEADER_SIZE];
 
-    g_assert_cmpuint(MUX_ENGINE_VERSION, ==, 3);
+    g_assert_cmpuint(MUX_ENGINE_VERSION, >, 1);
     init_header(packet);
-    put_u16(packet + 4, 1);
-    assert_protocol_rejected(packet, sizeof(packet));
+    /* Every older wire layout must be rejected before decoding its payload.
+     * This continues to cover previous layouts when a new version is added. */
+    for (guint16 version = 0; version < MUX_ENGINE_VERSION; version++) {
+        put_u16(packet + 4, version);
+        assert_protocol_rejected(packet, sizeof(packet));
+    }
 }
 
 typedef enum {
@@ -1138,7 +1142,7 @@ main(int argc, char **argv)
                     test_frame_rejected_round_trip);
     g_test_add_func("/engine-protocol/packet/cancel-close",
                     test_cancel_close_round_trip);
-    g_test_add_func("/engine-protocol/packet/reject-v1",
+    g_test_add_func("/engine-protocol/packet/reject-legacy",
                     test_legacy_protocol_version_rejected);
     g_test_add_func("/engine-runtime/create-view/prepare-initial-uri",
                     test_create_view_initial_uri_preparation);

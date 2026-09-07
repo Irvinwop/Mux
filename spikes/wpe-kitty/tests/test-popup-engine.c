@@ -48,6 +48,8 @@ static void
 test_manager_init(MuxPopupManager *manager, PopupCapture *capture)
 {
     memset(manager, 0, sizeof(*manager));
+    /* Match the owner reference established by the production constructor. */
+    g_atomic_ref_count_init(&manager->references);
     manager->parent = capture->expected_parent;
     manager->by_token = g_hash_table_new_full(
         g_str_hash,
@@ -64,6 +66,8 @@ test_manager_init(MuxPopupManager *manager, PopupCapture *capture)
 static void
 test_manager_clear(MuxPopupManager *manager)
 {
+    /* Callback guards must release their temporary references. */
+    g_assert_true(g_atomic_ref_count_compare(&manager->references, 1));
     g_hash_table_remove_all(manager->by_child);
     g_clear_pointer(&manager->by_token, g_hash_table_unref);
     g_clear_pointer(&manager->by_child, g_hash_table_unref);
