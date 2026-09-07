@@ -27,12 +27,18 @@ struct _MuxClipboardEngineWrite {
     gchar *profile;
     gchar *source_origin;
     guint64 source_view_id;
+    guint64 target_view_id;
     guint64 transaction_id;
     gint64 created_us;
     guint32 flags;
     gint64 deadline_us;
     gboolean completed;
 };
+
+typedef struct {
+    MuxClipboardEngineLink *link;
+    guint64 view_id;
+} EngineOutputTarget;
 
 static void engine_link_destroy(MuxClipboardEngineLink *link);
 
@@ -94,7 +100,9 @@ report_failure(MuxClipboardEngineLink *link,
 static gboolean
 wire_output(GBytes *packet, gpointer user_data, GError **error)
 {
-    MuxClipboardEngineLink *link = user_data;
+    const EngineOutputTarget *target = user_data;
+    MuxClipboardEngineLink *link = target->link;
+    gboolean result;
 
     if (link->disposing) {
         g_set_error_literal(error,
@@ -103,14 +111,35 @@ wire_output(GBytes *packet, gpointer user_data, GError **error)
                             "clipboard engine link is closing");
         return FALSE;
     }
-    return link->output_func(link, packet, link->user_data, error);
+    if (target->view_id == 0) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_FOUND,
+                            "clipboard output has no routed target view");
+        return FALSE;
+    }
+    result = link->output_func(link,
+                               target->view_id,
+                               packet,
+                               link->user_data,
+                               error);
+    if (result && link->disposing) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "clipboard engine link closed during publication");
+        return FALSE;
+    }
+    return result;
 }
 
 static gboolean
 send_ack(MuxClipboardEngineLink *link,
+         guint64 target_view_id,
          guint64 transaction_id,
          GError **error)
 {
+    const EngineOutputTarget target = { link, target_view_id };
     MuxClipboardWireRecord record = {
         .type = MUX_CLIPBOARD_WIRE_ACK,
         .transaction_id = transaction_id
@@ -120,7 +149,7 @@ send_ack(MuxClipboardEngineLink *link,
 
     if (packet == NULL)
         return FALSE;
-    result = link->output_func(link, packet, link->user_data, error);
+    result = wire_output(packet, (gpointer)&target, error);
     g_bytes_unref(packet);
     return result;
 }
@@ -139,6 +168,7 @@ mux_clipboard_engine_link_begin_write(MuxClipboardEngineLink *link)
     write->profile = g_strdup(link->profile);
     write->source_origin = g_strdup(link->active_origin);
     write->source_view_id = link->active_view_id;
+    write->target_view_id = link->active_view_id;
     write->transaction_id = next_transaction(link);
     write->created_us = g_get_monotonic_time();
     write->flags = MUX_CLIPBOARD_WIRE_FLAG_CURRENT |
@@ -155,6 +185,10 @@ mux_clipboard_engine_link_complete_write(
     const MuxClipboardSnapshot *snapshot,
     GError **error)
 {
+    g_autoptr(MuxClipboardEngineWrite) operation = NULL;
+    EngineOutputTarget target;
+    guint64 *key;
+
     g_return_val_if_fail(link != NULL, FALSE);
     if (!write || write->owner != link || write->completed) {
         g_set_error_literal(error,
@@ -178,6 +212,16 @@ mux_clipboard_engine_link_complete_write(
                             "clipboard engine link is closing");
         return FALSE;
     }
+    /* Output may synchronously acknowledge, close, or reenter this write. */
+    operation = engine_write_ref(write);
+    target.link = link;
+    target.view_id = write->target_view_id;
+    write->completed = TRUE;
+    write->deadline_us = g_get_monotonic_time() +
+        ((gint64)MUX_CLIPBOARD_WIRE_TIMEOUT_MS * 1000);
+    key = g_new(guint64, 1);
+    *key = write->transaction_id;
+    g_hash_table_insert(link->pending_writes, key, engine_write_ref(write));
     if (!mux_clipboard_wire_send_snapshot(write->transaction_id,
                                           write->flags,
                                           write->profile,
@@ -186,19 +230,10 @@ mux_clipboard_engine_link_complete_write(
                                           write->created_us,
                                           snapshot,
                                           wire_output,
-                                          link,
-                                          error))
+                                          &target,
+                                          error)) {
+        g_hash_table_remove(link->pending_writes, &write->transaction_id);
         return FALSE;
-    write->completed = TRUE;
-    write->deadline_us = g_get_monotonic_time() +
-        ((gint64)MUX_CLIPBOARD_WIRE_TIMEOUT_MS * 1000);
-    {
-        guint64 *key = g_new(guint64, 1);
-
-        *key = write->transaction_id;
-        g_hash_table_insert(link->pending_writes,
-                            key,
-                            engine_write_ref(write));
     }
     return TRUE;
 }
@@ -246,7 +281,8 @@ on_webkit_publish(MuxWpeClipboard *clipboard,
     if (!mux_clipboard_engine_link_complete_write(link,
                                                   write,
                                                   snapshot,
-                                                  &error))
+                                                  &error) &&
+        !link->disposing)
         report_failure(link, "webkit-copy", error);
 }
 
@@ -308,6 +344,8 @@ mux_clipboard_engine_link_free(MuxClipboardEngineLink *link)
     if (link->disposing)
         return;
     link->disposing = TRUE;
+    if (link->clipboard != NULL)
+        mux_wpe_clipboard_stop_publishing(link->clipboard);
     g_hash_table_remove_all(link->pending_writes);
     if (mux_clipboard_lifetime_release_owner(&link->lifetime))
         engine_link_destroy(link);
@@ -408,12 +446,22 @@ mux_clipboard_engine_link_handle_packet(MuxClipboardEngineLink *link,
     const gchar *profile;
     const MuxClipboardSnapshot *snapshot;
     guint64 transaction_id;
+    guint64 target_view_id;
+    gint64 cache_change_count;
+    gboolean should_paste;
     g_autoptr(GError) feed_error = NULL;
     gboolean result = FALSE;
 
     g_return_val_if_fail(link != NULL, FALSE);
     operation = engine_link_acquire(link);
     (void)operation;
+    if (link->disposing) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "clipboard engine link is closing");
+        return FALSE;
+    }
     if (!mux_clipboard_wire_record_decode(packet,
                                           packet_length,
                                           &record,
@@ -469,7 +517,29 @@ mux_clipboard_engine_link_handle_packet(MuxClipboardEngineLink *link,
     transaction_id =
         mux_clipboard_wire_transfer_get_transaction_id(transfer);
     snapshot = mux_clipboard_wire_transfer_get_snapshot(transfer);
+    should_paste = (mux_clipboard_wire_transfer_get_flags(transfer) &
+                    MUX_CLIPBOARD_WIRE_FLAG_PASTE) != 0;
+    target_view_id = link->active_view_id;
+    if (should_paste &&
+        (link->paste_func == NULL || target_view_id == 0)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_FOUND,
+                            "clipboard paste has no routed target view");
+        goto out;
+    }
+
+    /* Cache notifications may move focus, replace the cache, or close us. */
+    cache_change_count = wpe_clipboard_get_change_count(
+        WPE_CLIPBOARD(link->clipboard));
     mux_wpe_clipboard_set_external(link->clipboard, snapshot);
+    if (link->disposing) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_CLOSED,
+                            "clipboard engine link closed during cache update");
+        goto out;
+    }
     mux_clipboard_smoke_trace(
         MUX_CLIPBOARD_TRACE_ENGINE_EXTERNAL,
         &(MuxClipboardTraceFields) {
@@ -478,22 +548,29 @@ mux_clipboard_engine_link_handle_packet(MuxClipboardEngineLink *link,
                 mux_clipboard_wire_transfer_get_source_view_id(transfer),
             .snapshot = snapshot
         });
-    if ((mux_clipboard_wire_transfer_get_flags(transfer) &
-         MUX_CLIPBOARD_WIRE_FLAG_PASTE) &&
-        link->paste_func != NULL && link->active_view_id != 0) {
-        link->paste_func(link,
-                         link->active_view_id,
-                         snapshot,
-                         link->user_data);
-    } else if (mux_clipboard_wire_transfer_get_flags(transfer) &
-               MUX_CLIPBOARD_WIRE_FLAG_PASTE) {
-        g_set_error_literal(error,
-                            G_IO_ERROR,
-                            G_IO_ERROR_NOT_FOUND,
-                            "clipboard paste has no active target view");
-        goto out;
+    if (should_paste) {
+        if (wpe_clipboard_get_change_count(WPE_CLIPBOARD(link->clipboard)) !=
+            cache_change_count + 1) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_CANCELLED,
+                                "clipboard content changed before paste dispatch");
+            goto out;
+        }
+        if (!link->paste_func(link,
+                               target_view_id,
+                               snapshot,
+                               link->user_data,
+                               error)) {
+            if (error != NULL && *error == NULL)
+                g_set_error_literal(error,
+                                    G_IO_ERROR,
+                                    G_IO_ERROR_FAILED,
+                                    "clipboard target rejected paste dispatch");
+            goto out;
+        }
     }
-    result = send_ack(link, transaction_id, error);
+    result = send_ack(link, target_view_id, transaction_id, error);
 
 out:
     mux_clipboard_wire_transfer_free(transfer);

@@ -419,8 +419,6 @@ struct _Engine {
     GString *muxd_input;
     guint64 next_view_id;
     guint64 next_event_serial;
-    guint64 clipboard_reply_view_id;
-    Client *clipboard_reply_client;
     guint clipboard_tick_id;
     gsize frame_bytes;
     guint device_scale_milli;
@@ -1651,6 +1649,7 @@ clipboard_origin(EngineView *view)
 
 static gboolean
 clipboard_output(MuxClipboardEngineLink *link,
+                 guint64 target_view_id,
                  GBytes *packet,
                  gpointer data,
                  GError **error)
@@ -1658,17 +1657,15 @@ clipboard_output(MuxClipboardEngineLink *link,
     Engine *engine = data;
     EngineView *view;
 
-    (void)link;
-    view = clipboard_find_view(engine,
-                               engine->clipboard_reply_view_id,
-                               engine->clipboard_reply_client);
-    if (!view)
-        view = clipboard_find_view(engine, 0, NULL);
-    if (!view) {
+    view = target_view_id
+        ? clipboard_find_view(engine, target_view_id, NULL)
+        : NULL;
+    if (link != engine->clipboard_link || !view || !view->owner ||
+        view->owner->failed || view->owner->fd < 0) {
         g_set_error_literal(error,
                             G_IO_ERROR,
                             G_IO_ERROR_NOT_CONNECTED,
-                            "no pane owns the active clipboard view");
+                            "the original clipboard pane is no longer connected");
         return FALSE;
     }
 
@@ -1687,21 +1684,30 @@ clipboard_output(MuxClipboardEngineLink *link,
     return FALSE;
 }
 
-static void
+static gboolean
 clipboard_paste(MuxClipboardEngineLink *link,
                 guint64 target_view_id,
                 const MuxClipboardSnapshot *snapshot,
-                gpointer data)
+                gpointer data,
+                GError **error)
 {
     Engine *engine = data;
-    EngineView *view = clipboard_find_view(engine, target_view_id, NULL);
+    EngineView *view = target_view_id
+        ? clipboard_find_view(engine, target_view_id, NULL)
+        : NULL;
 
-    (void)link;
     (void)snapshot;
-    if (!view)
-        view = clipboard_find_view(engine, 0, NULL);
-    if (view)
-        webkit_web_view_execute_editing_command(view->web_view, "Paste");
+    if (link != engine->clipboard_link || !view || !view->owner ||
+        view->owner->failed || view->owner->fd < 0 || !view->web_view ||
+        view->web_process_state != ENGINE_WEB_PROCESS_ALIVE) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_CONNECTED,
+                            "the original paste view is no longer available");
+        return FALSE;
+    }
+    webkit_web_view_execute_editing_command(view->web_view, "Paste");
+    return TRUE;
 }
 
 static void
@@ -5560,14 +5566,10 @@ handle_extension(Client *client, const MuxEngineMessage *request)
     }
     g_free(origin);
 
-    engine->clipboard_reply_client = client;
-    engine->clipboard_reply_view_id = view->id;
     handled = mux_clipboard_engine_link_handle_packet(engine->clipboard_link,
                                                       packet,
                                                       packet_size,
                                                       &error);
-    engine->clipboard_reply_client = NULL;
-    engine->clipboard_reply_view_id = 0;
 
     if (!handled) {
         client_send_error(client,

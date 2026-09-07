@@ -198,6 +198,31 @@ static gboolean run_command(const gchar *executable,
     return wait_child_success(pid, timeout_ms, error);
 }
 
+static pid_t spawn_logged_daemon(const gchar *log_path, GError **error)
+{
+    int log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    pid_t child;
+
+    if (log_fd < 0) {
+        set_errno_error(error, "open daemon log", errno);
+        return -1;
+    }
+    child = fork();
+    if (child == 0) {
+        child_redirect_to_null();
+        if (dup2(log_fd, STDOUT_FILENO) < 0 ||
+            dup2(log_fd, STDERR_FILENO) < 0)
+            _exit(127);
+        close(log_fd);
+        execl(muxd_executable, muxd_executable, "--foreground", (char *)NULL);
+        _exit(127);
+    }
+    if (child < 0)
+        set_errno_error(error, "fork logged daemon", errno);
+    close(log_fd);
+    return child;
+}
+
 static gboolean run_command_with_extra_argument(const gchar *executable,
                                                 const gchar *argument,
                                                 const gchar *extra,
@@ -779,6 +804,43 @@ static gboolean set_current_layer(const gchar *socket_path,
         return FALSE;
     }
     return TRUE;
+}
+
+static int request_control_target(const gchar *socket_path,
+                                   const gchar *command,
+                                   const gchar *target,
+                                   GError **error)
+{
+    int fd = connect_unix_socket(socket_path, RESPONSE_TIMEOUT_MS, error);
+    g_autofree gchar *encoded = mux_encode(target);
+
+    if (fd < 0)
+        return -1;
+    if (!mux_send_line(fd, "CTL\t%s\t%s", command, encoded)) {
+        int saved_errno = errno;
+
+        close(fd);
+        set_errno_error(error, "send control request", saved_errno);
+        return -1;
+    }
+    return fd;
+}
+
+static gboolean expect_control_error(int fd,
+                                      const gchar *expected,
+                                      GError **error)
+{
+    g_autofree gchar *response = mux_read_line(fd, RESPONSE_TIMEOUT_MS);
+    g_autofree gchar *message = NULL;
+
+    if (response != NULL && g_str_has_prefix(response, "ERR\t"))
+        message = mux_decode(response + strlen("ERR\t"));
+    if (g_strcmp0(message, expected) == 0)
+        return TRUE;
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                "expected control error '%s', received %s",
+                expected, response != NULL ? response : "(none)");
+    return FALSE;
 }
 
 static int request_move(const gchar *socket_path,
@@ -1545,6 +1607,14 @@ static void test_muxd_async_move_and_queued_replies(void)
         "    : > \"$MUX_TEST_KITTEN_MARKER\"\n"
         "    exec sleep 10\n"
         "    ;;\n"
+        "  *\"--use-password=always\"*\"focus-window\"*\"--match id:302\")\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  *\"--use-password=always\"*\"focus-window\"*\"--match id:303\")\n"
+        "    : > \"$MUX_TEST_FOCUS_MARKER\"\n"
+        "    while [ ! -f \"$MUX_TEST_FOCUS_RELEASE\" ]; do sleep 0.01; done\n"
+        "    exit 0\n"
+        "    ;;\n"
         "esac\n"
         "exit 64\n";
     gchar *root = NULL;
@@ -1553,6 +1623,9 @@ static void test_muxd_async_move_and_queued_replies(void)
     gchar *bin_dir = NULL;
     gchar *kitten_path = NULL;
     gchar *marker_path = NULL;
+    gchar *focus_marker = NULL;
+    gchar *focus_release = NULL;
+    gchar *daemon_log = NULL;
     gchar *socket_path = NULL;
     gchar *path_value = NULL;
     gchar *target_id = NULL;
@@ -1567,6 +1640,9 @@ static void test_muxd_async_move_and_queued_replies(void)
     gchar *old_ephemeral = g_strdup(g_getenv("MUX_EPHEMERAL"));
     gchar *old_path = g_strdup(g_getenv("PATH"));
     gchar *old_marker = g_strdup(g_getenv("MUX_TEST_KITTEN_MARKER"));
+    gchar *old_focus_marker = g_strdup(g_getenv("MUX_TEST_FOCUS_MARKER"));
+    gchar *old_focus_release = g_strdup(g_getenv("MUX_TEST_FOCUS_RELEASE"));
+    gchar *old_debug = g_strdup(g_getenv("G_DEBUG"));
     GError *error = NULL;
     struct ucred daemon_credentials;
     int guard_fd = -1;
@@ -1575,6 +1651,8 @@ static void test_muxd_async_move_and_queued_replies(void)
     int timeout_source_fd = -1;
     int fallback_fd = -1;
     int move_fd = -1;
+    int focus_fd = -1;
+    pid_t daemon_child = -1;
     pid_t daemon_pid = -1;
     mode_t old_umask = umask(0077);
 
@@ -1584,6 +1662,9 @@ static void test_muxd_async_move_and_queued_replies(void)
     state_dir = g_build_filename(root, "state", NULL);
     bin_dir = g_build_filename(root, "bin", NULL);
     marker_path = g_build_filename(root, "kitty-started", NULL);
+    focus_marker = g_build_filename(root, "focus-started", NULL);
+    focus_release = g_build_filename(root, "focus-release", NULL);
+    daemon_log = g_build_filename(root, "muxd.log", NULL);
     kitten_path = g_build_filename(bin_dir, "kitten", NULL);
     REQUIRE(g_mkdir(runtime_dir, 0700) == 0,
             "create runtime directory: %s",
@@ -1615,14 +1696,17 @@ static void test_muxd_async_move_and_queued_replies(void)
     REQUIRE(g_setenv("PATH", path_value, TRUE), "set PATH");
     REQUIRE(g_setenv("MUX_TEST_KITTEN_MARKER", marker_path, TRUE),
             "set fake kitten marker");
+    REQUIRE(g_setenv("MUX_TEST_FOCUS_MARKER", focus_marker, TRUE),
+            "set focus-started marker");
+    REQUIRE(g_setenv("MUX_TEST_FOCUS_RELEASE", focus_release, TRUE),
+            "set focus release gate");
+    REQUIRE(g_setenv("G_DEBUG", "fatal-warnings", TRUE),
+            "make unexpected daemon GLib warnings fatal");
     socket_path =
         g_build_filename(runtime_dir, "mux", "muxd.sock", NULL);
 
-    REQUIRE_CALL(run_command(muxd_executable,
-                             "--ensure",
-                             CHILD_TIMEOUT_MS,
-                             &error),
-                 "start muxd");
+    daemon_child = spawn_logged_daemon(daemon_log, &error);
+    REQUIRE_CALL(daemon_child > 0, "start logged muxd");
     guard_fd = connect_unix_socket(socket_path,
                                    CONNECT_TIMEOUT_MS,
                                    &error);
@@ -1632,6 +1716,8 @@ static void test_muxd_async_move_and_queued_replies(void)
                                       &error),
                  "identify muxd peer");
     daemon_pid = daemon_credentials.pid;
+    REQUIRE(daemon_pid == daemon_child,
+            "daemon peer PID does not match the owned foreground child");
 
     target_fd = connect_unix_socket(socket_path,
                                     RESPONSE_TIMEOUT_MS,
@@ -1742,6 +1828,78 @@ static void test_muxd_async_move_and_queued_replies(void)
                                        &error),
                  "select deterministic main-layer view");
 
+    /* Rejected external focus must return an error without changing state. */
+    focus_fd = request_control_target(socket_path, "FOCUS", source_id, &error);
+    REQUIRE_CALL(focus_fd >= 0, "request rejected focus");
+    REQUIRE_CALL(expect_control_error(focus_fd,
+                                       "Kitty rejected focus request",
+                                       &error),
+                 "report rejected focus");
+    close(focus_fd);
+    focus_fd = -1;
+    focus_fd = request_control_target(socket_path, "LAYER", "target", &error);
+    REQUIRE_CALL(focus_fd >= 0, "request rejected layer focus");
+    REQUIRE_CALL(expect_control_error(focus_fd,
+                                       "Kitty rejected focus request",
+                                       &error),
+                 "report rejected layer focus");
+    close(focus_fd);
+    focus_fd = -1;
+    REQUIRE_CALL(wait_for_active_state(socket_path, timeout_source_id, "main",
+                                       STATE_TIMEOUT_MS, &error),
+                 "failed focus preserved the active view and layer");
+
+    focus_fd = request_control_target(socket_path, "FOCUS", fallback_id, &error);
+    REQUIRE_CALL(focus_fd >= 0, "request delayed focus");
+    REQUIRE(wait_for_path(focus_marker, 1000),
+            "fake kitten did not start delayed focus");
+    {
+        guint count = 0;
+        gint64 started_us = g_get_monotonic_time();
+
+        REQUIRE_CALL(query_view_count(socket_path, &count, &error),
+                     "query status while focus is pending");
+        REQUIRE(count == 4, "pending focus changed view count to %u", count);
+        REQUIRE(g_get_monotonic_time() - started_us < 500 * 1000,
+                "pending focus blocked daemon control traffic");
+    }
+    REQUIRE_CALL(wait_for_active_state(socket_path, timeout_source_id, "main",
+                                       STATE_TIMEOUT_MS, &error),
+                 "pending focus did not commit metadata early");
+    REQUIRE_CALL(g_file_set_contents(focus_release, "", -1, &error),
+                 "release delayed focus");
+    move_response = mux_read_line(focus_fd, RESPONSE_TIMEOUT_MS);
+    REQUIRE(g_strcmp0(move_response, "OK") == 0,
+            "unexpected successful FOCUS response: %s",
+            move_response != NULL ? move_response : "(none)");
+    g_clear_pointer(&move_response, g_free);
+    close(focus_fd);
+    focus_fd = -1;
+    REQUIRE_CALL(wait_for_active_state(socket_path, fallback_id, "main",
+                                       STATE_TIMEOUT_MS, &error),
+                 "accepted focus committed the active view");
+
+    REQUIRE(g_unlink(focus_marker) == 0 && g_unlink(focus_release) == 0,
+            "reset focus gates before empty-layer selection: %s",
+            g_strerror(errno));
+    focus_fd = request_control_target(socket_path, "FOCUS", fallback_id, &error);
+    REQUIRE_CALL(focus_fd >= 0, "request focus before selecting an empty layer");
+    REQUIRE(wait_for_path(focus_marker, 1000),
+            "fake kitten did not start focus before empty-layer selection");
+    REQUIRE_CALL(set_current_layer(socket_path, "empty", &error),
+                 "select an empty layer while focus is pending");
+    REQUIRE_CALL(g_file_set_contents(focus_release, "", -1, &error),
+                 "release the superseded focus");
+    REQUIRE_CALL(expect_control_error(focus_fd,
+                                       "Kitty focus request was cancelled",
+                                       &error),
+                 "empty-layer selection cancelled the older focus");
+    close(focus_fd);
+    focus_fd = -1;
+    REQUIRE_CALL(wait_for_active_state(socket_path, "", "empty",
+                                       STATE_TIMEOUT_MS, &error),
+                 "late focus completion did not undo empty-layer selection");
+
     REQUIRE(mux_send_line(fallback_fd, "FOCUS\t1"),
             "focus fallback view: %s",
             g_strerror(errno));
@@ -1751,8 +1909,21 @@ static void test_muxd_async_move_and_queued_replies(void)
                                        STATE_TIMEOUT_MS,
                                        &error),
                  "observe focused fallback view");
+    REQUIRE(g_unlink(focus_marker) == 0 && g_unlink(focus_release) == 0,
+            "reset focus gates: %s", g_strerror(errno));
+    focus_fd = request_control_target(socket_path, "FOCUS", fallback_id, &error);
+    REQUIRE_CALL(focus_fd >= 0, "request focus before target disconnect");
+    REQUIRE(wait_for_path(focus_marker, 1000),
+            "fake kitten did not start focus before target disconnect");
     close(fallback_fd);
     fallback_fd = -1;
+    REQUIRE_CALL(expect_control_error(
+                     focus_fd,
+                     "source view disconnected during Kitty focus request",
+                     &error),
+                 "cancel focus when its target disconnects");
+    close(focus_fd);
+    focus_fd = -1;
     REQUIRE_CALL(wait_for_view_count(socket_path,
                                      3,
                                      STATE_TIMEOUT_MS,
@@ -1800,6 +1971,8 @@ static void test_muxd_async_move_and_queued_replies(void)
             observed_layer);
 
 cleanup:
+    if (focus_fd >= 0)
+        close(focus_fd);
     if (move_fd >= 0)
         close(move_fd);
     if (fallback_fd >= 0)
@@ -1826,6 +1999,21 @@ cleanup:
     }
     if (guard_fd >= 0)
         close(guard_fd);
+    if (daemon_child > 0) {
+        GError *child_error = NULL;
+
+        if (!wait_child_success(daemon_child, CHILD_TIMEOUT_MS, &child_error)) {
+            g_test_message("logged muxd exit: %s", child_error->message);
+            g_test_fail();
+        }
+        g_clear_error(&child_error);
+    }
+    if (g_test_failed() && daemon_log != NULL) {
+        g_autofree gchar *log = NULL;
+
+        if (g_file_get_contents(daemon_log, &log, NULL, NULL))
+            g_test_message("muxd diagnostics:\n%s", log);
+    }
     g_clear_error(&error);
     remove_tree(root);
     restore_environment("XDG_RUNTIME_DIR", old_runtime);
@@ -1833,6 +2021,9 @@ cleanup:
     restore_environment("MUX_EPHEMERAL", old_ephemeral);
     restore_environment("PATH", old_path);
     restore_environment("MUX_TEST_KITTEN_MARKER", old_marker);
+    restore_environment("MUX_TEST_FOCUS_MARKER", old_focus_marker);
+    restore_environment("MUX_TEST_FOCUS_RELEASE", old_focus_release);
+    restore_environment("G_DEBUG", old_debug);
     (void)umask(old_umask);
     g_free(error_message);
     g_free(observed_layer);
@@ -1844,12 +2035,18 @@ cleanup:
     g_free(path_value);
     g_free(socket_path);
     g_free(marker_path);
+    g_free(focus_marker);
+    g_free(focus_release);
+    g_free(daemon_log);
     g_free(kitten_path);
     g_free(bin_dir);
     g_free(state_dir);
     g_free(runtime_dir);
     g_free(root);
     g_free(old_marker);
+    g_free(old_focus_marker);
+    g_free(old_focus_release);
+    g_free(old_debug);
     g_free(old_path);
     g_free(old_ephemeral);
     g_free(old_state);

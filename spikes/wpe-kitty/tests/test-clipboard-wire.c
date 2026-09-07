@@ -1280,6 +1280,63 @@ test_limits_and_truncation(void)
 }
 
 static void
+test_empty_item_lifecycle(void)
+{
+    g_autoptr(MuxClipboardWireAssembler) assembler =
+        mux_clipboard_wire_assembler_new(0);
+    guint mode;
+
+    for (mode = 0; mode < 3; mode++) {
+        guint64 id = mode + 1U;
+        g_autoptr(GBytes) begin = make_begin_packet(
+            id, id, 0, 0, 1, 2, 0, "default", NULL);
+        g_autoptr(GBytes) plain = make_item_begin_packet(id, 0, "text/plain", 0);
+        g_autoptr(GBytes) html = make_item_begin_packet(id, 1, "text/html", 0);
+        g_autoptr(MuxClipboardWireTransfer) completed = NULL;
+        g_autoptr(GError) error = NULL;
+
+        /* Empty formats complete at ITEM_BEGIN, without an ITEM_DATA packet. */
+        assert_feed_without_error(assembler, begin, 1,
+                                  MUX_CLIPBOARD_WIRE_FEED_ACCEPTED);
+        assert_feed_without_error(assembler, plain, 2,
+                                  MUX_CLIPBOARD_WIRE_FEED_ACCEPTED);
+        assert_feed_without_error(assembler, html, 3,
+                                  MUX_CLIPBOARD_WIRE_FEED_ACCEPTED);
+        if (mode == 0) {
+            g_autoptr(GBytes) commit = make_control_packet(
+                MUX_CLIPBOARD_WIRE_SNAPSHOT_COMMIT, id);
+            const MuxClipboardSnapshot *snapshot;
+            GBytes *bytes;
+
+            g_assert_cmpint(feed_packet(assembler, commit, 4, &completed, &error),
+                            ==, MUX_CLIPBOARD_WIRE_FEED_COMPLETED);
+            g_assert_no_error(error);
+            g_assert_nonnull(completed);
+            snapshot = mux_clipboard_wire_transfer_get_snapshot(completed);
+            g_assert_true(mux_clipboard_snapshot_is_sealed(snapshot));
+            g_assert_cmpuint(mux_clipboard_snapshot_get_count(snapshot), ==, 2);
+            g_assert_cmpuint(mux_clipboard_snapshot_get_total_bytes(snapshot),
+                             ==, 0);
+            bytes = mux_clipboard_snapshot_find(snapshot, "text/plain");
+            g_assert_nonnull(bytes);
+            g_assert_cmpuint(g_bytes_get_size(bytes), ==, 0);
+            bytes = mux_clipboard_snapshot_find(snapshot, "text/html");
+            g_assert_nonnull(bytes);
+            g_assert_cmpuint(g_bytes_get_size(bytes), ==, 0);
+        } else if (mode == 1) {
+            g_autoptr(GBytes) cancel = make_control_packet(
+                MUX_CLIPBOARD_WIRE_CANCEL, id);
+
+            assert_feed_without_error(assembler, cancel, 4,
+                                      MUX_CLIPBOARD_WIRE_FEED_CANCELLED);
+        } else {
+            mux_clipboard_wire_assembler_reset(assembler);
+        }
+        g_assert_false(mux_clipboard_wire_assembler_tick(assembler, G_MAXINT64));
+    }
+}
+
+static void
 test_timeout_semantics(void)
 {
     const gint64 start = G_GINT64_CONSTANT(1000000);
@@ -3227,6 +3284,8 @@ main(int argc, char **argv)
                     test_limits_and_truncation);
     g_test_add_func("/clipboard/wire/timeout-semantics",
                     test_timeout_semantics);
+    g_test_add_func("/clipboard/wire/empty-item-lifecycle",
+                    test_empty_item_lifecycle);
     g_test_add_func("/clipboard/kitty-write/incremental-bounds",
                     test_kitty_write_is_incremental_and_bounded);
     g_test_add_func("/clipboard/kitty-write/official-framing",

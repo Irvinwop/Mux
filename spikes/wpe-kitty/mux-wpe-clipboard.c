@@ -11,6 +11,7 @@ struct _MuxWpeClipboard {
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     GMainContext *context;
+    GQueue pending_publications;
     guint64 next_serial;
 };
 
@@ -21,6 +22,7 @@ typedef struct {
     GDestroyNotify publication_data_destroy;
     gpointer publication_data;
     gpointer user_data;
+    GSource *source;
 } PendingPublication;
 
 G_DEFINE_TYPE(MuxWpeClipboard, mux_wpe_clipboard, WPE_TYPE_CLIPBOARD)
@@ -30,6 +32,8 @@ dispatch_publication(gpointer user_data)
 {
     PendingPublication *pending = user_data;
 
+    g_queue_remove(&pending->clipboard->pending_publications, pending);
+    pending->source = NULL;
     pending->publish_func(pending->clipboard,
                           pending->snapshot,
                           pending->publication_data,
@@ -42,6 +46,8 @@ pending_publication_free(gpointer user_data)
 {
     PendingPublication *pending = user_data;
 
+    if (pending->source != NULL)
+        g_queue_remove(&pending->clipboard->pending_publications, pending);
     if (pending->publication_data_destroy != NULL)
         pending->publication_data_destroy(pending->publication_data);
     mux_clipboard_snapshot_unref(pending->snapshot);
@@ -66,6 +72,8 @@ queue_publication(MuxWpeClipboard *clipboard,
     pending->publication_data_destroy = publication_data_destroy;
     pending->publication_data = publication_data;
     pending->user_data = user_data;
+    pending->source = source;
+    g_queue_push_tail(&clipboard->pending_publications, pending);
     g_source_set_callback(source,
                           dispatch_publication,
                           pending,
@@ -339,7 +347,7 @@ mux_wpe_clipboard_class_init(MuxWpeClipboardClass *clipboard_class)
 static void
 mux_wpe_clipboard_init(MuxWpeClipboard *clipboard)
 {
-    (void)clipboard;
+    g_queue_init(&clipboard->pending_publications);
 }
 
 MuxWpeClipboard *
@@ -368,6 +376,23 @@ mux_wpe_clipboard_new(WPEDisplay *display,
 }
 
 void
+mux_wpe_clipboard_stop_publishing(MuxWpeClipboard *clipboard)
+{
+    PendingPublication *pending;
+
+    g_return_if_fail(MUX_IS_WPE_CLIPBOARD(clipboard));
+
+    clipboard->publish_begin_func = NULL;
+    clipboard->publish_func = NULL;
+    while ((pending = g_queue_pop_head(&clipboard->pending_publications))) {
+        GSource *source = pending->source;
+
+        pending->source = NULL;
+        g_source_destroy(source);
+    }
+}
+
+void
 mux_wpe_clipboard_set_external(MuxWpeClipboard *clipboard,
                                const MuxClipboardSnapshot *snapshot)
 {
@@ -385,12 +410,13 @@ mux_wpe_clipboard_set_external(MuxWpeClipboard *clipboard,
     g_clear_pointer(&clipboard->external, mux_clipboard_snapshot_unref);
     clipboard->external = copy;
 
-    formats = g_ptr_array_new_with_free_func(g_free);
+    formats = g_ptr_array_new();
     for (i = 0; i < mux_clipboard_snapshot_get_count(copy); i++) {
         const gchar *mime = NULL;
 
         mux_clipboard_snapshot_get_item(copy, i, &mime, NULL);
-        g_ptr_array_add(formats, g_strdup(mime));
+        /* WPE matches advertised formats against interned MIME pointers. */
+        g_ptr_array_add(formats, (gpointer)g_intern_string(mime));
     }
     g_ptr_array_add(formats, NULL);
 

@@ -97,16 +97,22 @@ typedef struct {
     gboolean session_dirty;
     gint64 session_write_due_us;
     GMainContext *main_context;
-    GPtrArray *pending_moves;
+    GPtrArray *pending_kitty_operations;
     MuxdClipboard *clipboard;
     MuxSessionState *session;
     gchar *session_path;
 } Server;
 
+typedef enum {
+    KITTY_OPERATION_MOVE,
+    KITTY_OPERATION_FOCUS,
+} KittyOperationKind;
+
 typedef struct {
     Server *server;
     Client *control;
     Client *source;
+    KittyOperationKind kind;
     gchar *layer;
     GPid child_pid;
     GSource *child_source;
@@ -115,7 +121,7 @@ typedef struct {
     gboolean timed_out;
     gboolean cancelled;
     gboolean source_lost;
-} PendingMove;
+} PendingKittyOperation;
 
 #define SESSION_WRITE_DEBOUNCE_US (250 * 1000)
 #define SESSION_WRITE_RETRY_US (1000 * 1000)
@@ -129,7 +135,7 @@ typedef struct {
 #define MAX_ENGINE_PROFILE_BYTES 64u
 #define MAX_CLIENT_OUTPUT_BYTES (1024u * 1024u)
 #define MAX_CLIENT_IO_BYTES_PER_TICK (64u * 1024u)
-#define KITTY_MOVE_TIMEOUT_MS 2500u
+#define KITTY_COMMAND_TIMEOUT_MS 2500u
 #define ENSURE_STARTUP_TIMEOUT_MS 2000u
 #define ENSURE_PING_TIMEOUT_MS 50
 #define ENSURE_STARTUP_POLL_US 10000u
@@ -736,7 +742,7 @@ static Client *find_bar(Server *server, Client *view)
 {
     for (guint i = 0; i < server->clients->len; i++) {
         Client *client = g_ptr_array_index(server->clients, i);
-        if (client->kind == CLIENT_BAR &&
+        if (client->kind == CLIENT_BAR && !client->closing && client->fd >= 0 &&
             g_strcmp0(client->kitty_socket, view->kitty_socket) == 0 &&
             g_strcmp0(client->layer, view->layer) == 0 &&
             g_strcmp0(client->profile, view->profile) == 0) {
@@ -823,8 +829,9 @@ static gboolean kitty_window_id_is_valid(const gchar *id)
 static void control_error(Client *client, const gchar *message);
 static void broadcast_view(Server *server, Client *view, const gchar *event);
 static void reconcile_active(Server *server, Client *preferred);
+static void set_active(Server *server, Client *view);
 
-static void pending_move_destroy_source(GSource **source)
+static void kitty_operation_destroy_source(GSource **source)
 {
     if (*source == NULL)
         return;
@@ -833,73 +840,147 @@ static void pending_move_destroy_source(GSource **source)
     *source = NULL;
 }
 
-static void pending_move_free(gpointer data)
+static void kitty_operation_free(gpointer data)
 {
-    PendingMove *move = data;
+    PendingKittyOperation *operation = data;
 
-    pending_move_destroy_source(&move->timeout_source);
-    pending_move_destroy_source(&move->child_source);
-    g_free(move->layer);
-    g_free(move);
+    kitty_operation_destroy_source(&operation->timeout_source);
+    kitty_operation_destroy_source(&operation->child_source);
+    g_free(operation->layer);
+    g_free(operation);
 }
 
-static void pending_move_kill(PendingMove *move)
+static void kitty_operation_kill(PendingKittyOperation *operation)
 {
-    if (move->child_pid <= 0)
+    if (operation->child_pid <= 0)
         return;
-    while (kill((pid_t)move->child_pid, SIGKILL) < 0 && errno == EINTR)
+    while (kill((pid_t)operation->child_pid, SIGKILL) < 0 && errno == EINTR)
         ;
 }
 
-static gboolean kitty_move_timed_out(gpointer user_data)
+static gboolean kitty_operation_timed_out(gpointer user_data)
 {
-    PendingMove *move = user_data;
+    PendingKittyOperation *operation = user_data;
 
-    move->timed_out = TRUE;
-    pending_move_kill(move);
+    operation->timed_out = TRUE;
+    kitty_operation_kill(operation);
     return G_SOURCE_REMOVE;
 }
 
-static void kitty_move_child_exited(GPid child_pid,
-                                    gint wait_status,
-                                    gpointer user_data)
+static void kitty_operation_child_exited(GPid child_pid,
+                                         gint wait_status,
+                                         gpointer user_data)
 {
-    PendingMove *move = user_data;
-    Client *control = move->control;
-    Client *source = move->source;
+    PendingKittyOperation *operation = user_data;
+    Client *control = operation->control;
+    Client *source = operation->source;
+    const gchar *description = operation->kind == KITTY_OPERATION_MOVE
+        ? "layer move" : "focus request";
     gboolean source_live =
-        source != NULL && source->kind == CLIENT_VIEW &&
+        source != NULL &&
+        (source->kind == CLIENT_VIEW ||
+         (operation->kind == KITTY_OPERATION_FOCUS &&
+          source->kind == CLIENT_BAR)) &&
         !source->closing && source->fd >= 0;
     gboolean accepted = g_spawn_check_wait_status(wait_status, NULL);
+    g_autofree gchar *failure = NULL;
 
-    pending_move_destroy_source(&move->timeout_source);
-    pending_move_destroy_source(&move->child_source);
+    kitty_operation_destroy_source(&operation->timeout_source);
+    kitty_operation_destroy_source(&operation->child_source);
     g_spawn_close_pid(child_pid);
-    move->child_pid = 0;
+    operation->child_pid = 0;
 
-    if (!move->timed_out && !move->cancelled && accepted && source_live) {
-        replace_string(&source->layer, g_steal_pointer(&move->layer));
-        update_persisted_view(move->server, source);
-        broadcast_view(move->server, source, "UPSERT");
-        reconcile_active(move->server, NULL);
+    if (operation->timed_out) {
+        failure = g_strdup_printf("Kitty %s timed out", description);
+    } else if (operation->source_lost || !source_live) {
+        failure = g_strdup_printf(
+            "source view disconnected during Kitty %s", description);
+    } else if (operation->cancelled) {
+        failure = g_strdup_printf("Kitty %s was cancelled", description);
+    } else if (!accepted) {
+        failure = g_strdup_printf("Kitty rejected %s", description);
+    } else if (operation->kind == KITTY_OPERATION_FOCUS &&
+               g_strcmp0(source->layer, operation->layer) != 0) {
+        failure = g_strdup("target changed layers during Kitty focus request");
+    }
+
+    if (failure == NULL) {
+        if (operation->kind == KITTY_OPERATION_MOVE) {
+            replace_string(&source->layer, g_steal_pointer(&operation->layer));
+            update_persisted_view(operation->server, source);
+            broadcast_view(operation->server, source, "UPSERT");
+            reconcile_active(operation->server, NULL);
+        } else if (source->kind == CLIENT_VIEW) {
+            set_active(operation->server, source);
+        }
         if (control != NULL && !control->closing) {
             client_send_line(control, "OK");
             client_close_after_flush(control);
         }
     } else if (control != NULL && !control->closing) {
-        if (move->timed_out) {
-            control_error(control, "Kitty layer move timed out");
-        } else if (move->source_lost || !source_live) {
-            control_error(control,
-                          "source view disconnected during Kitty layer move");
-        } else if (move->cancelled) {
-            control_error(control, "Kitty layer move was cancelled");
-        } else {
-            control_error(control, "Kitty rejected layer move");
-        }
+        control_error(control, failure);
+    } else if (!operation->cancelled) {
+        /* Remote command rejection is an operational error, not a GLib bug. */
+        g_printerr("muxd: %s\n", failure);
     }
 
-    g_ptr_array_remove(move->server->pending_moves, move);
+    g_ptr_array_remove(operation->server->pending_kitty_operations, operation);
+}
+
+static gboolean kitty_operation_async(Server *server,
+                                       Client *control,
+                                       Client *source,
+                                       KittyOperationKind kind,
+                                       const gchar *layer,
+                                       gchar **argv)
+{
+    PendingKittyOperation *operation;
+    GPid child_pid = 0;
+    g_autoptr(GError) error = NULL;
+
+    if (server->pending_kitty_operations->len >= MAX_CLIENTS)
+        return FALSE;
+    if (!g_spawn_async(NULL,
+                       argv,
+                       NULL,
+                       G_SPAWN_SEARCH_PATH |
+                           G_SPAWN_DO_NOT_REAP_CHILD |
+                           G_SPAWN_STDIN_FROM_DEV_NULL |
+                           G_SPAWN_STDOUT_TO_DEV_NULL |
+                           G_SPAWN_STDERR_TO_DEV_NULL,
+                       NULL,
+                       NULL,
+                       &child_pid,
+                       &error)) {
+        g_printerr("muxd: cannot launch Kitty command: %s\n", error->message);
+        return FALSE;
+    }
+
+    operation = g_new0(PendingKittyOperation, 1);
+    operation->server = server;
+    operation->control = control;
+    operation->source = source;
+    operation->kind = kind;
+    operation->layer = g_strdup(layer);
+    operation->child_pid = child_pid;
+    operation->deadline_us = g_get_monotonic_time() +
+        ((gint64)KITTY_COMMAND_TIMEOUT_MS * 1000);
+    operation->child_source = g_child_watch_source_new(child_pid);
+    g_source_set_callback(operation->child_source,
+                          G_SOURCE_FUNC(kitty_operation_child_exited),
+                          operation,
+                          NULL);
+    g_source_attach(operation->child_source, server->main_context);
+    operation->timeout_source = g_timeout_source_new(KITTY_COMMAND_TIMEOUT_MS);
+    g_source_set_callback(operation->timeout_source,
+                          kitty_operation_timed_out,
+                          operation,
+                          NULL);
+    g_source_attach(operation->timeout_source, server->main_context);
+    g_ptr_array_add(server->pending_kitty_operations, operation);
+    if (control != NULL)
+        control->request_pending = TRUE;
+    return TRUE;
 }
 
 static gboolean kitty_move_view_async(Server *server,
@@ -913,209 +994,169 @@ static gboolean kitty_move_view_async(Server *server,
     g_autofree gchar *target_tab =
         g_strdup_printf("window_id:%s", target->kitty_window);
     gchar *argv[] = {
-        "kitten",
-        "@",
-        "--use-password=always",
-        "--to",
-        source->kitty_socket,
-        "detach-window",
-        "--match",
-        source_match,
-        "--target-tab",
-        target_tab,
-        NULL,
+        "kitten", "@", "--use-password=always",
+        "--to", source->kitty_socket,
+        "detach-window", "--match", source_match,
+        "--target-tab", target_tab, NULL,
     };
-    PendingMove *move;
-    GPid child_pid = 0;
 
-    if (!g_spawn_async(NULL,
-                       argv,
-                       NULL,
-                       G_SPAWN_SEARCH_PATH |
-                           G_SPAWN_DO_NOT_REAP_CHILD |
-                           G_SPAWN_STDIN_FROM_DEV_NULL |
-                           G_SPAWN_STDOUT_TO_DEV_NULL |
-                           G_SPAWN_STDERR_TO_DEV_NULL,
-                       NULL,
-                       NULL,
-                       &child_pid,
-                       NULL))
-        return FALSE;
-
-    move = g_new0(PendingMove, 1);
-    move->server = server;
-    move->control = control;
-    move->source = source;
-    move->layer = g_strdup(layer);
-    move->child_pid = child_pid;
-    move->deadline_us =
-        g_get_monotonic_time() + ((gint64)KITTY_MOVE_TIMEOUT_MS * 1000);
-    move->child_source = g_child_watch_source_new(child_pid);
-    g_source_set_callback(move->child_source,
-                          G_SOURCE_FUNC(kitty_move_child_exited),
-                          move,
-                          NULL);
-    g_source_attach(move->child_source, server->main_context);
-    move->timeout_source = g_timeout_source_new(KITTY_MOVE_TIMEOUT_MS);
-    g_source_set_callback(move->timeout_source,
-                          kitty_move_timed_out,
-                          move,
-                          NULL);
-    g_source_attach(move->timeout_source, server->main_context);
-    g_ptr_array_add(server->pending_moves, move);
-    control->request_pending = TRUE;
-    return TRUE;
+    return kitty_operation_async(server, control, source,
+                                  KITTY_OPERATION_MOVE, layer, argv);
 }
 
-static gboolean source_has_pending_move(Server *server,
-                                        const Client *source)
+static gboolean source_has_pending_move(Server *server, const Client *source)
 {
-    for (guint i = 0; i < server->pending_moves->len; i++) {
-        PendingMove *move = g_ptr_array_index(server->pending_moves, i);
+    for (guint i = 0; i < server->pending_kitty_operations->len; i++) {
+        PendingKittyOperation *operation =
+            g_ptr_array_index(server->pending_kitty_operations, i);
 
-        if (move->source == source && !move->cancelled)
+        if (operation->kind == KITTY_OPERATION_MOVE &&
+            operation->source == source && !operation->cancelled)
             return TRUE;
     }
     return FALSE;
 }
 
-static void pending_moves_detach_client(Server *server, Client *client)
+static void pending_kitty_operations_detach_client(Server *server,
+                                                    Client *client)
 {
-    for (guint i = 0; i < server->pending_moves->len; i++) {
-        PendingMove *move = g_ptr_array_index(server->pending_moves, i);
+    for (guint i = 0; i < server->pending_kitty_operations->len; i++) {
+        PendingKittyOperation *operation =
+            g_ptr_array_index(server->pending_kitty_operations, i);
         gboolean affected = FALSE;
 
-        if (move->control == client) {
-            move->control = NULL;
+        if (operation->control == client) {
+            operation->control = NULL;
             affected = TRUE;
         }
-        if (move->source == client) {
-            move->source = NULL;
-            move->source_lost = TRUE;
+        if (operation->source == client) {
+            operation->source = NULL;
+            operation->source_lost = TRUE;
             affected = TRUE;
         }
-        if (affected && !move->cancelled) {
-            move->cancelled = TRUE;
-            pending_move_destroy_source(&move->timeout_source);
-            pending_move_kill(move);
+        if (affected && !operation->cancelled) {
+            operation->cancelled = TRUE;
+            kitty_operation_destroy_source(&operation->timeout_source);
+            kitty_operation_kill(operation);
         }
     }
 }
 
-static gboolean pending_moves_shutdown(Server *server)
+static gboolean pending_kitty_operations_shutdown(Server *server)
 {
     gint64 deadline_us = g_get_monotonic_time() +
         ((gint64)STOP_OWNED_CHILD_REAP_MS * 1000);
     gboolean complete = TRUE;
 
-    for (guint i = 0; i < server->pending_moves->len; i++) {
-        PendingMove *move = g_ptr_array_index(server->pending_moves, i);
+    for (guint i = 0; i < server->pending_kitty_operations->len; i++) {
+        PendingKittyOperation *operation =
+            g_ptr_array_index(server->pending_kitty_operations, i);
 
-        pending_move_destroy_source(&move->timeout_source);
-        pending_move_destroy_source(&move->child_source);
-        pending_move_kill(move);
+        kitty_operation_destroy_source(&operation->timeout_source);
+        kitty_operation_destroy_source(&operation->child_source);
+        kitty_operation_kill(operation);
     }
 
-    while (server->pending_moves->len > 0 &&
+    while (server->pending_kitty_operations->len > 0 &&
            g_get_monotonic_time() < deadline_us) {
-        for (gint i = (gint)server->pending_moves->len - 1; i >= 0; i--) {
-            PendingMove *move =
-                g_ptr_array_index(server->pending_moves, (guint)i);
+        for (gint i = (gint)server->pending_kitty_operations->len - 1;
+             i >= 0; i--) {
+            PendingKittyOperation *operation =
+                g_ptr_array_index(server->pending_kitty_operations, (guint)i);
             gint wait_status;
             pid_t waited;
 
             do {
-                waited = waitpid((pid_t)move->child_pid,
+                waited = waitpid((pid_t)operation->child_pid,
                                  &wait_status,
                                  WNOHANG);
             } while (waited < 0 && errno == EINTR);
-            if (waited != (pid_t)move->child_pid &&
+            if (waited != (pid_t)operation->child_pid &&
                 !(waited < 0 && errno == ECHILD))
                 continue;
-            g_spawn_close_pid(move->child_pid);
-            move->child_pid = 0;
-            g_ptr_array_remove_index(server->pending_moves, (guint)i);
+            g_spawn_close_pid(operation->child_pid);
+            operation->child_pid = 0;
+            g_ptr_array_remove_index(server->pending_kitty_operations, (guint)i);
         }
-        if (server->pending_moves->len > 0)
+        if (server->pending_kitty_operations->len > 0)
             (void)poll(NULL, 0, 10);
     }
 
-    while (server->pending_moves->len > 0) {
-        PendingMove *move = g_ptr_array_index(server->pending_moves, 0);
+    while (server->pending_kitty_operations->len > 0) {
+        PendingKittyOperation *operation =
+            g_ptr_array_index(server->pending_kitty_operations, 0);
 
-        g_printerr("muxd: owned Kitty move child %ld was not reaped\n",
-                   (long)move->child_pid);
+        g_printerr("muxd: owned Kitty command child %ld was not reaped\n",
+                   (long)operation->child_pid);
         complete = FALSE;
-        g_spawn_close_pid(move->child_pid);
-        move->child_pid = 0;
-        g_ptr_array_remove_index(server->pending_moves, 0);
+        g_spawn_close_pid(operation->child_pid);
+        operation->child_pid = 0;
+        g_ptr_array_remove_index(server->pending_kitty_operations, 0);
     }
     return complete;
 }
 
-static gint pending_move_poll_timeout(Server *server, gint fallback_ms)
+static gint kitty_operation_poll_timeout(Server *server, gint fallback_ms)
 {
     gint timeout_ms = fallback_ms;
     gint64 now_us = g_get_monotonic_time();
 
-    for (guint i = 0; i < server->pending_moves->len; i++) {
-        PendingMove *move = g_ptr_array_index(server->pending_moves, i);
-        gint64 remaining_us = move->deadline_us - now_us;
-        gint remaining_ms = remaining_us <= 0
-            ? 0
-            : (gint)MIN((remaining_us + 999) / 1000,
-                        (gint64)G_MAXINT);
+    for (guint i = 0; i < server->pending_kitty_operations->len; i++) {
+        PendingKittyOperation *operation =
+            g_ptr_array_index(server->pending_kitty_operations, i);
+        gint64 remaining_us;
+        gint remaining;
 
-        timeout_ms = MIN(timeout_ms, remaining_ms);
+        if (operation->cancelled || operation->timed_out)
+            continue;
+        remaining_us = operation->deadline_us - now_us;
+        remaining = remaining_us <= 0 ? 0
+            : (gint)MIN((remaining_us + 999) / 1000, (gint64)G_MAXINT);
+        timeout_ms = MIN(timeout_ms, remaining);
     }
     return timeout_ms;
 }
 
-static gboolean kitty_focus(Client *client)
+static void cancel_pending_focus(Server *server, const gchar *kitty_socket)
 {
-    if (!client || !client->kitty_window || !*client->kitty_window ||
-        !client->kitty_socket || !*client->kitty_socket) {
-        return FALSE;
-    }
+    for (guint i = 0; i < server->pending_kitty_operations->len; i++) {
+        PendingKittyOperation *operation =
+            g_ptr_array_index(server->pending_kitty_operations, i);
 
-    g_autofree gchar *match =
-        g_strdup_printf("id:%s", client->kitty_window);
+        if (operation->kind != KITTY_OPERATION_FOCUS ||
+            operation->cancelled || operation->source == NULL ||
+            (kitty_socket != NULL &&
+             g_strcmp0(operation->source->kitty_socket, kitty_socket) != 0))
+            continue;
+        operation->cancelled = TRUE;
+        kitty_operation_destroy_source(&operation->timeout_source);
+        kitty_operation_kill(operation);
+    }
+}
+
+static gboolean kitty_focus_async(Server *server,
+                                   Client *control,
+                                   Client *target)
+{
+    g_autofree gchar *match = NULL;
+
+    if (target == NULL || target->closing || target->fd < 0 ||
+        !kitty_window_id_is_valid(target->kitty_window) ||
+        !kitty_socket_is_valid(target->kitty_socket))
+        return FALSE;
+
+    /* The most recent focus request owns focus within its Kitty instance. */
+    cancel_pending_focus(server, target->kitty_socket);
+
+    match = g_strdup_printf("id:%s", target->kitty_window);
     gchar *argv[] = {
-        "kitten",
-        "@",
-        "--to",
-        client->kitty_socket,
-        "focus-window",
-        "--match",
-        match,
-        NULL,
+        "kitten", "@", "--use-password=always",
+        "--to", target->kitty_socket,
+        "focus-window", "--match", match, NULL,
     };
 
-    g_autofree gchar *standard_output = NULL;
-    g_autofree gchar *standard_error = NULL;
-    g_autoptr(GError) error = NULL;
-    gint status = 0;
-
-    if (!g_spawn_sync(NULL,
-                      argv,
-                      NULL,
-                      G_SPAWN_SEARCH_PATH,
-                      NULL,
-                      NULL,
-                      &standard_output,
-                      &standard_error,
-                      &status,
-                      &error) ||
-        !g_spawn_check_wait_status(status, &error)) {
-        g_warning("Kitty focus-window failed: %s%s%s",
-                  error ? error->message : "unknown failure",
-                  standard_error && *standard_error ? ": " : "",
-                  standard_error && *standard_error
-                      ? g_strstrip(standard_error)
-                      : "");
-        return FALSE;
-    }
-    return TRUE;
+    return kitty_operation_async(server, control, target,
+                                  KITTY_OPERATION_FOCUS, target->layer, argv);
 }
 
 static guint view_count(Server *server)
@@ -1587,16 +1628,21 @@ static void handle_control(
             control_error(client, "invalid layer identifier");
             return;
         }
+        Client *view = find_layer_view(server, layer);
+        if (view != NULL) {
+            if (!kitty_focus_async(server, client, view))
+                control_error(client, "failed to execute Kitty focus request");
+            g_free(layer);
+            return;
+        }
+        /* An empty layer has no Kitty target, but still supersedes focus. */
+        cancel_pending_focus(server, NULL);
         replace_string(&server->current_layer, layer);
         persist_active_layer_if_eligible(server,
                                          server->current_layer,
                                          NULL);
         broadcast_layer(server);
-        Client *view = find_layer_view(server, server->current_layer);
-        reconcile_active(server, view);
-        if (view) {
-            kitty_focus(view);
-        }
+        reconcile_active(server, NULL);
         client_send_line(client, "OK");
         client_close_after_flush(client);
         return;
@@ -1607,10 +1653,8 @@ static void handle_control(
             control_error(client, "view not found");
             return;
         }
-        set_active(server, view);
-        kitty_focus(view);
-        client_send_line(client, "OK");
-        client_close_after_flush(client);
+        if (!kitty_focus_async(server, client, view))
+            control_error(client, "failed to execute Kitty focus request");
         return;
     }
     if (g_strcmp0(command, "MOVE") == 0 && field_count >= 4) {
@@ -1773,9 +1817,9 @@ static void handle_view(
     }
     if (g_strcmp0(fields[0], "PROMPT") == 0) {
         Client *bar = find_bar(server, client);
-        if (bar && client_send_line(bar, "DO\tEDIT\t")) {
-            kitty_focus(bar);
-        }
+        if (bar && client_send_line(bar, "DO\tEDIT\t") &&
+            !kitty_focus_async(server, NULL, bar))
+            g_printerr("muxd: failed to focus the global URL bar\n");
         return;
     }
     if (g_strcmp0(fields[0], "BYE") == 0) {
@@ -1795,14 +1839,15 @@ static void handle_bar(
         Client *view = find_bar_active_view(server, client);
         if (view) {
             client_send_line(view, "DO\tOPEN\t%s", fields[1]);
-            kitty_focus(view);
+            if (!kitty_focus_async(server, NULL, view))
+                g_printerr("muxd: failed to focus the opened page\n");
         }
         return;
     }
     if (g_strcmp0(fields[0], "CANCEL") == 0) {
         Client *view = find_bar_active_view(server, client);
-        if (view)
-            kitty_focus(view);
+        if (view && !kitty_focus_async(server, NULL, view))
+            g_printerr("muxd: failed to return focus to the page\n");
         return;
     }
     if (g_strcmp0(fields[0], "CLOSE") == 0) {
@@ -1996,7 +2041,7 @@ static void remove_closed_clients(Server *server)
         if (!client->closing)
             continue;
 
-        pending_moves_detach_client(server, client);
+        pending_kitty_operations_detach_client(server, client);
 
         if (server->stopping && client->kind == CLIENT_VIEW &&
             !client->stop_abandon) {
@@ -2395,7 +2440,7 @@ static int run_server(void)
         .listener = -1,
         .lock_fd = -1,
         .clients = g_ptr_array_new_with_free_func(client_free),
-        .pending_moves = g_ptr_array_new_with_free_func(pending_move_free),
+        .pending_kitty_operations = g_ptr_array_new_with_free_func(kitty_operation_free),
         .current_layer = g_strdup("main"),
         .next_transient_id = 1,
         .running = TRUE,
@@ -2407,7 +2452,7 @@ static int run_server(void)
     if (server.listener < 0) {
         g_printerr("muxd: cannot listen: %s\n", g_strerror(errno));
         g_ptr_array_unref(server.clients);
-        g_ptr_array_unref(server.pending_moves);
+        g_ptr_array_unref(server.pending_kitty_operations);
         g_free(server.current_layer);
         g_main_context_unref(server.main_context);
         return EXIT_FAILURE;
@@ -2445,7 +2490,7 @@ static int run_server(void)
         unlink(server.socket_path);
         close(server.lock_fd);
         g_ptr_array_unref(server.clients);
-        g_ptr_array_unref(server.pending_moves);
+        g_ptr_array_unref(server.pending_kitty_operations);
         g_free(server.socket_path);
         g_free(server.current_layer);
         g_free(server.session_path);
@@ -2481,7 +2526,7 @@ static int run_server(void)
         do {
             result = poll(poll_fds,
                           client_count + 1,
-                          pending_move_poll_timeout(&server, 50));
+                          kitty_operation_poll_timeout(&server, 50));
         } while (result < 0 && errno == EINTR && !stop_requested);
         int poll_error = result < 0 ? errno : 0;
 
@@ -2517,7 +2562,7 @@ static int run_server(void)
 
     if (server.session_dirty && !persist_session_now(&server))
         server.stop_cleanup_failed = TRUE;
-    if (!pending_moves_shutdown(&server))
+    if (!pending_kitty_operations_shutdown(&server))
         server.stop_cleanup_failed = TRUE;
     muxd_clipboard_free(server.clipboard);
     g_main_context_unref(server.main_context);
@@ -2534,7 +2579,7 @@ static int run_server(void)
         send_controlled_stop_response(&server);
     g_ptr_array_unref(server.clients);
     g_ptr_array_unref(server.engines);
-    g_ptr_array_unref(server.pending_moves);
+    g_ptr_array_unref(server.pending_kitty_operations);
     g_free(server.socket_path);
     g_free(server.active_id);
     g_free(server.current_layer);

@@ -546,11 +546,8 @@ finish_item(MuxClipboardWireAssembler *assembler, GError **error)
     GBytes *bytes;
     gboolean result;
 
-    if (assembler->item_expected == 0)
-        bytes = g_bytes_new_static("", 0);
-    else
-        bytes = g_byte_array_free_to_bytes(assembler->item_data);
-    assembler->item_data = NULL;
+    bytes = g_byte_array_free_to_bytes(
+        g_steal_pointer(&assembler->item_data));
     result = mux_clipboard_snapshot_add(assembler->snapshot,
                                         assembler->item_mime,
                                         bytes,

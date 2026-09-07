@@ -493,6 +493,36 @@ wait_frame_ack() {
     fail "positive Kitty FRAME_ACK was not observed for $expected_title within the polling deadline"
 }
 
+wait_bar_ready() {
+    local expected_url=$1
+    local capture="$BASE/bar-startup.txt"
+    local attempt
+
+    # Page load and bar launch are independent children of mux-layer.
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        if (( BAR_PID == 0 )); then
+            BAR_PID=$(marked_pid mux-bar 2>/dev/null || true)
+            BAR_PID=${BAR_PID:-0}
+        elif ! pid_alive "$BAR_PID"; then
+            fail "mux-bar exited before displaying its registered page"
+        fi
+        if (( BAR_PID > 0 )); then
+            BAR_KITTY_ID=$(pid_env_value "$BAR_PID" KITTY_WINDOW_ID 2>/dev/null || true)
+            if [[ -n $BAR_KITTY_ID ]] &&
+                kitty_rc get-text --match "id:$BAR_KITTY_ID" --extent=all \
+                    >"$capture" 2>>"$LOG_DIR/kitty-actions.log" &&
+                grep -Fq "$expected_url" "$capture"; then
+                pid_alive "$BAR_PID" || fail "mux-bar exited during readiness"
+                return 0
+            fi
+        fi
+        assert_core_alive
+        pid_alive "$BOOT_PANE_PID" || fail "initial mux-pane exited during bar startup"
+        sleep 0.05
+    done
+    fail "global URL bar did not display its registered page within the startup deadline"
+}
+
 wait_bar_editing() {
     local kitty_window=$1
     local capture="$BASE/bar-editing.txt"
@@ -855,23 +885,21 @@ wait_socket "$KITTY_SOCKET" "$KITTY_PID" kitty
 BOOT_VIEW_ID=$(wait_initial_view "$BOOT_URL" MUX_SMOKE_BOOT_LOADED)
 SNAPSHOT=$(run_muxctl list)
 BOOT_PANE_PID=$(marked_pid mux-pane) || fail "mux-pane process was not observed"
-BAR_PID=$(marked_pid mux-bar) || fail "mux-bar process was not observed"
-pid_alive "$BAR_PID" || fail "mux-bar exited"
-
 reported_boot_pid=$(record_field "$SNAPSHOT" "$BOOT_VIEW_ID" pid)
 BOOT_KITTY_ID=$(record_field "$SNAPSHOT" "$BOOT_VIEW_ID" kitty)
 [[ $reported_boot_pid == "$BOOT_PANE_PID" ]] ||
     fail "muxctl pane PID $reported_boot_pid does not match process $BOOT_PANE_PID"
 [[ -n $BOOT_KITTY_ID ]] || fail "muxctl did not report the initial Kitty window ID"
 KITTY_WINDOW_IDS+=("$BOOT_KITTY_ID")
-BAR_KITTY_ID=$(pid_env_value "$BAR_PID" KITTY_WINDOW_ID || true)
-[[ -n $BAR_KITTY_ID ]] || fail "KITTY_WINDOW_ID was not present in the mux-bar environment"
-[[ $BAR_KITTY_ID != "$BOOT_KITTY_ID" ]] ||
-    fail "mux-bar and mux-pane unexpectedly reported the same Kitty window ID"
-
 KITTY_PUBLIC_KEY_VALUE=$(pid_env_value "$BOOT_PANE_PID" KITTY_PUBLIC_KEY || true)
 [[ -n $KITTY_PUBLIC_KEY_VALUE ]] ||
     fail "KITTY_PUBLIC_KEY was not present in the mux-pane environment"
+
+wait_bar_ready "$BOOT_URL"
+[[ -n $BAR_KITTY_ID ]] || fail "KITTY_WINDOW_ID was not present in the mux-bar environment"
+[[ $BAR_KITTY_ID != "$BOOT_KITTY_ID" ]] ||
+    fail "mux-bar and mux-pane unexpectedly reported the same Kitty window ID"
+KITTY_WINDOW_IDS+=("$BAR_KITTY_ID")
 wait_frame_ack "$BOOT_KITTY_ID" "$BOOT_URL" MUX_SMOKE_BOOT_LOADED
 
 run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||

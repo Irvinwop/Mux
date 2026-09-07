@@ -110,8 +110,17 @@ assert_protocol_rejected(const guint8 *packet, gsize packet_size)
     sent = send(sockets[0], packet, packet_size, 0);
     g_assert_cmpint(sent, ==, (ssize_t)packet_size);
 
-    g_assert_false(mux_engine_receive_message(sockets[1], &message, &error));
+    g_assert_cmpint(mux_engine_receive_message(sockets[1], &message, &error),
+                    ==,
+                    MUX_ENGINE_RECEIVE_ERROR);
     g_assert_error(error, MUX_ENGINE_ERROR, MUX_ENGINE_ERROR_PROTOCOL);
+    g_assert_null(message.payload);
+
+    g_clear_error(&error);
+    g_assert_cmpint(mux_engine_receive_message(sockets[1], &message, &error),
+                    ==,
+                    MUX_ENGINE_RECEIVE_WOULD_BLOCK);
+    g_assert_no_error(error);
     g_assert_null(message.payload);
 
     mux_engine_message_clear(&message);
@@ -250,7 +259,9 @@ test_packet_round_trip(void)
 
     g_assert_true(mux_engine_send_message(sockets[0], &outgoing, &error));
     g_assert_no_error(error);
-    g_assert_true(mux_engine_receive_message(sockets[1], &incoming, &error));
+    g_assert_cmpint(mux_engine_receive_message(sockets[1], &incoming, &error),
+                    ==,
+                    MUX_ENGINE_RECEIVE_MESSAGE);
     g_assert_no_error(error);
 
     g_assert_cmpuint(incoming.type, ==, MUX_ENGINE_MESSAGE_EXTENSION);
@@ -298,9 +309,11 @@ test_close_handshake_round_trip(void)
                                               &outgoing,
                                               &error));
         g_assert_no_error(error);
-        g_assert_true(mux_engine_receive_message(sockets[1],
-                                                 &incoming,
-                                                 &error));
+        g_assert_cmpint(mux_engine_receive_message(sockets[1],
+                                                   &incoming,
+                                                   &error),
+                        ==,
+                        MUX_ENGINE_RECEIVE_MESSAGE);
         g_assert_no_error(error);
         g_assert_cmpuint(incoming.type, ==, types[index]);
         g_assert_cmpuint(incoming.flags, ==, MUX_ENGINE_FLAG_NONE);
@@ -351,9 +364,11 @@ test_visibility_round_trip(void)
                                               &outgoing,
                                               &error));
         g_assert_no_error(error);
-        g_assert_true(mux_engine_receive_message(sockets[1],
-                                                 &incoming,
-                                                 &error));
+        g_assert_cmpint(mux_engine_receive_message(sockets[1],
+                                                   &incoming,
+                                                   &error),
+                        ==,
+                        MUX_ENGINE_RECEIVE_MESSAGE);
         g_assert_no_error(error);
         g_assert_cmpuint(incoming.type,
                          ==,
@@ -400,7 +415,9 @@ test_layer_round_trip(void)
                             payload);
     g_assert_true(mux_engine_send_message(sockets[0], &outgoing, &error));
     g_assert_no_error(error);
-    g_assert_true(mux_engine_receive_message(sockets[1], &incoming, &error));
+    g_assert_cmpint(mux_engine_receive_message(sockets[1], &incoming, &error),
+                    ==,
+                    MUX_ENGINE_RECEIVE_MESSAGE);
     g_assert_no_error(error);
     g_assert_cmpuint(incoming.type, ==, MUX_ENGINE_MESSAGE_SET_LAYER);
     mux_engine_cursor_init(&cursor, incoming.payload);
@@ -439,7 +456,9 @@ test_frame_rejected_round_trip(void)
                             payload);
     g_assert_true(mux_engine_send_message(sockets[0], &outgoing, &error));
     g_assert_no_error(error);
-    g_assert_true(mux_engine_receive_message(sockets[1], &incoming, &error));
+    g_assert_cmpint(mux_engine_receive_message(sockets[1], &incoming, &error),
+                    ==,
+                    MUX_ENGINE_RECEIVE_MESSAGE);
     g_assert_no_error(error);
     g_assert_cmpuint(incoming.type,
                      ==,
@@ -481,9 +500,11 @@ test_cancel_close_round_trip(void)
 
     g_assert_true(mux_engine_send_message(sockets[0], &outgoing, &error));
     g_assert_no_error(error);
-    g_assert_true(mux_engine_receive_message(sockets[1],
-                                             &incoming,
-                                             &error));
+    g_assert_cmpint(mux_engine_receive_message(sockets[1],
+                                               &incoming,
+                                               &error),
+                    ==,
+                    MUX_ENGINE_RECEIVE_MESSAGE);
     g_assert_no_error(error);
     g_assert_cmpuint(incoming.type, ==, MUX_ENGINE_MESSAGE_CANCEL_CLOSE);
     mux_engine_cursor_init(&cursor, incoming.payload);
