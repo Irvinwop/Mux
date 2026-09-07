@@ -51,6 +51,7 @@ jobs:
       - name: Enforce resource budgets
         env:
           CI: "true"
+          G_DEBUG: fatal-criticals
           MUX_RESOURCE_ALLOW_ROOT_CI: "1"
           MUX_BIN_DIR: ${{ github.workspace }}/build/resource-smoke
           MUX_RESOURCE_ARTIFACT_DIR: ${{ github.workspace }}/resource-smoke-artifacts

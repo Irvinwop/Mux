@@ -5,11 +5,13 @@
 #include <gio/gio.h>
 #include <glib.h>
 #include <wpe/webkit.h>
+#include <wpe/wpe-platform.h>
 
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+GBytes *mux_engine_test_ref_buffer_pixels(WPEBuffer *buffer, GError **error);
 gboolean mux_engine_test_prepare_initial_uri(gboolean popup_claim,
                                              const gchar *uri,
                                              const gchar *search_url,
@@ -54,6 +56,98 @@ gchar *mux_pane_test_find_overlay_label(const gchar *query,
                                         MuxEngineFindStatus status,
                                         guint matches,
                                         guint columns);
+
+typedef struct {
+    WPEBuffer parent_instance;
+    GBytes *pixels;
+} TestPixelBuffer;
+
+typedef struct {
+    WPEBufferClass parent_class;
+} TestPixelBufferClass;
+
+G_DEFINE_TYPE(TestPixelBuffer, test_pixel_buffer, WPE_TYPE_BUFFER)
+
+static GBytes *
+test_pixel_buffer_import_pixels(WPEBuffer *buffer, GError **error)
+{
+    TestPixelBuffer *test_buffer = (TestPixelBuffer *)buffer;
+
+    if (!test_buffer->pixels)
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_SUPPORTED,
+                            "fixture has no pixel data");
+    return test_buffer->pixels;
+}
+
+static void
+test_pixel_buffer_finalize(GObject *object)
+{
+    TestPixelBuffer *buffer = (TestPixelBuffer *)object;
+
+    g_clear_pointer(&buffer->pixels, g_bytes_unref);
+    G_OBJECT_CLASS(test_pixel_buffer_parent_class)->finalize(object);
+}
+
+static void
+test_pixel_buffer_class_init(TestPixelBufferClass *klass)
+{
+    G_OBJECT_CLASS(klass)->finalize = test_pixel_buffer_finalize;
+    WPE_BUFFER_CLASS(klass)->import_to_pixels = test_pixel_buffer_import_pixels;
+}
+
+static void
+test_pixel_buffer_init(TestPixelBuffer *buffer)
+{
+    (void)buffer;
+}
+
+static void
+record_pixel_release(gpointer data)
+{
+    guint *releases = data;
+
+    (*releases)++;
+}
+
+static void
+test_borrowed_buffer_pixels_survive_reuse(void)
+{
+    static const guint8 pixels[] = {0x17, 0x28, 0x39, 0xff};
+    TestPixelBuffer *buffer = g_object_new(test_pixel_buffer_get_type(),
+                                          "width", 1,
+                                          "height", 1,
+                                          NULL);
+    g_autoptr(GError) error = NULL;
+    guint releases = 0;
+
+    g_assert_null(mux_engine_test_ref_buffer_pixels(WPE_BUFFER(buffer),
+                                                    &error));
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED);
+    g_clear_error(&error);
+
+    buffer->pixels = g_bytes_new_with_free_func(pixels,
+                                                sizeof(pixels),
+                                                record_pixel_release,
+                                                &releases);
+    for (guint iteration = 0; iteration < 8; iteration++) {
+        GBytes *imported = mux_engine_test_ref_buffer_pixels(
+            WPE_BUFFER(buffer), &error);
+        gsize size;
+        gconstpointer data;
+
+        g_assert_no_error(error);
+        g_assert_nonnull(imported);
+        g_assert_true(imported == buffer->pixels);
+        data = g_bytes_get_data(imported, &size);
+        g_assert_cmpmem(data, size, pixels, sizeof(pixels));
+        g_bytes_unref(imported);
+        g_assert_cmpuint(releases, ==, 0);
+    }
+    g_object_unref(buffer);
+    g_assert_cmpuint(releases, ==, 1);
+}
 
 static void
 put_u16(guint8 *target, guint16 value)
@@ -1173,6 +1267,8 @@ main(int argc, char **argv)
                     test_engine_error_payload_validation);
     g_test_add_func("/engine-runtime/graphics/kitty-response",
                     test_kitty_graphics_response_classification);
+    g_test_add_func("/engine-runtime/graphics/borrowed-buffer-reuse",
+                    test_borrowed_buffer_pixels_survive_reuse);
     g_test_add_func("/engine-runtime/graphics/trusted-overlay-layering",
                     test_kitty_frame_trusted_overlay_layering);
     g_test_add_func("/engine-runtime/popup/global-view-capacity",

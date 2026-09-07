@@ -182,7 +182,23 @@ engine_private_network_session_new(void)
     return session;
 }
 
+static GBytes *
+engine_ref_buffer_pixels(WPEBuffer *buffer, GError **error)
+{
+    GBytes *pixels = wpe_buffer_import_to_pixels(buffer, error);
+
+    /* WPE retains ownership. The caller releases only this extra reference
+     * after copying the pixels, before the render buffer is released. */
+    return pixels ? g_bytes_ref(pixels) : NULL;
+}
+
 #ifdef MUX_ENGINE_LOGIC_TEST
+
+GBytes *
+mux_engine_test_ref_buffer_pixels(WPEBuffer *buffer, GError **error)
+{
+    return engine_ref_buffer_pixels(buffer, error);
+}
 
 gboolean
 mux_engine_test_prepare_initial_uri(gboolean popup_claim,
@@ -2856,7 +2872,7 @@ engine_view_update_pixels(EngineView *view,
         width != view->width || height != view->height)
         return FALSE;
 
-    bytes = wpe_buffer_import_to_pixels(buffer, &error);
+    bytes = engine_ref_buffer_pixels(buffer, &error);
     if (!bytes) {
         g_warning("import WPE buffer for Kitty: %s",
                   error ? error->message : "unsupported buffer");

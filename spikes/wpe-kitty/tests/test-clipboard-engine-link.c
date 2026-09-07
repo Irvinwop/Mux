@@ -640,17 +640,15 @@ change_during_cache_notification(GObject *clipboard,
 }
 
 static gboolean
-incoming_paste_packet(GBytes *packet, gpointer user_data, GError **error)
+collect_incoming_paste_packet(GBytes *packet,
+                              gpointer user_data,
+                              GError **error)
 {
-    IncomingPaste *fixture = user_data;
-    const guint8 *data;
-    gsize length;
+    GPtrArray *packets = user_data;
 
-    data = g_bytes_get_data(packet, &length);
-    return mux_clipboard_engine_link_handle_packet(fixture->link,
-                                                    data,
-                                                    length,
-                                                    error);
+    (void)error;
+    g_ptr_array_add(packets, g_bytes_ref(packet));
+    return TRUE;
 }
 
 static void
@@ -658,9 +656,12 @@ test_incoming_paste_owns_its_destination(gconstpointer user_data)
 {
     IncomingPaste fixture = { 0 };
     g_autoptr(MuxClipboardSnapshot) snapshot = test_snapshot(500);
+    g_autoptr(GPtrArray) incoming_packets = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)g_bytes_unref);
     g_autoptr(WPEClipboard) clipboard = NULL;
     g_autoptr(GError) error = NULL;
-    gboolean accepted;
+    gboolean accepted = FALSE;
+    guint i;
 
     fixture.change = GPOINTER_TO_INT(user_data);
     packet_sink_init(&fixture.sink);
@@ -685,7 +686,7 @@ test_incoming_paste_owns_its_destination(gconstpointer user_data)
         &fixture);
 
     /* Historical source metadata must never become a paste destination. */
-    accepted = mux_clipboard_wire_send_snapshot(
+    g_assert_true(mux_clipboard_wire_send_snapshot(
         700,
         MUX_CLIPBOARD_WIRE_FLAG_CURRENT | MUX_CLIPBOARD_WIRE_FLAG_PASTE,
         "profile-paste",
@@ -693,9 +694,47 @@ test_incoming_paste_owns_its_destination(gconstpointer user_data)
         499,
         g_get_monotonic_time(),
         snapshot,
-        incoming_paste_packet,
-        &fixture,
-        &error);
+        collect_incoming_paste_packet,
+        incoming_packets,
+        &error));
+    g_assert_no_error(error);
+    g_assert_cmpuint(incoming_packets->len, >, 0);
+
+    /*
+     * Receiving a record happens after transport accepts it. An application
+     * rejection of COMMIT must not become a send failure that makes the sender
+     * manufacture a second CANCEL against an already-finished receiver.
+     */
+    for (i = 0; i < incoming_packets->len; i++) {
+        GBytes *packet = g_ptr_array_index(incoming_packets, i);
+        const guint8 *data;
+        gsize length;
+
+        data = g_bytes_get_data(packet, &length);
+        if (i + 1 == incoming_packets->len) {
+            MuxClipboardWireRecord commit = { 0 };
+
+            g_assert_true(mux_clipboard_wire_record_decode(data,
+                                                          length,
+                                                          &commit,
+                                                          &error));
+            g_assert_no_error(error);
+            g_assert_cmpint(commit.type,
+                             ==,
+                             MUX_CLIPBOARD_WIRE_SNAPSHOT_COMMIT);
+            g_assert_cmpuint(commit.transaction_id, ==, 700);
+            mux_clipboard_wire_record_clear(&commit);
+        }
+        g_assert_nonnull(fixture.link);
+        accepted = mux_clipboard_engine_link_handle_packet(fixture.link,
+                                                            data,
+                                                            length,
+                                                            &error);
+        if (i + 1 < incoming_packets->len) {
+            g_assert_true(accepted);
+            g_assert_no_error(error);
+        }
+    }
     g_assert_cmpuint(fixture.notifications, ==, 1);
     if (fixture.change == PASTE_CACHE_UNCHANGED ||
         fixture.change == PASTE_FOCUS_CHANGED) {

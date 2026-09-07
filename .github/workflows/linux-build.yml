@@ -108,6 +108,7 @@ jobs:
       - name: Run full-stack headless gate
         env:
           CI: "true"
+          G_DEBUG: fatal-criticals
           MUX_SMOKE_ALLOW_ROOT_CI: "1"
           MUX_BIN_DIR: ${{ github.workspace }}/build/runtime-smoke
         run: ./runtime-smoke
