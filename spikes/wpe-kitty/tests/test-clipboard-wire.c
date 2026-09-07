@@ -1546,6 +1546,26 @@ kitty_sink_first_id(const KittyClipboardSink *sink,
     return NULL;
 }
 
+static gboolean
+kitty_sink_contains_packet_since(const KittyClipboardSink *sink,
+                                 guint start,
+                                 const gchar *expected)
+{
+    gsize expected_length = strlen(expected);
+    guint i;
+
+    for (i = start; i < sink->packets->len; i++) {
+        GBytes *packet = g_ptr_array_index(sink->packets, i);
+        gsize length;
+        const guint8 *data = g_bytes_get_data(packet, &length);
+
+        if (length == expected_length &&
+            memcmp(data, expected, length) == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static gchar *
 kitty_sink_first_write_id(const KittyClipboardSink *sink, guint start)
 {
@@ -1642,9 +1662,13 @@ kitty_finish_emission(MuxKittyClipboard *clipboard,
 {
     guint ticks = 0;
 
-    while (!kitty_sink_contains_since(sink, start, "type=wdata;")) {
+    while (!kitty_sink_contains_packet_since(
+               sink, start, "\033]5522;type=wdata\033\\")) {
+        guint previous_count = sink->packets->len;
+
         g_assert_cmpuint(ticks++, <, 32);
         kitty_assert_tick_budget(clipboard, sink);
+        g_assert_cmpuint(sink->packets->len, >, previous_count);
     }
 }
 
@@ -1714,7 +1738,7 @@ test_kitty_write_matches_official_framing(void)
     name64 = g_base64_encode((const guchar *)"Mux browser",
                              strlen("Mux browser"));
     expected = g_strdup_printf(
-        "\033]5522;type=write:id=%s:name=%s;\033\\", id, name64);
+        "\033]5522;type=write:id=%s:name=%s\033\\", id, name64);
     kitty_assert_packet_text(&sink, 0, expected);
 
     plain_mime64 = g_base64_encode((const guchar *)"text/plain",
@@ -1734,7 +1758,7 @@ test_kitty_write_matches_official_framing(void)
                                html_mime64,
                                html64);
     kitty_assert_packet_text(&sink, 2, expected);
-    kitty_assert_packet_text(&sink, 3, "\033]5522;type=wdata;\033\\");
+    kitty_assert_packet_text(&sink, 3, "\033]5522;type=wdata\033\\");
 
     kitty_ack_write(clipboard, id);
     g_assert_false(mux_kitty_clipboard_write_pending(clipboard));
@@ -2139,7 +2163,8 @@ test_kitty_write_is_incremental_and_bounded(void)
                      <=,
                      MUX_KITTY_CLIPBOARD_WRITE_BYTES_PER_TICK);
     g_assert_true(mux_kitty_clipboard_write_pending(clipboard));
-    g_assert_false(kitty_sink_contains_since(&sink, 0, "type=wdata;"));
+    g_assert_false(kitty_sink_contains_packet_since(
+        &sink, 0, "\033]5522;type=wdata\033\\"));
 
     kitty_finish_emission(clipboard, &sink, 0);
     id = kitty_sink_first_write_id(&sink, 0);
@@ -2200,9 +2225,8 @@ test_kitty_write_queue_is_bounded_latest_wins(void)
 
     winning_start = sink.packets->len;
     kitty_assert_tick_budget(clipboard, &sink);
-    g_assert_true(kitty_sink_contains_since(&sink,
-                                            winning_start,
-                                            "type=wdata;"));
+    g_assert_true(kitty_sink_contains_packet_since(
+        &sink, winning_start, "\033]5522;type=wdata\033\\"));
 
     plain64 = g_base64_encode((const guchar *)winning_plain,
                               strlen(winning_plain));
@@ -2220,6 +2244,382 @@ test_kitty_write_queue_is_bounded_latest_wins(void)
     mux_clipboard_snapshot_unref(winning);
     mux_clipboard_snapshot_unref(superseded);
     mux_clipboard_snapshot_unref(active);
+    kitty_sink_clear(&sink);
+}
+
+static void
+kitty_assert_mime_stream(const KittyClipboardSink *sink,
+                         const gchar *mime,
+                         GBytes *expected_bytes)
+{
+    g_autofree gchar *mime64 = g_base64_encode((const guchar *)mime,
+                                               strlen(mime));
+    g_autofree gchar *prefix = g_strdup_printf(
+        "\033]5522;type=wdata:mime=%s;", mime64);
+    g_autoptr(GString) encoded = g_string_new(NULL);
+    g_autofree gchar *expected64 = NULL;
+    g_autofree guchar *decoded = NULL;
+    gsize prefix_length = strlen(prefix);
+    gsize expected_length;
+    gsize decoded_length;
+    gconstpointer expected = g_bytes_get_data(expected_bytes, &expected_length);
+    gboolean closed = FALSE;
+    guint chunks = 0;
+    guint i;
+
+    for (i = 0; i < sink->packets->len; i++) {
+        GBytes *packet = g_ptr_array_index(sink->packets, i);
+        gsize length;
+        const gchar *data = g_bytes_get_data(packet, &length);
+
+        if (length >= prefix_length + 2U &&
+            memcmp(data, prefix, prefix_length) == 0) {
+            g_autofree gchar *chunk = NULL;
+            g_autofree guchar *chunk_data = NULL;
+            gsize chunk_length;
+
+            g_assert_false(closed);
+            g_assert_cmpmem(data + length - 2U, 2, "\033\\", 2);
+            chunk = g_strndup(data + prefix_length,
+                              length - prefix_length - 2U);
+            chunk_data = g_base64_decode(chunk, &chunk_length);
+            g_assert_cmpuint(chunk_length, <=, MUX_OSC5522_MAX_CHUNK);
+            g_string_append(encoded, chunk);
+            chunks++;
+        } else if (chunks != 0) {
+            closed = TRUE;
+        }
+    }
+
+    /* The terminal decodes the concatenation, not independent padded chunks. */
+    g_assert_cmpuint(chunks, >, 0);
+    expected64 = g_base64_encode(expected, expected_length);
+    g_assert_cmpuint(encoded->len, ==, strlen(expected64));
+    if (encoded->len > 0)
+        g_assert_cmpmem(encoded->str, encoded->len,
+                        expected64, strlen(expected64));
+    decoded = g_base64_decode(encoded->str, &decoded_length);
+    g_assert_cmpuint(decoded_length, ==, expected_length);
+    if (decoded_length > 0)
+        g_assert_cmpmem(decoded, decoded_length, expected, expected_length);
+}
+
+static void
+test_kitty_write_streaming_base64_integrity(void)
+{
+    static const gsize lengths[] = {
+        0, 1, 2, 3, 4095, 4096, 4097, 8190, 8191, 8192, 8193,
+        MUX_OSC5522_MAX_CHUNK *
+            MUX_KITTY_CLIPBOARD_WRITE_PACKETS_PER_TICK * 3U + 1U,
+    };
+    guint test;
+
+    for (test = 0; test < G_N_ELEMENTS(lengths); test++) {
+        KittyClipboardSink sink = { 0 };
+        g_autoptr(MuxKittyClipboard) clipboard = NULL;
+        g_autoptr(MuxClipboardSnapshot) snapshot = NULL;
+        g_autoptr(GBytes) binary = NULL;
+        g_autoptr(GBytes) html = g_bytes_new_static("<b>tail</b>", 11);
+        g_autoptr(GError) error = NULL;
+        g_autofree gchar *id = NULL;
+        guint8 *data = g_malloc(lengths[test]);
+        MuxClipboardSnapshotItem items[2];
+        gsize i;
+
+        for (i = 0; i < lengths[test]; i++)
+            data[i] = (guint8)(i * 37U + 11U);
+        binary = g_bytes_new_take(data, lengths[test]);
+        items[0] = (MuxClipboardSnapshotItem) {
+            "application/octet-stream", binary,
+        };
+        items[1] = (MuxClipboardSnapshotItem) { "text/html", html };
+        snapshot = mux_clipboard_snapshot_new_sealed_from_items(
+            test + 1, items, G_N_ELEMENTS(items), &error);
+        g_assert_no_error(error);
+        kitty_sink_init(&sink);
+        clipboard = mux_kitty_clipboard_new(collect_kitty_packet, NULL,
+                                             collect_kitty_failure,
+                                             &sink, NULL);
+        g_assert_true(mux_kitty_clipboard_publish(
+            clipboard, MUX_OSC5522_LOCATION_CLIPBOARD, snapshot, &error));
+        g_assert_no_error(error);
+        kitty_finish_emission(clipboard, &sink, 0);
+        kitty_assert_mime_stream(&sink, "application/octet-stream", binary);
+        kitty_assert_mime_stream(&sink, "text/html", html);
+        id = kitty_sink_first_write_id(&sink, 0);
+        g_assert_nonnull(id);
+        kitty_ack_write(clipboard, id);
+        g_assert_false(mux_kitty_clipboard_write_pending(clipboard));
+        g_assert_cmpuint(sink.failures, ==, 0);
+        kitty_sink_clear(&sink);
+    }
+}
+
+static void
+kitty_accept_sequence(MuxKittyClipboard *clipboard, const gchar *sequence)
+{
+    g_autoptr(GError) error = NULL;
+
+    g_assert_true(mux_kitty_clipboard_handle_osc(
+        clipboard, (const guint8 *)sequence, strlen(sequence), &error));
+    g_assert_no_error(error);
+}
+
+static void
+test_osc5522_empty_data_semantics(void)
+{
+    static const gchar *const valid[] = {
+        "\033]5522;type=read:status=DATA:mime=Lg==\033\\",
+        "\033]5522;type=read:status=DATA:mime=Lg==;\033\\",
+        "\033]5522;type=read:status=DATA:mime=Lg==\a",
+    };
+    static const gchar *const invalid[] = {
+        "\033]5522;type=read:status=DATA\033\\",
+        "\033]5522;type=read:status=DATA:mime=Lg==;%%%\033\\",
+        "\033]5522;type=read:status=DATA:mime=Lg==;YR==\033\\",
+        "\033]5522;type=read:status=DATA:mime=Lg==;YQ=\033\\",
+        "\033]5522;type=read:status=DATA:mime=Lg==:id=one:id=two\033\\",
+    };
+    guint i;
+
+    for (i = 0; i < G_N_ELEMENTS(valid); i++) {
+        MuxOsc5522Event *event = NULL;
+        g_autoptr(GError) error = NULL;
+
+        g_assert_true(mux_osc5522_parse((const guint8 *)valid[i],
+                                         strlen(valid[i]), &event, &error));
+        g_assert_no_error(error);
+        g_assert_cmpint(event->type, ==, MUX_OSC5522_EVENT_READ_DATA);
+        g_assert_cmpstr(event->mime, ==, ".");
+        g_assert_nonnull(event->data);
+        g_assert_cmpuint(g_bytes_get_size(event->data), ==, 0);
+        mux_osc5522_event_free(event);
+    }
+    for (i = 0; i < G_N_ELEMENTS(invalid); i++) {
+        MuxOsc5522Event *event = NULL;
+        g_autoptr(GError) error = NULL;
+
+        g_assert_false(mux_osc5522_parse((const guint8 *)invalid[i],
+                                          strlen(invalid[i]), &event, &error));
+        g_assert_error(error, MUX_OSC5522_ERROR, MUX_OSC5522_CODEC_ERROR_INVALID);
+        g_assert_null(event);
+    }
+}
+
+static void
+test_kitty_empty_discovery_finishes_without_another_request(void)
+{
+    KittyClipboardSink sink = { 0 };
+    g_autoptr(MuxKittyClipboard) clipboard = NULL;
+    g_autoptr(GError) error = NULL;
+    g_autofree gchar *id = NULL;
+    g_autofree gchar *ok = NULL;
+    g_autofree gchar *data = NULL;
+    g_autofree gchar *done = NULL;
+
+    kitty_sink_init(&sink);
+    clipboard = mux_kitty_clipboard_new(collect_kitty_packet,
+                                         collect_kitty_snapshot,
+                                         collect_kitty_failure, &sink, NULL);
+    g_assert_true(mux_kitty_clipboard_request_all(
+        clipboard, MUX_OSC5522_LOCATION_CLIPBOARD, NULL, "empty read",
+        FALSE, &error));
+    g_assert_no_error(error);
+    id = kitty_sink_first_id(&sink, 0, "type=read");
+    g_assert_nonnull(id);
+    ok = g_strdup_printf("\033]5522;type=read:status=OK:id=%s\033\\", id);
+    data = g_strdup_printf(
+        "\033]5522;type=read:status=DATA:id=%s:mime=Lg==\033\\", id);
+    done = g_strdup_printf("\033]5522;type=read:status=DONE:id=%s\033\\", id);
+    kitty_accept_sequence(clipboard, ok);
+    kitty_accept_sequence(clipboard, data);
+    kitty_accept_sequence(clipboard, done);
+    g_assert_cmpuint(sink.receives, ==, 1);
+    g_assert_cmpuint(mux_clipboard_snapshot_get_count(sink.received), ==, 0);
+    g_assert_cmpuint(sink.packets->len, ==, 1);
+    g_assert_false(mux_kitty_clipboard_read_pending(clipboard));
+    g_assert_cmpuint(sink.failures, ==, 0);
+    kitty_sink_clear(&sink);
+}
+
+static void
+test_kitty_official_paste_offer(gconstpointer user_data)
+{
+    const MuxOsc5522Location location = GPOINTER_TO_INT(user_data);
+    const gchar *loc = location == MUX_OSC5522_LOCATION_PRIMARY
+                           ? ":loc=primary" : "";
+    static const gchar *const list_parts[] = {
+        "text/plain text/", "html text/plain",
+    };
+    static const gchar *const contents[] = { "pasted text", "<p>pasted</p>" };
+    static const gchar *const mimes[] = { "text/plain", "text/html" };
+    KittyClipboardSink sink = { 0 };
+    g_autoptr(MuxKittyClipboard) clipboard = NULL;
+    g_autofree gchar *pw64 = g_base64_encode((const guchar *)"one-time", 8);
+    g_autofree gchar *name64 = g_base64_encode((const guchar *)"Paste event", 11);
+    g_autofree gchar *types64 = g_base64_encode(
+        (const guchar *)"text/plain text/html", 20);
+    g_autofree gchar *ok = NULL;
+    g_autofree gchar *id = NULL;
+    g_autofree gchar *expected = NULL;
+    g_autofree gchar *read_ok = NULL;
+    g_autofree gchar *read_done = NULL;
+    guint i;
+
+    kitty_sink_init(&sink);
+    clipboard = mux_kitty_clipboard_new(collect_kitty_packet,
+                                         collect_kitty_snapshot,
+                                         collect_kitty_failure, &sink, NULL);
+    ok = g_strdup_printf("\033]5522;type=read:status=OK%s:pw=%s\033\\",
+                          loc, pw64);
+    kitty_accept_sequence(clipboard, ok);
+    for (i = 0; i < G_N_ELEMENTS(list_parts); i++) {
+        g_autofree gchar *list64 = g_base64_encode(
+            (const guchar *)list_parts[i], strlen(list_parts[i]));
+        g_autofree gchar *part = g_strdup_printf(
+            "\033]5522;type=read:status=DATA:mime=Lg==:pw=%s;%s\033\\",
+            pw64, list64);
+
+        kitty_accept_sequence(clipboard, part);
+    }
+    g_assert_cmpuint(sink.packets->len, ==, 0);
+    kitty_accept_sequence(clipboard, "\033]5522;type=read:status=DONE\033\\");
+    g_assert_cmpuint(sink.packets->len, ==, 1);
+    id = kitty_sink_first_id(&sink, 0, "type=read");
+    g_assert_nonnull(id);
+    expected = g_strdup_printf(
+        "\033]5522;type=read%s:id=%s:pw=%s:name=%s;%s\033\\",
+        loc, id, pw64, name64, types64);
+    kitty_assert_packet_text(&sink, 0, expected);
+
+    read_ok = g_strdup_printf("\033]5522;type=read:status=OK%s:id=%s\033\\",
+                               loc, id);
+    kitty_accept_sequence(clipboard, read_ok);
+    for (i = 0; i < G_N_ELEMENTS(mimes); i++) {
+        g_autofree gchar *mime64 = g_base64_encode(
+            (const guchar *)mimes[i], strlen(mimes[i]));
+        g_autofree gchar *content64 = g_base64_encode(
+            (const guchar *)contents[i], strlen(contents[i]));
+        g_autofree gchar *part = g_strdup_printf(
+            "\033]5522;type=read:status=DATA:id=%s:mime=%s;%s\033\\",
+            id, mime64, content64);
+
+        kitty_accept_sequence(clipboard, part);
+    }
+    read_done = g_strdup_printf("\033]5522;type=read:status=DONE:id=%s\033\\",
+                                 id);
+    kitty_accept_sequence(clipboard, read_done);
+    g_assert_cmpuint(sink.receives, ==, 1);
+    g_assert_true(sink.received_is_paste);
+    g_assert_cmpint(sink.received_location, ==, location);
+    g_assert_cmpuint(mux_clipboard_snapshot_get_count(sink.received), ==, 2);
+    for (i = 0; i < G_N_ELEMENTS(mimes); i++) {
+        GBytes *bytes = mux_clipboard_snapshot_find(sink.received, mimes[i]);
+        gsize length;
+        gconstpointer data;
+
+        g_assert_nonnull(bytes);
+        data = g_bytes_get_data(bytes, &length);
+        g_assert_cmpmem(data, length, contents[i], strlen(contents[i]));
+    }
+    g_assert_false(mux_kitty_clipboard_read_pending(clipboard));
+    g_assert_cmpuint(sink.failures, ==, 0);
+    kitty_sink_clear(&sink);
+}
+
+static void
+test_kitty_empty_paste_offer(void)
+{
+    KittyClipboardSink sink = { 0 };
+    g_autoptr(MuxKittyClipboard) clipboard = NULL;
+
+    kitty_sink_init(&sink);
+    clipboard = mux_kitty_clipboard_new(collect_kitty_packet,
+                                         collect_kitty_snapshot,
+                                         collect_kitty_failure, &sink, NULL);
+    kitty_accept_sequence(clipboard, "\033]5522;type=read:status=OK\033\\");
+    kitty_accept_sequence(clipboard,
+        "\033]5522;type=read:status=DATA:mime=Lg==\033\\");
+    kitty_accept_sequence(clipboard, "\033]5522;type=read:status=DONE\033\\");
+    g_assert_cmpuint(sink.receives, ==, 1);
+    g_assert_true(sink.received_is_paste);
+    g_assert_cmpuint(mux_clipboard_snapshot_get_count(sink.received), ==, 0);
+    g_assert_cmpuint(sink.packets->len, ==, 0);
+    g_assert_false(mux_kitty_clipboard_read_pending(clipboard));
+    g_assert_cmpuint(sink.failures, ==, 0);
+    kitty_sink_clear(&sink);
+}
+
+static void
+test_kitty_paste_offer_rejects_invalid_mime_list(void)
+{
+    static const gchar embedded_nul[] = "text/plain\0text/html";
+    static const struct {
+        const gchar *data;
+        gsize length;
+    } invalid[] = {
+        { "text/plain .", 12 },
+        { embedded_nul, sizeof(embedded_nul) - 1U },
+    };
+    guint i;
+
+    for (i = 0; i < G_N_ELEMENTS(invalid); i++) {
+        KittyClipboardSink sink = { 0 };
+        g_autoptr(MuxKittyClipboard) clipboard = NULL;
+        g_autofree gchar *payload = g_base64_encode(
+            (const guchar *)invalid[i].data, invalid[i].length);
+        g_autofree gchar *data = g_strdup_printf(
+            "\033]5522;type=read:status=DATA:mime=Lg==;%s\033\\", payload);
+        g_autoptr(GError) error = NULL;
+        const gchar *done = "\033]5522;type=read:status=DONE\033\\";
+
+        kitty_sink_init(&sink);
+        clipboard = mux_kitty_clipboard_new(collect_kitty_packet,
+                                             collect_kitty_snapshot,
+                                             collect_kitty_failure, &sink, NULL);
+        kitty_accept_sequence(clipboard, "\033]5522;type=read:status=OK\033\\");
+        kitty_accept_sequence(clipboard, data);
+        g_assert_false(mux_kitty_clipboard_handle_osc(
+            clipboard, (const guint8 *)done, strlen(done), &error));
+        g_assert_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
+        g_assert_cmpuint(sink.receives, ==, 0);
+        g_assert_cmpuint(sink.packets->len, ==, 0);
+        g_assert_false(mux_kitty_clipboard_read_pending(clipboard));
+        kitty_sink_clear(&sink);
+    }
+}
+
+static void
+test_kitty_read_rejects_explicit_location_change(void)
+{
+    static const gchar *const mimes[] = { "text/plain", NULL };
+    KittyClipboardSink sink = { 0 };
+    g_autoptr(MuxKittyClipboard) clipboard = NULL;
+    g_autoptr(GError) error = NULL;
+    g_autofree gchar *id = NULL;
+    g_autofree gchar *ok = NULL;
+    g_autofree gchar *data = NULL;
+
+    kitty_sink_init(&sink);
+    clipboard = mux_kitty_clipboard_new(collect_kitty_packet,
+                                         collect_kitty_snapshot,
+                                         collect_kitty_failure, &sink, NULL);
+    g_assert_true(mux_kitty_clipboard_request(
+        clipboard, MUX_OSC5522_LOCATION_CLIPBOARD, mimes,
+        NULL, "location test", FALSE, &error));
+    g_assert_no_error(error);
+    id = kitty_sink_first_id(&sink, 0, "type=read");
+    g_assert_nonnull(id);
+    ok = g_strdup_printf("\033]5522;type=read:status=OK:id=%s\033\\", id);
+    kitty_accept_sequence(clipboard, ok);
+    data = g_strdup_printf(
+        "\033]5522;type=read:status=DATA:loc=primary:id=%s:"
+        "mime=dGV4dC9wbGFpbg==;YQ==\033\\", id);
+    g_assert_false(mux_kitty_clipboard_handle_osc(
+        clipboard, (const guint8 *)data, strlen(data), &error));
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
+    g_assert_false(mux_kitty_clipboard_read_pending(clipboard));
+    g_assert_cmpuint(sink.receives, ==, 0);
     kitty_sink_clear(&sink);
 }
 
@@ -2831,6 +3231,8 @@ main(int argc, char **argv)
                     test_kitty_write_is_incremental_and_bounded);
     g_test_add_func("/clipboard/kitty-write/official-framing",
                     test_kitty_write_matches_official_framing);
+    g_test_add_func("/clipboard/kitty-write/streaming-base64-integrity",
+                    test_kitty_write_streaming_base64_integrity);
     g_test_add_func("/clipboard/kitty-write/latest-wins",
                     test_kitty_write_queue_is_bounded_latest_wins);
     g_test_add_func("/clipboard/kitty-write/retry-would-block",
@@ -2839,6 +3241,22 @@ main(int argc, char **argv)
                     test_kitty_read_cancellation_ignores_late_response);
     g_test_add_func("/clipboard/kitty-read/discover-all",
                     test_kitty_read_all_discovers_and_fetches_mimes);
+    g_test_add_func("/clipboard/osc5522/empty-data-semantics",
+                    test_osc5522_empty_data_semantics);
+    g_test_add_func("/clipboard/kitty-read/empty-discovery",
+                    test_kitty_empty_discovery_finishes_without_another_request);
+    g_test_add_data_func("/clipboard/kitty-paste/official-clipboard-offer",
+                         GINT_TO_POINTER(MUX_OSC5522_LOCATION_CLIPBOARD),
+                         test_kitty_official_paste_offer);
+    g_test_add_data_func("/clipboard/kitty-paste/official-primary-offer",
+                         GINT_TO_POINTER(MUX_OSC5522_LOCATION_PRIMARY),
+                         test_kitty_official_paste_offer);
+    g_test_add_func("/clipboard/kitty-paste/empty-offer",
+                    test_kitty_empty_paste_offer);
+    g_test_add_func("/clipboard/kitty-paste/invalid-mime-list",
+                    test_kitty_paste_offer_rejects_invalid_mime_list);
+    g_test_add_func("/clipboard/kitty-read/explicit-location-change",
+                    test_kitty_read_rejects_explicit_location_change);
     g_test_add_func("/clipboard/kitty-write/rejection-promotes-latest",
                     test_kitty_write_rejection_promotes_latest);
     g_test_add_func("/clipboard/kitty-write/timeout-promotes-latest",

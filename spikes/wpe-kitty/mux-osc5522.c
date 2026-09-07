@@ -604,6 +604,7 @@ mux_osc5522_parse(const guint8 *sequence,
 
     event = g_new0(MuxOsc5522Event, 1);
     event->location = MUX_OSC5522_LOCATION_CLIPBOARD;
+    event->has_location = location != NULL;
     if (location != NULL) {
         if (g_str_equal(location, "primary"))
             event->location = MUX_OSC5522_LOCATION_PRIMARY;
@@ -656,11 +657,10 @@ mux_osc5522_parse(const guint8 *sequence,
             set_invalid(error, "OSC 5522 data response lacks a MIME type");
             goto out;
         }
-        if (!payload_present) {
-            set_invalid(error, "OSC 5522 data response lacks a payload");
-            goto out;
-        }
-        event->data = decode_bytes(payload, MUX_OSC5522_MAX_CHUNK, error);
+        /* Kitty omits the separator when a DATA response is empty too. */
+        event->data = decode_bytes(payload != NULL ? payload : "",
+                                   MUX_OSC5522_MAX_CHUNK,
+                                   error);
         if (event->data == NULL)
             goto out;
         event->type = MUX_OSC5522_EVENT_READ_DATA;
