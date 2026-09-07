@@ -79,7 +79,9 @@ notification_engine_unref(MuxNotificationEngine *engine)
     g_free(engine);
 }
 
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxNotificationEngine,
+typedef MuxNotificationEngine MuxNotificationEngineGuard;
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxNotificationEngineGuard,
                               notification_engine_unref)
 
 static PendingNotification *
@@ -185,7 +187,7 @@ static void
 on_notification_closed(WebKitNotification *notification,
                        MuxNotificationEngine *engine)
 {
-    g_autoptr(MuxNotificationEngine) guard =
+    g_autoptr(MuxNotificationEngineGuard) guard =
         notification_engine_ref(engine);
     guint64 request_id;
     PendingNotification *pending;
@@ -206,7 +208,7 @@ on_show_notification(WebKitWebView *web_view,
                      WebKitNotification *notification,
                      MuxNotificationEngine *engine)
 {
-    g_autoptr(MuxNotificationEngine) guard =
+    g_autoptr(MuxNotificationEngineGuard) guard =
         notification_engine_ref(engine);
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_NOTIFICATION);
@@ -330,7 +332,7 @@ mux_notification_engine_handle_payload(MuxNotificationEngine *engine,
                                        gsize length,
                                        GError **error)
 {
-    g_autoptr(MuxNotificationEngine) guard = NULL;
+    g_autoptr(MuxNotificationEngineGuard) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(engine, FALSE);

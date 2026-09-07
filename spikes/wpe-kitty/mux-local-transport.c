@@ -194,6 +194,7 @@ open_seqpacket_socket(GError **error)
 static gboolean
 socket_path_is_stale(const gchar *path,
                      struct stat *identity,
+                     gboolean *path_exists,
                      GError **error)
 {
     struct stat status;
@@ -202,6 +203,7 @@ socket_path_is_stale(const gchar *path,
     gint result;
     gint saved_errno;
 
+    *path_exists = FALSE;
     if (lstat(path, &status) < 0) {
         if (errno == ENOENT)
             return TRUE;
@@ -219,6 +221,7 @@ socket_path_is_stale(const gchar *path,
         return FALSE;
     }
     *identity = status;
+    *path_exists = TRUE;
 
     probe = socket(AF_UNIX, SOCK_SEQPACKET, 0);
     if (probe < 0) {
@@ -323,12 +326,13 @@ mux_local_listener_new(const gchar *service, guint backlog, GError **error)
     g_autofree gchar *path = NULL;
     struct sockaddr_un address = { 0 };
     struct stat status;
-    struct stat stale_identity;
+    struct stat stale_identity = { 0 };
     struct stat bound_identity;
     MuxLocalListener *listener;
     gint fd;
     gint lock_fd;
     gboolean bound_identity_valid = FALSE;
+    gboolean stale_path_exists = FALSE;
 
     g_return_val_if_fail(error == NULL || *error == NULL, NULL);
 
@@ -353,9 +357,11 @@ mux_local_listener_new(const gchar *service, guint backlog, GError **error)
         gint saved_errno = errno;
 
         if (saved_errno != EADDRINUSE ||
-            !socket_path_is_stale(path, &stale_identity, error) ||
-            !socket_path_matches(path, &stale_identity) ||
-            g_unlink(path) < 0 ||
+            !socket_path_is_stale(path, &stale_identity,
+                                  &stale_path_exists, error) ||
+            (stale_path_exists &&
+             (!socket_path_matches(path, &stale_identity) ||
+              g_unlink(path) < 0)) ||
             bind(fd, (const struct sockaddr *) &address, sizeof(address)) < 0) {
             if (error == NULL || *error == NULL) {
                 saved_errno = errno;

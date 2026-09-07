@@ -133,7 +133,9 @@ affordance_bridge_unref(MuxBrowserAffordanceBridge *bridge)
     g_free(bridge);
 }
 
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxBrowserAffordanceBridge,
+typedef MuxBrowserAffordanceBridge MuxBrowserAffordanceBridgeGuard;
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxBrowserAffordanceBridgeGuard,
                               affordance_bridge_unref)
 
 static gpointer
@@ -204,7 +206,7 @@ publish_request(MuxBrowserAffordanceBridge *bridge,
                 const MuxUiRequest *request,
                 GError **error)
 {
-    g_autoptr(MuxBrowserAffordanceBridge) guard =
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
         affordance_bridge_ref(bridge);
     g_autoptr(GBytes) payload = mux_ui_request_encode(request, error);
     guint64 request_id = pending->request_id;
@@ -273,7 +275,7 @@ mux_browser_affordance_bridge_show_command_surface(
         return FALSE;
     }
 
-    g_autoptr(MuxBrowserAffordanceBridge) guard =
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
         affordance_bridge_ref(bridge);
     bridge = guard;
     if (bridge->destroying) {
@@ -360,7 +362,7 @@ mux_browser_affordance_bridge_show_status(
     gboolean danger,
     GError **error)
 {
-    g_autoptr(MuxBrowserAffordanceBridge) guard = NULL;
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard = NULL;
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_NOTIFICATION);
     PendingAffordance *pending;
@@ -419,7 +421,7 @@ static void
 on_authentication_cancelled(WebKitAuthenticationRequest *request,
                             MuxBrowserAffordanceBridge *bridge)
 {
-    g_autoptr(MuxBrowserAffordanceBridge) guard =
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
         affordance_bridge_ref(bridge);
     guint64 request_id;
     PendingAffordance *pending;
@@ -441,7 +443,7 @@ static void
 on_option_menu_closed(WebKitOptionMenu *menu,
                       MuxBrowserAffordanceBridge *bridge)
 {
-    g_autoptr(MuxBrowserAffordanceBridge) guard =
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
         affordance_bridge_ref(bridge);
     guint64 request_id;
     PendingAffordance *pending;
@@ -476,7 +478,7 @@ cancel_matching(MuxBrowserAffordanceBridge *bridge,
                 MuxUiCancelReason reason,
                 gboolean notify_pane)
 {
-    g_autoptr(MuxBrowserAffordanceBridge) guard =
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
         affordance_bridge_ref(bridge);
     GHashTableIter iterator;
     gpointer value;
@@ -536,7 +538,7 @@ on_authenticate(WebKitWebView *web_view,
                 WebKitAuthenticationRequest *authentication,
                 MuxBrowserAffordanceBridge *bridge)
 {
-    g_autoptr(MuxBrowserAffordanceBridge) guard =
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
         affordance_bridge_ref(bridge);
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_AUTHENTICATION);
@@ -629,7 +631,7 @@ on_show_option_menu(WebKitWebView *web_view,
                     WebKitRectangle *rectangle,
                     MuxBrowserAffordanceBridge *bridge)
 {
-  g_autoptr(MuxBrowserAffordanceBridge) guard =
+  g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
     browser_affordance_bridge_ref (bridge);
 
   bridge = guard;
@@ -836,7 +838,7 @@ on_context_menu(WebKitWebView *web_view,
                 WebKitHitTestResult *hit_test,
                 MuxBrowserAffordanceBridge *bridge)
 {
-  g_autoptr(MuxBrowserAffordanceBridge) guard =
+  g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
     browser_affordance_bridge_ref (bridge);
 
   bridge = guard;
@@ -918,7 +920,7 @@ on_web_process_terminated(WebKitWebView *web_view,
                           WebKitWebProcessTerminationReason reason,
                           MuxBrowserAffordanceBridge *bridge)
 {
-    g_autoptr(MuxBrowserAffordanceBridge) guard =
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
         affordance_bridge_ref(bridge);
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_CRASH);
@@ -954,7 +956,7 @@ on_load_changed(WebKitWebView *web_view,
                 WebKitLoadEvent load_event,
                 MuxBrowserAffordanceBridge *bridge)
 {
-    g_autoptr(MuxBrowserAffordanceBridge) guard =
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
         affordance_bridge_ref(bridge);
 
     bridge = guard;
@@ -1273,7 +1275,7 @@ mux_browser_affordance_bridge_handle_payload(
     gsize length,
     GError **error)
 {
-    g_autoptr(MuxBrowserAffordanceBridge) guard = NULL;
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(bridge, FALSE);

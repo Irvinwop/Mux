@@ -114,6 +114,24 @@ Run `./doctor` for a read-only dependency report. See
 [Installation](docs/install.md) for prefix, staging, uninstall, Arch Linux ARM,
 and Nix details.
 
+## Core development tests
+
+Clipboard history, broker messages, permission and session storage, URL
+handling, and terminal overlays can be built and tested with just a C17
+compiler, Meson, Ninja, and GLib/GIO 2.74 or newer. This works on macOS as well
+as Linux and does not need WPE or a graphical session:
+
+```sh
+meson setup build/core spikes/wpe-kitty -Druntime=false --werror
+meson compile -C build/core -j 2
+meson test -C build/core --print-errorlogs --no-rebuild
+```
+
+Core tests and the browser processes link the same production model and
+protocol library. Linux also runs the local socket transport tests in this
+mode. The default build still includes the Linux browser and its WPE tests;
+core-only results do not qualify rendering, live sites, or desktop input.
+
 ## Headless full-stack runtime gate
 
 After the source build has produced the six executables, run the gate as an

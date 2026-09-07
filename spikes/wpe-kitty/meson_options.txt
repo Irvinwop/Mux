@@ -1,0 +1,6 @@
+option(
+  'runtime',
+  type: 'boolean',
+  value: true,
+  description: 'Build the Linux browser processes and WPE integration tests; disable for core tests only',
+)

@@ -655,10 +655,10 @@ render_row(GString *output,
         text, columns > 2 ? columns - 2 : columns);
 
     g_string_append_printf(output,
-                           "\x1b[%u;1H\x1b[2K%s",
+                           "\x1b[%u;1H%s\x1b[2K",
                            row,
                            style ? style : "");
-    if (columns > 1)
+    if (columns > 2)
         g_string_append_c(output, ' ');
     g_string_append(output, fitted);
 }
@@ -782,18 +782,29 @@ mux_pane_overlay_render(const MuxPaneOverlay *overlay,
 gchar *
 mux_pane_overlay_render_clear(guint rows)
 {
-    GString *output;
     guint panel_rows;
-    guint start;
-    guint i;
 
     if (!rows)
         return g_strdup("");
     panel_rows = MIN(rows, MUX_PANE_OVERLAY_ROWS);
-    start = rows - panel_rows + 1;
+    return mux_pane_overlay_render_clear_region(rows - panel_rows + 1,
+                                                 rows);
+}
+
+gchar *
+mux_pane_overlay_render_clear_region(guint first_row, guint last_row)
+{
+    GString *output;
+    guint row;
+
+    if (!first_row || last_row < first_row)
+        return g_strdup("");
     output = g_string_new("\x1b[?2026h\x1b[s\x1b[0m");
-    for (i = 0; i < panel_rows; i++)
-        g_string_append_printf(output, "\x1b[%u;1H\x1b[2K", start + i);
+    for (row = first_row; ; row++) {
+        g_string_append_printf(output, "\x1b[%u;1H\x1b[2K", row);
+        if (row == last_row)
+            break;
+    }
     g_string_append(output, "\x1b[u\x1b[?25h\x1b[?2026l");
     return g_string_free(output, FALSE);
 }

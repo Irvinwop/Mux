@@ -79,7 +79,9 @@ ui_engine_bridge_unref(MuxUiEngineBridge *bridge)
     g_free(bridge);
 }
 
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxUiEngineBridge, ui_engine_bridge_unref)
+typedef MuxUiEngineBridge MuxUiEngineBridgeGuard;
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxUiEngineBridgeGuard, ui_engine_bridge_unref)
 
 static guint64 *
 request_key_new(guint64 request_id)
@@ -302,7 +304,7 @@ on_script_dialog(WebKitWebView *web_view,
                  WebKitScriptDialog *dialog,
                  MuxUiEngineBridge *bridge)
 {
-    g_autoptr(MuxUiEngineBridge) guard = ui_engine_bridge_ref(bridge);
+    g_autoptr(MuxUiEngineBridgeGuard) guard = ui_engine_bridge_ref(bridge);
     MuxUiRequestKind kind = request_kind_for_dialog(
         webkit_script_dialog_get_dialog_type(dialog));
     g_autoptr(MuxUiRequest) request = NULL;
@@ -485,7 +487,7 @@ on_permission_request(WebKitWebView *web_view,
                       WebKitPermissionRequest *permission,
                       MuxUiEngineBridge *bridge)
 {
-    g_autoptr(MuxUiEngineBridge) guard = ui_engine_bridge_ref(bridge);
+    g_autoptr(MuxUiEngineBridgeGuard) guard = ui_engine_bridge_ref(bridge);
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_PERMISSION);
     g_autoptr(GBytes) payload = NULL;
@@ -714,7 +716,7 @@ mux_ui_engine_bridge_handle_payload(MuxUiEngineBridge *bridge,
                                     gsize length,
                                     GError **error)
 {
-    g_autoptr(MuxUiEngineBridge) guard = NULL;
+    g_autoptr(MuxUiEngineBridgeGuard) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(bridge, FALSE);
@@ -820,7 +822,7 @@ mux_ui_engine_bridge_cancel(MuxUiEngineBridge *bridge,
                             MuxUiCancelReason reason,
                             gboolean notify_pane)
 {
-    g_autoptr(MuxUiEngineBridge) guard = NULL;
+    g_autoptr(MuxUiEngineBridgeGuard) guard = NULL;
     PendingDialog *pending;
 
     g_return_if_fail(bridge);
@@ -851,7 +853,7 @@ mux_ui_engine_bridge_cancel_all(MuxUiEngineBridge *bridge,
                                 MuxUiCancelReason reason,
                                 gboolean notify_pane)
 {
-    g_autoptr(MuxUiEngineBridge) guard = NULL;
+    g_autoptr(MuxUiEngineBridgeGuard) guard = NULL;
 
     g_return_if_fail(bridge);
     guard = ui_engine_bridge_ref(bridge);

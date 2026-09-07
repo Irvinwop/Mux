@@ -950,6 +950,8 @@ handle_snapshot(MuxClipboardBrokerClient *client,
     if (feed_result == MUX_CLIPBOARD_WIRE_FEED_REJECTED)
         return FALSE;
 
+    transaction_id =
+        mux_clipboard_wire_transfer_get_transaction_id(transfer);
     if (client->pending_kind != PENDING_SELECT ||
         transaction_id != client->pending_request_id ||
         client->pending_snapshot != NULL ||
@@ -980,8 +982,6 @@ handle_snapshot(MuxClipboardBrokerClient *client,
         (MuxClipboardSnapshot *)
             mux_clipboard_wire_transfer_get_snapshot(transfer));
     client->pending_deadline_us = request_deadline();
-    transaction_id =
-        mux_clipboard_wire_transfer_get_transaction_id(transfer);
     mux_clipboard_wire_transfer_free(transfer);
     return send_wire_ack(client, transaction_id, error);
 }

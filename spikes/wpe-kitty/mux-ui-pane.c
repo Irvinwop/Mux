@@ -11,9 +11,14 @@ struct _MuxUiPaneBridge {
     GDestroyNotify user_data_destroy;
     guint columns;
     guint rows;
-    gboolean painted;
+    guint painted_first_row;
+    guint painted_last_row;
+    guint64 paint_generation;
     gboolean disposing;
 };
+
+/* Public autoptrs dispose the owner; scoped callback guards only release refs. */
+typedef MuxUiPaneBridge MuxUiPaneBridgeRef;
 
 static MuxUiPaneBridge *
 ui_pane_bridge_ref(MuxUiPaneBridge *bridge)
@@ -33,7 +38,7 @@ ui_pane_bridge_unref(MuxUiPaneBridge *bridge)
     g_free(bridge);
 }
 
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxUiPaneBridge, ui_pane_bridge_unref)
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxUiPaneBridgeRef, ui_pane_bridge_unref)
 
 static gboolean
 write_ansi(MuxUiPaneBridge *bridge,
@@ -100,9 +105,11 @@ mux_ui_pane_bridge_free(MuxUiPaneBridge *bridge)
     if (!bridge || bridge->disposing)
         return;
     bridge->disposing = TRUE;
-    if (bridge->painted && bridge->rows) {
+    if (bridge->painted_first_row && bridge->rows) {
         g_autofree gchar *clear =
-            mux_pane_overlay_render_clear(bridge->rows);
+            mux_pane_overlay_render_clear_region(
+                bridge->painted_first_row,
+                MIN(bridge->painted_last_row, bridge->rows));
 
         write_ansi(bridge, clear, NULL);
     }
@@ -114,33 +121,49 @@ mux_ui_pane_bridge_repaint(MuxUiPaneBridge *bridge,
                            gint64 monotonic_us,
                            GError **error)
 {
-    g_autoptr(MuxUiPaneBridge) guard = NULL;
+    g_autoptr(MuxUiPaneBridgeRef) guard = NULL;
     g_autofree gchar *sequence = NULL;
+    gboolean active;
+    guint first_row;
+    guint64 generation;
 
     g_return_val_if_fail(bridge, FALSE);
     guard = ui_pane_bridge_ref(bridge);
     if (bridge->disposing)
         return FALSE;
+    generation = ++bridge->paint_generation;
     if (!bridge->columns || !bridge->rows)
         return TRUE;
 
-    if (mux_pane_overlay_is_active(bridge->overlay)) {
-        sequence = mux_pane_overlay_render(bridge->overlay,
-                                           bridge->columns,
-                                           bridge->rows,
-                                           monotonic_us);
+    active = mux_pane_overlay_is_active(bridge->overlay);
+    first_row = bridge->rows - MIN(bridge->rows, MUX_PANE_OVERLAY_ROWS) + 1;
+    if (bridge->painted_first_row &&
+        (!active || bridge->painted_first_row != first_row ||
+         bridge->painted_last_row != bridge->rows)) {
+        sequence = mux_pane_overlay_render_clear_region(
+            bridge->painted_first_row,
+            MIN(bridge->painted_last_row, bridge->rows));
         if (!write_ansi(bridge, sequence, error) || bridge->disposing)
             return FALSE;
-        bridge->painted = TRUE;
-        return TRUE;
+        /* A callback may have resized or repainted while writing the clear. */
+        if (bridge->paint_generation != generation)
+            return TRUE;
+        bridge->painted_first_row = 0;
+        bridge->painted_last_row = 0;
+        g_clear_pointer(&sequence, g_free);
     }
-
-    if (!bridge->painted)
+    if (!active)
         return TRUE;
-    sequence = mux_pane_overlay_render_clear(bridge->rows);
+
+    sequence = mux_pane_overlay_render(bridge->overlay,
+                                       bridge->columns,
+                                       bridge->rows,
+                                       monotonic_us);
+    /* Account for partial writes and disposal from inside the writer. */
+    bridge->painted_first_row = first_row;
+    bridge->painted_last_row = bridge->rows;
     if (!write_ansi(bridge, sequence, error) || bridge->disposing)
         return FALSE;
-    bridge->painted = FALSE;
     return TRUE;
 }
 
@@ -150,7 +173,7 @@ mux_ui_pane_bridge_handle_payload(MuxUiPaneBridge *bridge,
                                   gsize length,
                                   GError **error)
 {
-    g_autoptr(MuxUiPaneBridge) guard = NULL;
+    g_autoptr(MuxUiPaneBridgeRef) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(bridge, FALSE);
@@ -208,7 +231,7 @@ finish_response(MuxUiPaneBridge *bridge,
                 gint64 monotonic_us,
                 GError **error)
 {
-    g_autoptr(MuxUiPaneBridge) guard = ui_pane_bridge_ref(bridge);
+    g_autoptr(MuxUiPaneBridgeRef) guard = ui_pane_bridge_ref(bridge);
     g_autoptr(MuxUiResponse) owned_response = response;
     g_autoptr(GError) send_error = NULL;
     gboolean sent;

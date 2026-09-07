@@ -6,8 +6,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <glib/gstdio.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 typedef struct {
@@ -505,9 +509,133 @@ test_dispatch_flushes_and_queues_callback_reply(void)
     test_pair_clear(&pair);
 }
 
+static gint
+bind_test_socket(const gchar *path)
+{
+    struct sockaddr_un address = { 0 };
+    gint fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+
+    g_assert_cmpint(fd, >=, 0);
+    address.sun_family = AF_UNIX;
+    g_strlcpy(address.sun_path, path, sizeof(address.sun_path));
+    g_assert_cmpint(bind(fd, (const struct sockaddr *)&address,
+                         sizeof(address)), ==, 0);
+    return fd;
+}
+
+static void
+test_listener_lock_lifetime(void)
+{
+    g_autoptr(GError) error = NULL;
+    MuxLocalListener *listener = mux_local_listener_new("lifetime", 1, &error);
+    MuxLocalListener *retained;
+    MuxLocalListener *contender;
+
+    g_assert_no_error(error);
+    g_assert_nonnull(listener);
+    retained = mux_local_listener_ref(listener);
+    mux_local_listener_free(listener);
+    contender = mux_local_listener_new("lifetime", 1, &error);
+    g_assert_null(contender);
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_ADDRESS_IN_USE);
+    g_clear_error(&error);
+    mux_local_listener_unref(retained);
+    contender = mux_local_listener_new("lifetime", 1, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(contender);
+    mux_local_listener_free(contender);
+}
+
+static void
+test_listener_reclaims_stale_socket(void)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree gchar *path = mux_local_transport_socket_path("stale", &error);
+    MuxLocalListener *listener;
+    gint fd;
+
+    g_assert_no_error(error);
+    fd = bind_test_socket(path);
+    close(fd);
+    listener = mux_local_listener_new("stale", 1, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(listener);
+    mux_local_listener_free(listener);
+}
+
+static void
+test_listener_preserves_replacement(void)
+{
+    g_autoptr(GError) error = NULL;
+    MuxLocalListener *listener = mux_local_listener_new("replace", 1, &error);
+    g_autofree gchar *path = NULL;
+    struct stat replacement;
+    struct stat remaining;
+    gint fd;
+
+    g_assert_no_error(error);
+    g_assert_nonnull(listener);
+    path = g_strdup(mux_local_listener_get_path(listener));
+    g_assert_cmpint(g_unlink(path), ==, 0);
+    fd = bind_test_socket(path);
+    g_assert_cmpint(lstat(path, &replacement), ==, 0);
+    mux_local_listener_free(listener);
+    g_assert_cmpint(lstat(path, &remaining), ==, 0);
+    g_assert_cmpuint(remaining.st_dev, ==, replacement.st_dev);
+    g_assert_cmpuint(remaining.st_ino, ==, replacement.st_ino);
+    close(fd);
+    g_assert_cmpint(g_unlink(path), ==, 0);
+}
+
+static void
+test_listener_respects_starting_owner(void)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree gchar *path = mux_local_transport_socket_path("starting", &error);
+    g_autofree gchar *lock_path = g_strconcat(path, ".lock", NULL);
+    MuxLocalListener *contender;
+    struct stat before;
+    struct stat after;
+    gint lock_fd;
+    gint socket_fd;
+
+    g_assert_no_error(error);
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    g_assert_cmpint(lock_fd, >=, 0);
+    g_assert_cmpint(flock(lock_fd, LOCK_EX | LOCK_NB), ==, 0);
+    socket_fd = bind_test_socket(path);
+    g_assert_cmpint(lstat(path, &before), ==, 0);
+
+    /* The first process owns the lock and has bound but not listened yet. */
+    contender = mux_local_listener_new("starting", 1, &error);
+    g_assert_null(contender);
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_ADDRESS_IN_USE);
+    g_assert_cmpint(lstat(path, &after), ==, 0);
+    g_assert_cmpuint(before.st_ino, ==, after.st_ino);
+    close(socket_fd);
+    close(lock_fd);
+
+    g_clear_error(&error);
+    contender = mux_local_listener_new("starting", 1, &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(contender);
+    mux_local_listener_free(contender);
+}
+
 int
 main(int argc, char **argv)
 {
+    g_autoptr(GError) error = NULL;
+    g_autofree gchar *runtime = g_dir_make_tmp("mux-transport-XXXXXX", &error);
+    g_autofree gchar *directory = NULL;
+    g_autoptr(GDir) entries = NULL;
+    const gchar *name;
+    gint result;
+
+    g_assert_no_error(error);
+    g_assert_true(g_setenv("XDG_RUNTIME_DIR", runtime, TRUE));
+    directory = g_build_filename(runtime, "mux", NULL);
+    g_assert_cmpint(g_mkdir(directory, 0700), ==, 0);
     g_test_init(&argc, &argv, NULL);
 
     g_test_add_func("/local-transport/send-receive-datagrams",
@@ -522,6 +650,25 @@ main(int argc, char **argv)
                     test_callback_rejection_is_protocol_error);
     g_test_add_func("/local-transport/dispatch-semantics",
                     test_dispatch_flushes_and_queues_callback_reply);
+    g_test_add_func("/local-transport/listener-lock-lifetime",
+                    test_listener_lock_lifetime);
+    g_test_add_func("/local-transport/listener-stale-socket",
+                    test_listener_reclaims_stale_socket);
+    g_test_add_func("/local-transport/listener-preserves-replacement",
+                    test_listener_preserves_replacement);
+    g_test_add_func("/local-transport/listener-starting-owner",
+                    test_listener_respects_starting_owner);
 
-    return g_test_run();
+    result = g_test_run();
+    entries = g_dir_open(directory, 0, &error);
+    g_assert_no_error(error);
+    while ((name = g_dir_read_name(entries)) != NULL) {
+        g_autofree gchar *entry = g_build_filename(directory, name, NULL);
+
+        g_assert_cmpint(g_unlink(entry), ==, 0);
+    }
+    g_clear_pointer(&entries, g_dir_close);
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+    g_assert_cmpint(g_rmdir(runtime), ==, 0);
+    return result;
 }

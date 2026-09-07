@@ -194,7 +194,6 @@ static void
 client_disconnected(gpointer protocol_pointer, const GError *error)
 {
     ClientProtocol *protocol = protocol_pointer;
-    ClientBinding *binding = protocol->binding;
     g_autoptr(GError) fallback = NULL;
 
     if (error == NULL) {

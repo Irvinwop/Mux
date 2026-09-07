@@ -142,7 +142,9 @@ popup_manager_unref(MuxPopupManager *manager)
     g_free(manager);
 }
 
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxPopupManager, popup_manager_unref)
+typedef MuxPopupManager MuxPopupManagerGuard;
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxPopupManagerGuard, popup_manager_unref)
 
 static void
 remove_record(PopupRecord *record)
@@ -159,7 +161,7 @@ static void
 on_child_ready(WebKitWebView *child, PopupRecord *record)
 {
     MuxPopupManager *manager = record->manager;
-    g_autoptr(MuxPopupManager) guard = popup_manager_ref(manager);
+    g_autoptr(MuxPopupManagerGuard) guard = popup_manager_ref(manager);
     g_autofree gchar *token = g_strdup(record->token);
     g_autoptr(GError) error = NULL;
     gboolean offered;
@@ -194,7 +196,7 @@ on_child_ready(WebKitWebView *child, PopupRecord *record)
 static void
 on_child_close(WebKitWebView *child, PopupRecord *record)
 {
-    g_autoptr(MuxPopupManager) guard =
+    g_autoptr(MuxPopupManagerGuard) guard =
         popup_manager_ref(record->manager);
 
     (void)child;
@@ -208,7 +210,7 @@ on_create(WebKitWebView *parent,
           WebKitNavigationAction *navigation_action,
           MuxPopupManager *manager)
 {
-    g_autoptr(MuxPopupManager) guard = popup_manager_ref(manager);
+    g_autoptr(MuxPopupManagerGuard) guard = popup_manager_ref(manager);
     g_autoptr(GError) error = NULL;
     WebKitWebView *child;
     PopupRecord *record;
@@ -333,7 +335,7 @@ mux_popup_manager_claim(MuxPopupManager *manager,
                         const gchar *token,
                         GError **error)
 {
-    g_autoptr(MuxPopupManager) guard = NULL;
+    g_autoptr(MuxPopupManagerGuard) guard = NULL;
     PopupRecord *record;
     WebKitWebView *child;
 
@@ -377,7 +379,7 @@ guint
 mux_popup_manager_tick(MuxPopupManager *manager,
                        gint64 monotonic_us)
 {
-    g_autoptr(MuxPopupManager) guard = NULL;
+    g_autoptr(MuxPopupManagerGuard) guard = NULL;
     GHashTableIter iterator;
     gpointer value;
     g_autoptr(GPtrArray) expired =

@@ -100,7 +100,9 @@ navigation_policy_unref(MuxNavigationPolicy *policy)
     g_free(policy);
 }
 
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxNavigationPolicy, navigation_policy_unref)
+typedef MuxNavigationPolicy MuxNavigationPolicyGuard;
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxNavigationPolicyGuard, navigation_policy_unref)
 
 static void
 invalidate_pending_tls(MuxNavigationPolicy *policy)
@@ -132,7 +134,7 @@ load_changed(WebKitWebView *web_view,
              gpointer data)
 {
     MuxNavigationPolicy *policy = data;
-    g_autoptr(MuxNavigationPolicy) guard = navigation_policy_ref(policy);
+    g_autoptr(MuxNavigationPolicyGuard) guard = navigation_policy_ref(policy);
 
     policy = guard;
     if (policy->disposing)
@@ -241,7 +243,7 @@ load_failed_with_tls_errors(WebKitWebView *web_view,
                             gpointer data)
 {
     MuxNavigationPolicy *policy = data;
-    g_autoptr(MuxNavigationPolicy) guard = navigation_policy_ref(policy);
+    g_autoptr(MuxNavigationPolicyGuard) guard = navigation_policy_ref(policy);
     g_autoptr(GUri) parsed = NULL;
     g_autofree gchar *error_summary = NULL;
     g_autofree gchar *message = NULL;
@@ -325,7 +327,7 @@ decide_policy(WebKitWebView *web_view,
               gpointer data)
 {
     MuxNavigationPolicy *policy = data;
-    g_autoptr(MuxNavigationPolicy) guard = navigation_policy_ref(policy);
+    g_autoptr(MuxNavigationPolicyGuard) guard = navigation_policy_ref(policy);
     WebKitNavigationAction *navigation;
     WebKitURIRequest *request;
     const gchar *uri;
@@ -448,7 +450,7 @@ mux_navigation_policy_handle_payload(MuxNavigationPolicy *policy,
                                      gsize length,
                                      GError **error)
 {
-    g_autoptr(MuxNavigationPolicy) guard = NULL;
+    g_autoptr(MuxNavigationPolicyGuard) guard = NULL;
     MuxUiRecordType record_type;
     g_autoptr(MuxUiResponse) response = NULL;
     PendingDecision *pending;

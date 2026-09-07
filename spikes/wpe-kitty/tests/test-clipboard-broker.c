@@ -27,6 +27,14 @@ typedef struct {
   gboolean client_destroyed;
   gboolean defer_peer_output;
   GPtrArray *deferred_peer_packets;
+  guint select_callbacks;
+  guint64 selected_entry_id;
+  gboolean selected_paste;
+  MuxClipboardSnapshot *selected_snapshot;
+  guint64 last_request_id;
+  MuxClipboardControlType last_request_type;
+  guint wire_ack_count;
+  guint64 last_wire_ack_id;
   gchar *last_failure;
 } BrokerHarness;
 
@@ -178,6 +186,110 @@ deliver_deferred_peer_packet(BrokerHarness *harness,
                                                       error);
   g_bytes_unref(packet);
   return result;
+}
+
+static void
+client_selected(MuxClipboardBrokerClient *client,
+                guint64 entry_id,
+                const MuxClipboardSnapshot *snapshot,
+                gboolean paste,
+                gpointer user_data)
+{
+  BrokerHarness *harness = user_data;
+
+  (void)client;
+  harness->select_callbacks++;
+  harness->selected_entry_id = entry_id;
+  harness->selected_paste = paste;
+  g_clear_pointer(&harness->selected_snapshot, mux_clipboard_snapshot_unref);
+  harness->selected_snapshot = mux_clipboard_snapshot_dup_sealed(snapshot);
+}
+
+static gboolean
+capture_selection_output(MuxClipboardBrokerClient *client,
+                         GBytes *packet,
+                         gpointer user_data,
+                         GError **error)
+{
+  BrokerHarness *harness = user_data;
+  MuxExtensionRecord extension = { 0 };
+  const guint8 *data;
+  gsize size;
+  gboolean result;
+
+  (void)client;
+  data = g_bytes_get_data(packet, &size);
+  if (!mux_extension_record_decode(data, size, &extension, error))
+    return FALSE;
+  data = g_bytes_get_data(extension.payload, &size);
+  if (extension.channel == MUX_EXTENSION_CHANNEL_CLIPBOARD_BROKER) {
+    MuxClipboardControlRecord record = { 0 };
+
+    result = mux_clipboard_control_record_decode(data, size, &record, error);
+    if (result) {
+      harness->last_request_id = record.request_id;
+      harness->last_request_type = record.type;
+    }
+    mux_clipboard_control_record_clear(&record);
+  } else {
+    MuxClipboardWireRecord record = { 0 };
+
+    g_assert_cmpuint(extension.channel, ==, MUX_EXTENSION_CHANNEL_CLIPBOARD);
+    result = mux_clipboard_wire_record_decode(data, size, &record, error);
+    if (result) {
+      g_assert_cmpint(record.type, ==, MUX_CLIPBOARD_WIRE_ACK);
+      harness->wire_ack_count++;
+      harness->last_wire_ack_id = record.transaction_id;
+    }
+    mux_clipboard_wire_record_clear(&record);
+  }
+  mux_extension_record_clear(&extension);
+  return result;
+}
+
+static gboolean
+queue_selection_wire(GBytes *payload, gpointer user_data, GError **error)
+{
+  MuxExtensionRecord extension = {
+    .channel = MUX_EXTENSION_CHANNEL_CLIPBOARD,
+    .payload = payload,
+  };
+  g_autoptr(GBytes) packet = mux_extension_record_encode(&extension, error);
+
+  if (packet == NULL)
+    return FALSE;
+  return peer_output(NULL, packet, user_data, error);
+}
+
+static gboolean
+deliver_control_ok(BrokerHarness *harness,
+                   guint64 request_id,
+                   guint64 entry_id,
+                   GError **error)
+{
+  MuxClipboardControlRecord record = {
+    .type = MUX_CLIPBOARD_CONTROL_OK,
+    .request_id = request_id,
+    .entry_id = entry_id,
+  };
+  MuxExtensionRecord extension = {
+    .channel = MUX_EXTENSION_CHANNEL_CLIPBOARD_BROKER,
+  };
+  g_autoptr(GBytes) payload = mux_clipboard_control_record_encode(&record,
+                                                                error);
+  g_autoptr(GBytes) packet = NULL;
+  const guint8 *data;
+  gsize size;
+
+  if (payload == NULL)
+    return FALSE;
+  extension.payload = payload;
+  packet = mux_extension_record_encode(&extension, error);
+  if (packet == NULL)
+    return FALSE;
+  data = g_bytes_get_data(packet, &size);
+  return mux_clipboard_broker_client_handle_packet(harness->client,
+                                                   data, size, error);
 }
 
 static void
@@ -655,6 +767,115 @@ test_observation_order_and_errors(void)
   g_free(harness.last_failure);
 }
 
+static void
+test_expired_selection_cannot_replace_current(gconstpointer user_data)
+{
+  const gboolean begin_expired_transfer = GPOINTER_TO_INT(user_data);
+  BrokerHarness harness = { 0 };
+  g_autoptr(MuxClipboardSnapshot) obsolete = broker_snapshot_new();
+  g_autoptr(GBytes) replacement_text = g_bytes_new_static("replacement", 11);
+  MuxClipboardSnapshotItem item = { "text/plain", replacement_text };
+  g_autoptr(MuxClipboardSnapshot) replacement = NULL;
+  g_autoptr(GError) error = NULL;
+  guint64 expired_request;
+  guint64 current_request;
+  guint stale_packets;
+
+  replacement = mux_clipboard_snapshot_new_sealed_from_items(99, &item, 1,
+                                                             &error);
+  g_assert_no_error(error);
+  harness.client = mux_clipboard_broker_client_new(
+      "default", MUX_CLIPBOARD_HISTORY_MEMORY, capture_selection_output,
+      client_ready, NULL, client_selected, NULL, client_failed, &harness, NULL);
+  g_assert_true(mux_clipboard_broker_client_start(harness.client, &error));
+  g_assert_no_error(error);
+  g_assert_cmpint(harness.last_request_type, ==, MUX_CLIPBOARD_CONTROL_HELLO);
+  g_assert_true(deliver_control_ok(&harness, harness.last_request_id, 0, &error));
+  g_assert_no_error(error);
+  g_assert_true(harness.ready);
+
+  harness.defer_peer_output = TRUE;
+  g_assert_true(mux_clipboard_broker_client_select(harness.client, 41, TRUE,
+                                                   &error));
+  g_assert_no_error(error);
+  g_assert_cmpint(harness.last_request_type, ==, MUX_CLIPBOARD_CONTROL_SELECT);
+  expired_request = harness.last_request_id;
+  g_assert_true(mux_clipboard_wire_send_snapshot(
+      expired_request,
+      MUX_CLIPBOARD_WIRE_FLAG_CURRENT | MUX_CLIPBOARD_WIRE_FLAG_PASTE,
+      "default", "https://obsolete.test", 1, 1, obsolete,
+      queue_selection_wire, &harness, &error));
+  g_assert_no_error(error);
+  if (begin_expired_transfer) {
+    g_assert_true(deliver_deferred_peer_packet(&harness, 0, &error));
+    g_assert_no_error(error);
+  }
+  g_assert_cmpuint(mux_clipboard_broker_client_tick(harness.client, G_MAXINT64),
+                   ==, 1);
+  g_assert_cmpuint(harness.failure_count, ==, 1);
+  g_assert_cmpuint(harness.select_callbacks, ==, 0);
+  g_assert_false(mux_clipboard_broker_client_request_pending(harness.client));
+
+  g_assert_true(mux_clipboard_broker_client_select(harness.client, 99, TRUE,
+                                                   &error));
+  g_assert_no_error(error);
+  current_request = harness.last_request_id;
+  g_assert_cmpuint(current_request, !=, expired_request);
+  stale_packets = harness.deferred_peer_packets->len;
+  g_assert_true(mux_clipboard_wire_send_snapshot(
+      current_request,
+      MUX_CLIPBOARD_WIRE_FLAG_CURRENT | MUX_CLIPBOARD_WIRE_FLAG_PASTE,
+      "default", "https://replacement.test", 2, 2, replacement,
+      queue_selection_wire, &harness, &error));
+  g_assert_no_error(error);
+
+  /* Start the new transfer, then deliver all obsolete fragments into it. */
+  g_assert_true(deliver_deferred_peer_packet(&harness, stale_packets, &error));
+  g_assert_no_error(error);
+  while (stale_packets-- > 0) {
+    g_assert_true(deliver_deferred_peer_packet(&harness, 0, &error));
+    g_assert_no_error(error);
+  }
+  g_assert_true(deliver_control_ok(&harness, expired_request, 41, &error));
+  g_assert_no_error(error);
+  g_assert_true(mux_clipboard_broker_client_request_pending(harness.client));
+  g_assert_cmpuint(harness.select_callbacks, ==, 0);
+  g_assert_cmpuint(harness.wire_ack_count, ==, 0);
+
+  while (harness.deferred_peer_packets->len > 0) {
+    g_assert_true(deliver_deferred_peer_packet(&harness, 0, &error));
+    g_assert_no_error(error);
+  }
+  g_assert_cmpuint(harness.wire_ack_count, ==, 1);
+  g_assert_cmpuint(harness.last_wire_ack_id, ==, current_request);
+  g_assert_cmpuint(harness.select_callbacks, ==, 0);
+  g_assert_true(deliver_control_ok(&harness, expired_request, 41, &error));
+  g_assert_no_error(error);
+  g_assert_true(mux_clipboard_broker_client_request_pending(harness.client));
+  g_assert_true(deliver_control_ok(&harness, current_request, 99, &error));
+  g_assert_no_error(error);
+  g_assert_cmpuint(harness.select_callbacks, ==, 1);
+  g_assert_cmpuint(harness.selected_entry_id, ==, 99);
+  g_assert_true(harness.selected_paste);
+  g_assert_true(g_bytes_equal(
+      mux_clipboard_snapshot_find(harness.selected_snapshot, "text/plain"),
+      replacement_text));
+  g_assert_cmpuint(mux_clipboard_snapshot_get_count(harness.selected_snapshot),
+                   ==, 1);
+  g_assert_false(mux_clipboard_broker_client_request_pending(harness.client));
+  g_assert_cmpuint(harness.failure_count, ==, 1);
+
+  /* Repeated completion packets must not paste the selection twice. */
+  g_assert_true(deliver_control_ok(&harness, current_request, 99, &error));
+  g_assert_no_error(error);
+  g_assert_cmpuint(harness.select_callbacks, ==, 1);
+
+  mux_clipboard_snapshot_unref(harness.selected_snapshot);
+  g_ptr_array_unref(harness.deferred_peer_packets);
+  mux_clipboard_broker_client_unref(harness.client);
+  g_free(harness.last_failure);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -671,5 +892,11 @@ main(int argc, char **argv)
                   test_destructive_selection_ack_output_callback);
   g_test_add_func("/clipboard/broker/observation-order-and-errors",
                   test_observation_order_and_errors);
+  g_test_add_data_func("/clipboard/broker/selection-expired-before-begin",
+                       GINT_TO_POINTER(FALSE),
+                       test_expired_selection_cannot_replace_current);
+  g_test_add_data_func("/clipboard/broker/selection-expired-mid-transfer",
+                       GINT_TO_POINTER(TRUE),
+                       test_expired_selection_cannot_replace_current);
   return g_test_run();
 }
