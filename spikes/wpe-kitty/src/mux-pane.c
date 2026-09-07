@@ -1338,14 +1338,17 @@ connect_control(Pane *pane, const gchar *initial_uri)
     encoded_socket = mux_encode(kitty_socket ? kitty_socket : "");
     encoded_layer = mux_encode(pane->layer);
     encoded_uri = mux_encode(initial_uri);
+    g_autofree gchar *encoded_public_key =
+        mux_encode(g_getenv("KITTY_PUBLIC_KEY"));
     control_write(pane,
-                  "VIEW\t%s\t%ld\t%s\t%s\t%s\t%s",
+                  "VIEW\t%s\t%ld\t%s\t%s\t%s\t%s\t%s",
                   encoded_id,
                   (long)getpid(),
                   encoded_window,
                   encoded_socket,
                   encoded_layer,
-                  encoded_uri);
+                  encoded_uri,
+                  encoded_public_key);
     g_free(encoded_id);
     g_free(encoded_window);
     g_free(encoded_socket);

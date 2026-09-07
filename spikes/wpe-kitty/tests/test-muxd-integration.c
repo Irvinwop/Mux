@@ -515,10 +515,11 @@ static gboolean persistent_view_id_is_valid(const gchar *id)
     return errno == 0 && end != number && *end == '\0';
 }
 
-static gboolean register_view_with_identity(int fd,
+static gboolean register_view_with_context(int fd,
                                             const gchar *proposed_id,
                                             const gchar *window_id,
                                             const gchar *kitty_socket,
+                                            const gchar *kitty_public_key,
                                             const gchar *layer,
                                             gchar **assigned_id,
                                             GError **error)
@@ -527,6 +528,9 @@ static gboolean register_view_with_identity(int fd,
         mux_encode(proposed_id != NULL ? proposed_id : "");
     g_autofree gchar *encoded_window = mux_encode(window_id);
     g_autofree gchar *encoded_socket = mux_encode(kitty_socket);
+    g_autofree gchar *encoded_key = mux_encode(kitty_public_key);
+    g_autofree gchar *key_field = kitty_public_key != NULL
+        ? g_strdup_printf("\t%s", encoded_key) : g_strdup("");
     g_autofree gchar *encoded_layer = mux_encode(layer);
     g_autofree gchar *encoded_uri =
         mux_encode("https://example.invalid/muxd-integration");
@@ -536,13 +540,14 @@ static gboolean register_view_with_identity(int fd,
 
     *assigned_id = NULL;
     if (!mux_send_line(fd,
-                       "VIEW\t%s\t%ld\t%s\t%s\t%s\t%s",
+                       "VIEW\t%s\t%ld\t%s\t%s\t%s\t%s%s",
                        encoded_id,
                        (long)getpid(),
                        encoded_window,
                        encoded_socket,
                        encoded_layer,
-                       encoded_uri)) {
+                       encoded_uri,
+                       key_field)) {
         set_errno_error(error, "send VIEW registration", errno);
         return FALSE;
     }
@@ -569,6 +574,19 @@ static gboolean register_view_with_identity(int fd,
     if (field_count >= 3 && fields[2][0] != '\0')
         *assigned_id = mux_decode(fields[2]);
     return TRUE;
+}
+
+static gboolean register_view_with_identity(int fd,
+                                            const gchar *proposed_id,
+                                            const gchar *window_id,
+                                            const gchar *kitty_socket,
+                                            const gchar *layer,
+                                            gchar **assigned_id,
+                                            GError **error)
+{
+    return register_view_with_context(fd, proposed_id, window_id,
+                                      kitty_socket, NULL, layer,
+                                      assigned_id, error);
 }
 
 static gboolean register_view(int fd,
@@ -1599,20 +1617,39 @@ static void test_muxd_async_move_and_queued_replies(void)
         "#!/bin/sh\n"
         "case \"$*\" in\n"
         "  *\"--use-password=always\"*\"detach-window\"*\"--match id:301\"*\"--target-tab window_id:401\"*)\n"
+        "    [ \"$KITTY_PUBLIC_KEY\" = '1:primary' ] || exit 65\n"
         "    : > \"$MUX_TEST_KITTEN_MARKER\"\n"
         "    sleep 1\n"
         "    exit 0\n"
         "    ;;\n"
         "  *\"--use-password=always\"*\"detach-window\"*\"--match id:302\"*\"--target-tab window_id:401\"*)\n"
+        "    [ \"$KITTY_PUBLIC_KEY\" = '1:primary' ] || exit 65\n"
         "    : > \"$MUX_TEST_KITTEN_MARKER\"\n"
         "    exec sleep 10\n"
         "    ;;\n"
         "  *\"--use-password=always\"*\"focus-window\"*\"--match id:302\")\n"
+        "    [ \"$KITTY_PUBLIC_KEY\" = '1:primary' ] || exit 65\n"
         "    exit 0\n"
         "    ;;\n"
         "  *\"--use-password=always\"*\"focus-window\"*\"--match id:303\")\n"
+        "    if printenv KITTY_PUBLIC_KEY >/dev/null; then exit 65; fi\n"
         "    : > \"$MUX_TEST_FOCUS_MARKER\"\n"
         "    while [ ! -f \"$MUX_TEST_FOCUS_RELEASE\" ]; do sleep 0.01; done\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  *\"--use-password=always\"*\"focus-window\"*\"--match id:401\")\n"
+        "    [ \"$KITTY_PUBLIC_KEY\" = '1:primary' ] || exit 65\n"
+        "    printf 'focus denied\\033[31m\\000after-nul\\n' >&2\n"
+        "    i=0; while [ \"$i\" -lt 128 ]; do printf '%1024s' x >&2; i=$((i+1)); done\n"
+        "    exit 64\n"
+        "    ;;\n"
+        "  *\"--to second-kitty\"*\"focus-window\"*\"--match id:501\")\n"
+        "    [ \"$KITTY_PUBLIC_KEY\" = '1:second' ] || exit 65\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  *\"--to second-kitty\"*\"focus-window\"*\"--match id:601\")\n"
+        "    [ \"$KITTY_PUBLIC_KEY\" = '1:second' ] || exit 65\n"
+        "    : > \"$MUX_TEST_FOCUS_MARKER\"\n"
         "    exit 0\n"
         "    ;;\n"
         "esac\n"
@@ -1632,6 +1669,7 @@ static void test_muxd_async_move_and_queued_replies(void)
     gchar *source_id = NULL;
     gchar *timeout_source_id = NULL;
     gchar *fallback_id = NULL;
+    gchar *second_id = NULL;
     gchar *move_response = NULL;
     gchar *observed_layer = NULL;
     gchar *error_message = NULL;
@@ -1643,6 +1681,7 @@ static void test_muxd_async_move_and_queued_replies(void)
     gchar *old_focus_marker = g_strdup(g_getenv("MUX_TEST_FOCUS_MARKER"));
     gchar *old_focus_release = g_strdup(g_getenv("MUX_TEST_FOCUS_RELEASE"));
     gchar *old_debug = g_strdup(g_getenv("G_DEBUG"));
+    gchar *old_public_key = g_strdup(g_getenv("KITTY_PUBLIC_KEY"));
     GError *error = NULL;
     struct ucred daemon_credentials;
     int guard_fd = -1;
@@ -1652,6 +1691,8 @@ static void test_muxd_async_move_and_queued_replies(void)
     int fallback_fd = -1;
     int move_fd = -1;
     int focus_fd = -1;
+    int second_fd = -1;
+    int second_bar_fd = -1;
     pid_t daemon_child = -1;
     pid_t daemon_pid = -1;
     mode_t old_umask = umask(0077);
@@ -1702,6 +1743,8 @@ static void test_muxd_async_move_and_queued_replies(void)
             "set focus release gate");
     REQUIRE(g_setenv("G_DEBUG", "fatal-warnings", TRUE),
             "make unexpected daemon GLib warnings fatal");
+    REQUIRE(g_setenv("KITTY_PUBLIC_KEY", "1:daemon-stale", TRUE),
+            "seed stale daemon encryption context");
     socket_path =
         g_build_filename(runtime_dir, "mux", "muxd.sock", NULL);
 
@@ -1723,10 +1766,11 @@ static void test_muxd_async_move_and_queued_replies(void)
                                     RESPONSE_TIMEOUT_MS,
                                     &error);
     REQUIRE_CALL(target_fd >= 0, "connect target view");
-    REQUIRE_CALL(register_view_with_identity(target_fd,
+    REQUIRE_CALL(register_view_with_context(target_fd,
                                              "",
                                              "401",
                                              "integration-kitty",
+                                             "1:primary",
                                              "target",
                                              &target_id,
                                              &error),
@@ -1735,10 +1779,11 @@ static void test_muxd_async_move_and_queued_replies(void)
                                     RESPONSE_TIMEOUT_MS,
                                     &error);
     REQUIRE_CALL(source_fd >= 0, "connect successful source view");
-    REQUIRE_CALL(register_view_with_identity(source_fd,
+    REQUIRE_CALL(register_view_with_context(source_fd,
                                              "",
                                              "301",
                                              "integration-kitty",
+                                             "1:primary",
                                              "main",
                                              &source_id,
                                              &error),
@@ -1747,10 +1792,11 @@ static void test_muxd_async_move_and_queued_replies(void)
                                             RESPONSE_TIMEOUT_MS,
                                             &error);
     REQUIRE_CALL(timeout_source_fd >= 0, "connect timeout source view");
-    REQUIRE_CALL(register_view_with_identity(timeout_source_fd,
+    REQUIRE_CALL(register_view_with_context(timeout_source_fd,
                                              "",
                                              "302",
                                              "integration-kitty",
+                                             "1:primary",
                                              "main",
                                              &timeout_source_id,
                                              &error),
@@ -1970,7 +2016,85 @@ static void test_muxd_async_move_and_queued_replies(void)
             "timed-out move changed metadata to layer %s",
             observed_layer);
 
+    second_fd = connect_unix_socket(socket_path, RESPONSE_TIMEOUT_MS, &error);
+    REQUIRE_CALL(second_fd >= 0, "connect second terminal view");
+    REQUIRE_CALL(register_view_with_context(second_fd, "", "501",
+                                             "second-kitty", "1:second",
+                                             "other", &second_id, &error),
+                 "register second terminal encryption context");
+    focus_fd = request_control_target(socket_path, "FOCUS", second_id, &error);
+    REQUIRE_CALL(focus_fd >= 0, "request second terminal focus");
+    {
+        g_autofree gchar *line = mux_read_line(focus_fd, RESPONSE_TIMEOUT_MS);
+
+        REQUIRE(g_strcmp0(line, "OK") == 0,
+                "second terminal focus failed: %s",
+                line != NULL ? line : "(none)");
+    }
+    close(focus_fd);
+    focus_fd = -1;
+    REQUIRE_CALL(wait_for_active_state(socket_path, second_id, "other",
+                                       STATE_TIMEOUT_MS, &error),
+                 "observe second terminal focus");
+
+    second_bar_fd = connect_unix_socket(socket_path, RESPONSE_TIMEOUT_MS, &error);
+    REQUIRE_CALL(second_bar_fd >= 0, "connect second terminal bar");
+    {
+        g_autofree gchar *id = mux_encode("second-bar");
+        g_autofree gchar *window = mux_encode("601");
+        g_autofree gchar *socket = mux_encode("second-kitty");
+        g_autofree gchar *layer = mux_encode("other");
+        g_autofree gchar *profile = mux_encode("default");
+        g_autofree gchar *key = mux_encode("1:second");
+        g_autofree gchar *line = NULL;
+
+        REQUIRE(mux_send_line(second_bar_fd,
+                              "BAR\t%s\t%ld\t%s\t%s\t%s\t%s\t%s",
+                              id, (long)getpid(), window, socket, layer,
+                              profile, key),
+                "send second terminal bar registration");
+        line = mux_read_line(second_bar_fd, RESPONSE_TIMEOUT_MS);
+        REQUIRE(line != NULL && g_str_has_prefix(line, "OK\t"),
+                "second terminal bar registration failed");
+    }
+    REQUIRE(g_unlink(focus_marker) == 0,
+            "reset marker before bar focus: %s", g_strerror(errno));
+    REQUIRE(mux_send_line(second_fd, "PROMPT"),
+            "request second terminal bar focus");
+    REQUIRE(wait_for_path(focus_marker, 1000),
+            "bar focus did not use its registered terminal key");
+
+    focus_fd = request_control_target(socket_path, "FOCUS",
+                                       timeout_source_id, &error);
+    REQUIRE_CALL(focus_fd >= 0, "refocus primary terminal after second terminal");
+    {
+        g_autofree gchar *line = mux_read_line(focus_fd, RESPONSE_TIMEOUT_MS);
+
+        REQUIRE(g_strcmp0(line, "OK") == 0,
+                "second terminal key leaked into primary focus: %s",
+                line != NULL ? line : "(none)");
+    }
+    close(focus_fd);
+    focus_fd = -1;
+    {
+        g_autofree gchar *log = NULL;
+        gsize length = 0;
+
+        REQUIRE_CALL(g_file_get_contents(daemon_log, &log, &length, &error),
+                     "read bounded Kitty failure diagnostics");
+        REQUIRE(strstr(log, "exit-status=64") != NULL &&
+                strstr(log, "focus denied\\x1b[31m\\x00after-nul\\x0a") != NULL &&
+                strstr(log, "[truncated]") != NULL,
+                "Kitty rejection did not retain escaped child diagnostics");
+        REQUIRE(strchr(log, '\033') == NULL && length < 20000,
+                "Kitty diagnostics were unbounded or contained raw escapes");
+    }
+
 cleanup:
+    if (second_bar_fd >= 0)
+        close(second_bar_fd);
+    if (second_fd >= 0)
+        close(second_fd);
     if (focus_fd >= 0)
         close(focus_fd);
     if (move_fd >= 0)
@@ -2024,11 +2148,13 @@ cleanup:
     restore_environment("MUX_TEST_FOCUS_MARKER", old_focus_marker);
     restore_environment("MUX_TEST_FOCUS_RELEASE", old_focus_release);
     restore_environment("G_DEBUG", old_debug);
+    restore_environment("KITTY_PUBLIC_KEY", old_public_key);
     (void)umask(old_umask);
     g_free(error_message);
     g_free(observed_layer);
     g_free(move_response);
     g_free(fallback_id);
+    g_free(second_id);
     g_free(timeout_source_id);
     g_free(source_id);
     g_free(target_id);
@@ -2047,6 +2173,7 @@ cleanup:
     g_free(old_focus_marker);
     g_free(old_focus_release);
     g_free(old_debug);
+    g_free(old_public_key);
     g_free(old_path);
     g_free(old_ephemeral);
     g_free(old_state);

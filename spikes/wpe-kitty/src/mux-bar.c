@@ -524,15 +524,17 @@ static gboolean register_bar(Bar *bar)
     gchar *profile = mux_encode(g_getenv("MUX_PROFILE")
                                     ? g_getenv("MUX_PROFILE")
                                     : "default");
+    g_autofree gchar *public_key = mux_encode(g_getenv("KITTY_PUBLIC_KEY"));
     gboolean result = mux_send_line(
         bar->daemon_fd,
-        "BAR\t%s\t%ld\t%s\t%s\t%s\t%s",
+        "BAR\t%s\t%ld\t%s\t%s\t%s\t%s\t%s",
         id,
         (long)getpid(),
         window,
         socket,
         layer,
-        profile);
+        profile,
+        public_key);
     g_free(profile);
     g_free(layer);
     g_free(socket);

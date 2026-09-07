@@ -47,6 +47,7 @@ typedef struct {
     gchar *id;
     gchar *kitty_window;
     gchar *kitty_socket;
+    gchar *kitty_public_key;
     gchar *profile;
     gchar *layer;
     gchar *uri;
@@ -115,6 +116,9 @@ typedef struct {
     KittyOperationKind kind;
     gchar *layer;
     GPid child_pid;
+    int stderr_fd;
+    GString *stderr_output;
+    gboolean stderr_truncated;
     GSource *child_source;
     GSource *timeout_source;
     gint64 deadline_us;
@@ -129,6 +133,8 @@ typedef struct {
 #define MAX_PEER_ENVIRONMENT_BYTES (4u * 1024u * 1024u)
 #define MAX_KITTY_SOCKET_BYTES 4096u
 #define MAX_KITTY_WINDOW_ID_BYTES 20u
+#define MAX_KITTY_PUBLIC_KEY_BYTES 1024u
+#define MAX_KITTY_STDERR_BYTES 4096u
 #define MAX_CLIENTS 128u
 #define MAX_ENGINES 32u
 #define ENGINE_REGISTRY_VERSION 1u
@@ -719,6 +725,7 @@ static void client_free(gpointer data)
     g_free(client->id);
     g_free(client->kitty_window);
     g_free(client->kitty_socket);
+    g_free(client->kitty_public_key);
     g_free(client->profile);
     g_free(client->layer);
     g_free(client->uri);
@@ -826,6 +833,35 @@ static gboolean kitty_window_id_is_valid(const gchar *id)
     return errno != ERANGE && end == id + length && value > 0;
 }
 
+/* The optional registration field carries terminal-scoped encryption context,
+ * not daemon startup state. Keep the key opaque while rejecting hidden bytes
+ * and noncanonical transport encoding. */
+static gboolean decode_kitty_public_key(const gchar *encoded, gchar **key)
+{
+    g_autofree guchar *decoded = NULL;
+    g_autofree gchar *canonical = NULL;
+    gsize length;
+    const gsize encoded_limit = 4u * ((MAX_KITTY_PUBLIC_KEY_BYTES + 2u) / 3u);
+
+    *key = NULL;
+    if (encoded == NULL || encoded[0] == '\0')
+        return TRUE;
+    if (strnlen(encoded, encoded_limit + 1u) > encoded_limit)
+        return FALSE;
+    decoded = g_base64_decode(encoded, &length);
+    if (length == 0 || length > MAX_KITTY_PUBLIC_KEY_BYTES)
+        return FALSE;
+    canonical = g_base64_encode(decoded, length);
+    if (strcmp(encoded, canonical) != 0)
+        return FALSE;
+    for (gsize i = 0; i < length; i++) {
+        if (decoded[i] < 0x21 || decoded[i] > 0x7e)
+            return FALSE;
+    }
+    *key = g_strndup((const gchar *)decoded, length);
+    return TRUE;
+}
+
 static void control_error(Client *client, const gchar *message);
 static void broadcast_view(Server *server, Client *view, const gchar *event);
 static void reconcile_active(Server *server, Client *preferred);
@@ -846,6 +882,9 @@ static void kitty_operation_free(gpointer data)
 
     kitty_operation_destroy_source(&operation->timeout_source);
     kitty_operation_destroy_source(&operation->child_source);
+    if (operation->stderr_fd >= 0)
+        close(operation->stderr_fd);
+    g_string_free(operation->stderr_output, TRUE);
     g_free(operation->layer);
     g_free(operation);
 }
@@ -856,6 +895,60 @@ static void kitty_operation_kill(PendingKittyOperation *operation)
         return;
     while (kill((pid_t)operation->child_pid, SIGKILL) < 0 && errno == EINTR)
         ;
+}
+
+static void kitty_operation_read_stderr(PendingKittyOperation *operation)
+{
+    gchar buffer[4096];
+    gsize received = 0;
+
+    while (operation->stderr_fd >= 0 &&
+           received < MAX_CLIENT_IO_BYTES_PER_TICK) {
+        ssize_t count;
+
+        do {
+            count = read(operation->stderr_fd, buffer,
+                         MIN(sizeof(buffer),
+                             MAX_CLIENT_IO_BYTES_PER_TICK - received));
+        } while (count < 0 && errno == EINTR);
+        if (count > 0) {
+            gsize retained = MIN((gsize)count,
+                MAX_KITTY_STDERR_BYTES - operation->stderr_output->len);
+
+            received += (gsize)count;
+            g_string_append_len(operation->stderr_output, buffer, retained);
+            if (retained < (gsize)count)
+                operation->stderr_truncated = TRUE;
+            continue;
+        }
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        close(operation->stderr_fd);
+        operation->stderr_fd = -1;
+    }
+}
+
+static void kitty_operation_report_failure(PendingKittyOperation *operation,
+                                           const gchar *failure,
+                                           gint wait_status)
+{
+    GString *escaped = g_string_sized_new(operation->stderr_output->len);
+
+    for (gsize i = 0; i < operation->stderr_output->len; i++) {
+        guchar byte = (guchar)operation->stderr_output->str[i];
+
+        if (byte >= 0x20 && byte <= 0x7e && byte != '\\')
+            g_string_append_c(escaped, (gchar)byte);
+        else
+            g_string_append_printf(escaped, "\\x%02x", (guint)byte);
+    }
+    g_printerr("muxd: %s (exit-status=%d signal=%d): %s%s\n",
+               failure,
+               WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1,
+               WIFSIGNALED(wait_status) ? WTERMSIG(wait_status) : 0,
+               escaped->str,
+               operation->stderr_truncated ? " [truncated]" : "");
+    g_string_free(escaped, TRUE);
 }
 
 static gboolean kitty_operation_timed_out(gpointer user_data)
@@ -885,6 +978,7 @@ static void kitty_operation_child_exited(GPid child_pid,
     gboolean accepted = g_spawn_check_wait_status(wait_status, NULL);
     g_autofree gchar *failure = NULL;
 
+    kitty_operation_read_stderr(operation);
     kitty_operation_destroy_source(&operation->timeout_source);
     kitty_operation_destroy_source(&operation->child_source);
     g_spawn_close_pid(child_pid);
@@ -904,6 +998,11 @@ static void kitty_operation_child_exited(GPid child_pid,
         failure = g_strdup("target changed layers during Kitty focus request");
     }
 
+    /* Log bounded, escaped diagnostics even when a control client receives ERR.
+     * Remote rejection is an operational error, never a fatal GLib warning. */
+    if (failure != NULL && !operation->cancelled)
+        kitty_operation_report_failure(operation, failure, wait_status);
+
     if (failure == NULL) {
         if (operation->kind == KITTY_OPERATION_MOVE) {
             replace_string(&source->layer, g_steal_pointer(&operation->layer));
@@ -919,9 +1018,6 @@ static void kitty_operation_child_exited(GPid child_pid,
         }
     } else if (control != NULL && !control->closing) {
         control_error(control, failure);
-    } else if (!operation->cancelled) {
-        /* Remote command rejection is an operational error, not a GLib bug. */
-        g_printerr("muxd: %s\n", failure);
     }
 
     g_ptr_array_remove(operation->server->pending_kitty_operations, operation);
@@ -936,22 +1032,32 @@ static gboolean kitty_operation_async(Server *server,
 {
     PendingKittyOperation *operation;
     GPid child_pid = 0;
+    int stderr_fd = -1;
+    int stderr_flags;
+    g_auto(GStrv) environment = g_get_environ();
     g_autoptr(GError) error = NULL;
 
     if (server->pending_kitty_operations->len >= MAX_CLIENTS)
         return FALSE;
-    if (!g_spawn_async(NULL,
-                       argv,
-                       NULL,
-                       G_SPAWN_SEARCH_PATH |
-                           G_SPAWN_DO_NOT_REAP_CHILD |
-                           G_SPAWN_STDIN_FROM_DEV_NULL |
-                           G_SPAWN_STDOUT_TO_DEV_NULL |
-                           G_SPAWN_STDERR_TO_DEV_NULL,
-                       NULL,
-                       NULL,
-                       &child_pid,
-                       &error)) {
+    environment = g_environ_unsetenv(environment, "KITTY_PUBLIC_KEY");
+    if (source->kitty_public_key != NULL)
+        environment = g_environ_setenv(environment, "KITTY_PUBLIC_KEY",
+                                        source->kitty_public_key, TRUE);
+    if (!g_spawn_async_with_pipes(NULL,
+                                  argv,
+                                  environment,
+                                  G_SPAWN_SEARCH_PATH |
+                                      G_SPAWN_DO_NOT_REAP_CHILD |
+                                      G_SPAWN_STDIN_FROM_DEV_NULL |
+                                      G_SPAWN_STDOUT_TO_DEV_NULL |
+                                      G_SPAWN_CLOEXEC_PIPES,
+                                  NULL,
+                                  NULL,
+                                  &child_pid,
+                                  NULL,
+                                  NULL,
+                                  &stderr_fd,
+                                  &error)) {
         g_printerr("muxd: cannot launch Kitty command: %s\n", error->message);
         return FALSE;
     }
@@ -963,6 +1069,18 @@ static gboolean kitty_operation_async(Server *server,
     operation->kind = kind;
     operation->layer = g_strdup(layer);
     operation->child_pid = child_pid;
+    operation->stderr_fd = stderr_fd;
+    operation->stderr_output = g_string_new(NULL);
+    stderr_flags = fcntl(stderr_fd, F_GETFL);
+    if (stderr_flags < 0 ||
+        fcntl(stderr_fd, F_SETFL, stderr_flags | O_NONBLOCK) < 0) {
+        g_printerr("muxd: cannot configure Kitty diagnostic pipe: %s\n",
+                   g_strerror(errno));
+        close(operation->stderr_fd);
+        operation->stderr_fd = -1;
+        operation->cancelled = TRUE;
+        kitty_operation_kill(operation);
+    }
     operation->deadline_us = g_get_monotonic_time() +
         ((gint64)KITTY_COMMAND_TIMEOUT_MS * 1000);
     operation->child_source = g_child_watch_source_new(child_pid);
@@ -1891,7 +2009,9 @@ static void handle_line(Server *server, Client *client, const gchar *line)
         (void)register_engine(server, client, fields, field_count);
     } else if (client->kind == CLIENT_UNKNOWN &&
         g_strcmp0(fields[0], "VIEW") == 0 &&
-        field_count >= 7 && encoded_layer_is_valid(fields[5])) {
+        field_count >= 7 && encoded_layer_is_valid(fields[5]) &&
+        decode_kitty_public_key(field_count >= 8 ? fields[7] : NULL,
+                                &client->kitty_public_key)) {
         g_autofree gchar *proposed_id = mux_decode(fields[1]);
         g_autofree gchar *peer_profile = NULL;
         guint64 proposed_session_view_id = 0;
@@ -1948,7 +2068,9 @@ static void handle_line(Server *server, Client *client, const gchar *line)
             set_active(server, client);
     } else if (client->kind == CLIENT_UNKNOWN &&
                g_strcmp0(fields[0], "BAR") == 0 &&
-               field_count >= 6 && encoded_layer_is_valid(fields[5])) {
+               field_count >= 6 && encoded_layer_is_valid(fields[5]) &&
+               decode_kitty_public_key(field_count >= 8 ? fields[7] : NULL,
+                                       &client->kitty_public_key)) {
         client->kind = CLIENT_BAR;
         client->id = mux_decode(fields[1]);
         client->pid = strtol(fields[2], NULL, 10);
@@ -2113,6 +2235,17 @@ static void request_engine_shutdown(Server *server, gint64 now_us)
         ((gint64)STOP_ENGINE_GRACE_MS * 1000);
 }
 
+static gboolean has_tracked_views(Server *server)
+{
+    for (guint i = 0; i < server->clients->len; i++) {
+        Client *client = g_ptr_array_index(server->clients, i);
+
+        if (client->kind == CLIENT_VIEW)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static void update_controlled_stop(Server *server)
 {
     gint64 now_us;
@@ -2120,7 +2253,9 @@ static void update_controlled_stop(Server *server)
     if (!server->stopping)
         return;
     now_us = g_get_monotonic_time();
-    if (view_count(server) > 0) {
+    /* A disconnected pane still owns a tracked PID until exit is observed.
+     * Do not report successful shutdown while that process needs escalation. */
+    if (has_tracked_views(server)) {
         if (now_us < server->stop_deadline_us)
             return;
         if (!server->stop_term_sent) {
@@ -2509,7 +2644,9 @@ static int run_server(void)
 
     while (server.running && !stop_requested) {
         guint client_count = server.clients->len;
-        struct pollfd *poll_fds = g_new0(struct pollfd, client_count + 1);
+        guint operation_count = server.pending_kitty_operations->len;
+        guint descriptor_count = client_count + operation_count + 1;
+        struct pollfd *poll_fds = g_new0(struct pollfd, descriptor_count);
         poll_fds[0].fd = server.listener;
         poll_fds[0].events = POLLIN;
         for (guint i = 0; i < client_count; i++) {
@@ -2521,15 +2658,33 @@ static int run_server(void)
             if (!client->closing && client->output_bytes > 0)
                 poll_fds[i + 1].events |= POLLOUT;
         }
+        for (guint i = 0; i < operation_count; i++) {
+            PendingKittyOperation *operation =
+                g_ptr_array_index(server.pending_kitty_operations, i);
+
+            poll_fds[client_count + i + 1].fd = operation->stderr_fd;
+            poll_fds[client_count + i + 1].events = POLLIN;
+        }
 
         int result;
         do {
             result = poll(poll_fds,
-                          client_count + 1,
+                          descriptor_count,
                           kitty_operation_poll_timeout(&server, 50));
         } while (result < 0 && errno == EINTR && !stop_requested);
         int poll_error = result < 0 ? errno : 0;
 
+        /* Child-watch dispatch may free operations, so drain their ready pipes
+         * before dispatching the main context. */
+        if (result > 0) {
+            for (guint i = 0; i < operation_count; i++) {
+                PendingKittyOperation *operation =
+                    g_ptr_array_index(server.pending_kitty_operations, i);
+
+                if (poll_fds[client_count + i + 1].revents != 0)
+                    kitty_operation_read_stderr(operation);
+            }
+        }
         while (g_main_context_iteration(server.main_context, FALSE))
             ;
         if (result < 0 && !(poll_error == EINTR && stop_requested)) {
