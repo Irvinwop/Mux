@@ -111,4 +111,13 @@ jobs:
           G_DEBUG: fatal-criticals
           MUX_SMOKE_ALLOW_ROOT_CI: "1"
           MUX_BIN_DIR: ${{ github.workspace }}/build/runtime-smoke
-        run: ./runtime-smoke
+        run: MUX_SMOKE_SCREENSHOT_DIR="$PWD/runtime-smoke-artifacts/screenshots" ./runtime-smoke
+
+      - name: Upload runtime screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-screenshots-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runtime-smoke-artifacts/screenshots
+          if-no-files-found: error
+          retention-days: 7

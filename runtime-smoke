@@ -67,6 +67,11 @@ required_commands=(
     mkdir mktemp pgrep pkg-config python3 rm sed sha256sum sleep stat tail
     timeout tr uname weston
 )
+if [[ -n ${MUX_SMOKE_SCREENSHOT_DIR:-} ]]; then
+    [[ $MUX_SMOKE_SCREENSHOT_DIR == /* ]] ||
+        die "MUX_SMOKE_SCREENSHOT_DIR must be an absolute output directory"
+    required_commands+=(od weston-screenshooter)
+fi
 for command in "${required_commands[@]}"; do
     command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
@@ -115,6 +120,7 @@ SNAPSHOT=
 FRAME_ACK_TELEMETRY=
 CLIPBOARD_TELEMETRY=
 FIXTURE_STATE=
+SCREENSHOT_RUN_DIR=
 MUXD_PID=0
 ENGINE_PID=0
 ISOLATED_ENGINE_PID=0
@@ -130,6 +136,7 @@ ISOLATED_ENGINE_SOCKET=
 declare -a CHILD_PIDS=()
 declare -a CHILD_LABELS=()
 declare -a KITTY_WINDOW_IDS=()
+declare -a WESTON_CAPTURE_ARGS=()
 TEARDOWN_DONE=0
 
 pid_alive() {
@@ -364,6 +371,49 @@ assert_core_alive() {
     pid_alive "$KITTY_PID" || fail "Kitty exited"
 }
 
+capture_screenshot() {
+    local state=$1
+    local directory image header bytes
+    local png_count=0
+
+    [[ -n $SCREENSHOT_RUN_DIR ]] || return 0
+    [[ $state =~ ^[0-9][0-9]-[a-z0-9-]+$ ]] ||
+        fail "invalid screenshot state: $state"
+    directory="$SCREENSHOT_RUN_DIR/$state"
+    mkdir -m 700 -- "$directory" ||
+        fail "could not create fresh screenshot state directory: $directory"
+    assert_core_alive
+
+    # Capture the real compositor output after the caller's readiness barrier.
+    # A fresh working directory prevents an old PNG from satisfying this run.
+    if ! (
+        cd -- "$directory" &&
+        timeout --signal=TERM --kill-after=2s 8s weston-screenshooter
+    ) >"$directory/screenshooter.log" 2>&1; then
+        safe_dump_file "$directory/screenshooter.log" || true
+        fail "screenshot $state failed or exceeded its 8-second capture deadline"
+    fi
+
+    for image in "$directory"/*.png; do
+        [[ -f $image ]] || continue
+        bytes=$(stat -c '%s' -- "$image") ||
+            fail "could not size screenshot: $image"
+        header=$(od -An -tx1 -N16 -- "$image" | tr -d ' \n') ||
+            fail "could not read screenshot header: $image"
+        # PNG signature followed by its mandatory 13-byte IHDR chunk.
+        [[ $header == 89504e470d0a1a0a0000000d49484452 ]] &&
+            (( bytes >= 67 && bytes <= 32 * 1024 * 1024 )) ||
+            fail "screenshot $state did not produce a bounded PNG: $image"
+        (( png_count += 1 ))
+        printf '%s\t%s\t%s\n' "$state" "$state/${image##*/}" "$bytes" \
+            >>"$SCREENSHOT_RUN_DIR/screenshots.tsv"
+    done
+    (( png_count > 0 )) ||
+        fail "screenshot $state exited successfully without producing a PNG"
+    printf 'runtime-smoke: captured %s (%s PNG) at %s\n' \
+        "$state" "$png_count" "$directory"
+}
+
 wait_fixture_event() {
     local scenario=$1
     local event=$2
@@ -525,19 +575,21 @@ wait_bar_ready() {
 
 wait_bar_editing() {
     local kitty_window=$1
+    local expected_text=${2:-URL>}
     local capture="$BASE/bar-editing.txt"
     local attempt
 
     for (( attempt=0; attempt < 100; attempt++ )); do
         if kitty_rc get-text --match "id:$kitty_window" --extent=all \
             >"$capture" 2>>"$LOG_DIR/kitty-actions.log" &&
-            grep -Fq 'URL>' "$capture"; then
+            grep -Fq 'URL>' "$capture" &&
+            grep -Fq -- "$expected_text" "$capture"; then
             return 0
         fi
         assert_core_alive
         sleep 0.05
     done
-    fail "global URL bar did not enter edit mode after Super+L"
+    fail "global URL bar did not display expected edit text: $expected_text"
 }
 
 wait_initial_view() {
@@ -639,6 +691,7 @@ qualify_private_history_absence() {
         sleep 0.05
     done
     (( saw_picker == 1 )) || fail "clipboard history picker did not render in the private profile"
+    capture_screenshot 07-private-clipboard-history
 
     printf 'PROFILE_HISTORY_ISOLATION\tprofile_sha256=%s\tmarker_sha256=%s\tresult=PASS\n' \
         "$(sha256_text runtime-smoke-private)" "$(sha256_text "$marker")" \
@@ -747,6 +800,19 @@ install -d -m 700 \
     "$BASE/fixture-state" \
     "$BASE/kitty"
 
+if [[ -n ${MUX_SMOKE_SCREENSHOT_DIR:-} ]]; then
+    mkdir -p -- "$MUX_SMOKE_SCREENSHOT_DIR" ||
+        fail "could not create screenshot output directory"
+    SCREENSHOT_RUN_DIR=$(mktemp -d \
+        "$MUX_SMOKE_SCREENSHOT_DIR/runtime-smoke.XXXXXX") ||
+        fail "could not create a fresh screenshot run directory"
+    printf 'state\tpng\tbytes\n' >"$SCREENSHOT_RUN_DIR/screenshots.tsv"
+    # Debug capture access is limited to this disposable headless compositor
+    # in the smoke test's private, mode-0700 XDG_RUNTIME_DIR, never production.
+    WESTON_CAPTURE_ARGS+=(--debug)
+    printf 'runtime-smoke: screenshot artifacts at %s\n' "$SCREENSHOT_RUN_DIR"
+fi
+
 FIXTURE_STATE="$BASE/fixture-state"
 CLIPBOARD_TELEMETRY="$LOG_DIR/clipboard-qualification.log"
 : >"$CLIPBOARD_TELEMETRY"
@@ -775,7 +841,7 @@ text += "clipboard_control write-clipboard write-primary read-clipboard read-pri
 path.write_text(text, encoding="ascii")
 PY
 
-weston \
+weston "${WESTON_CAPTURE_ARGS[@]}" \
     --backend=headless \
     --fake-seat \
     --renderer=pixman \
@@ -901,6 +967,7 @@ wait_bar_ready "$BOOT_URL"
     fail "mux-bar and mux-pane unexpectedly reported the same Kitty window ID"
 KITTY_WINDOW_IDS+=("$BAR_KITTY_ID")
 wait_frame_ack "$BOOT_KITTY_ID" "$BOOT_URL" MUX_SMOKE_BOOT_LOADED
+capture_screenshot 01-initial-pane-and-global-bar
 
 run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "muxctl focus failed for $BOOT_VIEW_ID"
@@ -952,19 +1019,32 @@ kitty_rc send-key --match "id:$BOOT_KITTY_ID" super+l \
     >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
     fail "encrypted Super+L injection failed for $BOOT_VIEW_ID"
 wait_bar_editing "$BAR_KITTY_ID"
+capture_screenshot 02-url-edit-initial
 kitty_rc send-text --match "id:$BAR_KITTY_ID" "$BAR_URL" \
     >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
     fail "encrypted URL input failed for the global bar"
+if [[ -n $SCREENSHOT_RUN_DIR ]]; then
+    wait_bar_editing "$BAR_KITTY_ID" "$BAR_URL"
+    capture_screenshot 03-url-edit-destination
+fi
 kitty_rc send-key --match "id:$BAR_KITTY_ID" enter \
     >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
     fail "encrypted Enter injection failed for the global bar"
 wait_title "$BOOT_VIEW_ID" "$BAR_URL" MUX_SMOKE_BAR_LOADED
 wait_frame_ack "$BOOT_KITTY_ID" "$BAR_URL" MUX_SMOKE_BAR_LOADED
+if [[ -n $SCREENSHOT_RUN_DIR ]]; then
+    wait_bar_ready "$BAR_URL"
+    capture_screenshot 04-url-navigation-loaded
+fi
 
 run_muxctl open "$BOOT_VIEW_ID" "$SECOND_URL" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "targeted navigation failed for $BOOT_VIEW_ID"
 wait_title "$BOOT_VIEW_ID" "$SECOND_URL" MUX_SMOKE_SECOND_LOADED
 wait_frame_ack "$BOOT_KITTY_ID" "$SECOND_URL" MUX_SMOKE_SECOND_LOADED
+if [[ -n $SCREENSHOT_RUN_DIR ]]; then
+    wait_bar_ready "$SECOND_URL"
+    capture_screenshot 05-normal-navigation-loaded
+fi
 
 run_muxctl open "$BOOT_VIEW_ID" "$SAME_CLIPBOARD_URL" \
     >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
@@ -1014,6 +1094,7 @@ kitty_rc send-key --match "id:$ALT_KITTY_ID" "$LINUX_COMPAT_PASTE_CHORD" \
 wait_fixture_event cross-pane paste
 wait_title "$ALT_VIEW_ID" "$CROSS_PANE_TARGET_URL" MUX_CLIP_CROSS_PANE_PASS
 wait_frame_ack "$ALT_KITTY_ID" "$CROSS_PANE_TARGET_URL" MUX_CLIP_CROSS_PANE_PASS
+capture_screenshot 06-alternate-layer-content
 
 run_muxctl open "$BOOT_VIEW_ID" "$CROSS_PROFILE_SOURCE_URL" \
     >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
@@ -1093,6 +1174,7 @@ kitty_rc send-key --match "id:$ISOLATED_KITTY_ID" "$LINUX_COMPAT_PASTE_CHORD" \
 wait_fixture_event cross-profile paste
 wait_title "$ISOLATED_VIEW_ID" "$CROSS_PROFILE_TARGET_URL" MUX_CLIP_CROSS_PROFILE_PASS
 wait_frame_ack "$ISOLATED_KITTY_ID" "$CROSS_PROFILE_TARGET_URL" MUX_CLIP_CROSS_PROFILE_PASS
+capture_screenshot 08-private-profile-content
 
 kitty_rc send-key --match "id:$ISOLATED_KITTY_ID" super+q \
     >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
