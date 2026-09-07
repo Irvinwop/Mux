@@ -631,12 +631,11 @@ on_show_option_menu(WebKitWebView *web_view,
                     WebKitRectangle *rectangle,
                     MuxBrowserAffordanceBridge *bridge)
 {
-  g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
-    browser_affordance_bridge_ref (bridge);
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
+        affordance_bridge_ref(bridge);
 
-  bridge = guard;
-  if (bridge->destroying)
-    return FALSE;
+    if (bridge->destroying)
+        return FALSE;
 
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_OPTION_MENU);
@@ -838,12 +837,11 @@ on_context_menu(WebKitWebView *web_view,
                 WebKitHitTestResult *hit_test,
                 MuxBrowserAffordanceBridge *bridge)
 {
-  g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
-    browser_affordance_bridge_ref (bridge);
+    g_autoptr(MuxBrowserAffordanceBridgeGuard) guard =
+        affordance_bridge_ref(bridge);
 
-  bridge = guard;
-  if (bridge->destroying)
-    return FALSE;
+    if (bridge->destroying)
+        return FALSE;
 
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_CONTEXT_MENU);
