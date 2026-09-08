@@ -98,17 +98,38 @@ while IFS= read -r font_root || [[ -n "$font_root" ]]; do
 done < "$MUX_FONT_ROOTS_FILE"
 [[ ${#allowed_roots[@]} -gt 0 ]] || fail 'No immutable font roots were declared'
 
+# A declared package can link individual fonts into another store output.
+# Derive the exact permitted targets from declared roots, never from fc-list.
+# pipefail and realpath -e make traversal or resolution errors fatal.
+declare -A allowed_files=()
+find -L "${allowed_roots[@]}" -type f -print0 \
+    | sort -zu > "$work/declared-font-paths"
+: > "$work/declared-font-source-targets.tsv"
+while IFS= read -r -d '' declared_file; do
+    canonical_file="$(realpath -e -- "$declared_file")"
+    [[ -f "$canonical_file" ]] \
+        || fail "Declared font entry is not a file: $declared_file"
+    case "$canonical_file" in
+        "$MUX_NIX_STORE_DIR"/*) ;;
+        *) fail "Declared font entry resolves outside the Nix store: $declared_file ($canonical_file)" ;;
+    esac
+    allowed_files["$canonical_file"]=1
+    printf '%s\t%s\n' "$declared_file" "$canonical_file" \
+        >> "$work/declared-font-source-targets.tsv"
+done < "$work/declared-font-paths"
+[[ ${#allowed_files[@]} -gt 0 ]] || fail 'No files are reachable from the declared font roots'
+printf '%s\n' "${!allowed_files[@]}" | sort > "$out/allowed-font-files.txt"
+sort -u "$work/declared-font-source-targets.tsv" > "$out/declared-font-source-targets.tsv"
+
 assert_allowed_file() {
-    local candidate="$1" canonical root
+    local candidate="$1" canonical
     [[ -n "$candidate" ]] || fail 'Fontconfig returned an empty font path'
     canonical="$(realpath -e -- "$candidate")"
     [[ -f "$canonical" ]] || fail "Fontconfig returned a non-file: $candidate"
-    for root in "${allowed_roots[@]}"; do
-        case "$canonical" in
-            "$root"/*) return 0 ;;
-        esac
-    done
-    fail "Fontconfig exposed a font outside the declared packages: $candidate ($canonical)"
+    if [[ ${allowed_files["$canonical"]+present} == present ]]; then
+        return 0
+    fi
+    fail "Fontconfig exposed a font not reachable from the declared roots: $candidate ($canonical)"
 }
 
 # Keep the hostile HOME/XDG/FONTCONFIG_PATH environment, changing only the

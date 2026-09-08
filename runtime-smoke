@@ -755,7 +755,8 @@ wait_automatic_recovery() {
 
 wait_engine_diagnostic_screen() {
     local expected=$1
-    local capture="$LOG_DIR/engine-error-$expected.screen"
+    local checkpoint=${2:-$expected}
+    local capture="$LOG_DIR/engine-error-$checkpoint.screen"
     local attempt
 
     for (( attempt=0; attempt < 200; attempt++ )); do
@@ -764,7 +765,7 @@ wait_engine_diagnostic_screen() {
             >"$capture" 2>>"$LOG_DIR/kitty-actions.log"; then
             if [[ $expected == present ]]; then
                 if grep -Fq 'Mux engine error (' "$capture" &&
-                    grep -Fq "The page's Web process crashed." "$capture"; then
+                    grep -Fq 'Only about:blank is allowed for direct about: navigation' "$capture"; then
                     return 0
                 fi
             elif [[ $expected == absent ]]; then
@@ -787,9 +788,67 @@ wait_engine_diagnostic_screen() {
     fail "live pane diagnostic text did not become $expected within the polling deadline"
 }
 
-qualify_engine_error_recovery() {
-    local probe_url="$SECOND_URL?mux-recovery=$MUX_SMOKE_ID-before"
-    local recovered_url="$SECOND_URL?mux-recovery=$MUX_SMOKE_ID-after"
+wait_web_process_crash_prompt() {
+    local capture="$LOG_DIR/web-process-crash-prompt.screen"
+    local attempt
+
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        if kitty_rc get-text --match "id:$ISOLATED_KITTY_ID" --extent=screen \
+            >"$capture" 2>>"$LOG_DIR/kitty-actions.log" &&
+            grep -Fq 'Web process terminated' "$capture" &&
+            grep -Fq 'The page renderer crashed. Reloading starts a fresh renderer.' "$capture" &&
+            grep -Fq '[r] reload' "$capture" &&
+            grep -Fq '[q/Esc] close' "$capture"; then
+            return 0
+        fi
+        assert_core_alive
+        pid_alive "$ISOLATED_PANE_PID" || fail "isolated pane exited before its crash prompt"
+        sleep 0.05
+    done
+    fail "structured WebProcess crash prompt did not appear within the polling deadline"
+}
+
+qualify_raw_engine_error_recovery() {
+    local probe_url="$SECOND_URL?mux-diagnostic=$MUX_SMOKE_ID-before"
+    local recovered_url="$SECOND_URL?mux-diagnostic=$MUX_SMOKE_ID-after"
+    local fence
+    local trace="$LOG_DIR/raw-engine-error-recovery.log"
+
+    : >"$trace"
+    run_muxctl open "$ISOLATED_VIEW_ID" "$probe_url" \
+        >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+        fail "raw engine-diagnostic fixture navigation failed"
+    wait_title "$ISOLATED_VIEW_ID" "$probe_url" MUX_SMOKE_SECOND_LOADED
+    wait_frame_ack "$ISOLATED_KITTY_ID" "$probe_url" MUX_SMOKE_SECOND_LOADED
+    wait_engine_diagnostic_screen absent raw-before
+
+    # The supported control path forwards this URI to the actual engine. Its
+    # URI validator emits ERROR/BAD_MESSAGE without creating a browser prompt.
+    # The static, non-editable fixture must remain quiescent until capture; a
+    # transient diagnostic cleared by new frames must not count as coverage.
+    run_muxctl open "$ISOLATED_VIEW_ID" about:runtime-smoke-invalid \
+        >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+        fail "raw engine-diagnostic navigation request could not be delivered"
+    wait_engine_diagnostic_screen present raw-present
+    capture_screenshot 09-engine-error-diagnostic
+    wait_engine_diagnostic_screen present raw-present-after-capture
+
+    # The isolated pane has no URL bar. Use normal supported control navigation
+    # through the same pane NAVIGATE path, not an injected engine-protocol reply.
+    fence=$(frame_ack_fence)
+    run_muxctl open "$ISOLATED_VIEW_ID" "$recovered_url" \
+        >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+        fail "control navigation after the raw engine diagnostic failed"
+    wait_title "$ISOLATED_VIEW_ID" "$recovered_url" MUX_SMOKE_SECOND_LOADED
+    wait_frame_ack "$ISOLATED_KITTY_ID" "$recovered_url" MUX_SMOKE_SECOND_LOADED "$fence"
+    wait_engine_diagnostic_screen absent raw-recovered
+    capture_screenshot 10-engine-error-recovered
+    printf 'RAW_ENGINE_ERROR_RECOVERY\tkitty_sha256=%s\turi_sha256=%s\tack_after_line=%s\tresult=PASS\n' \
+        "$(sha256_text "$ISOLATED_KITTY_ID")" "$(sha256_text "$recovered_url")" "$fence" >>"$trace"
+}
+
+qualify_web_process_crash_recovery() {
+    local probe_url="$SECOND_URL?mux-crash=$MUX_SMOKE_ID"
     local original_process replacement_process recovered_process fence
     local trace="$LOG_DIR/engine-error-recovery.log"
 
@@ -822,27 +881,28 @@ qualify_engine_error_recovery() {
     wait_layer "$ISOLATED_LAYER" "$ISOLATED_VIEW_ID"
     wait_title "$ISOLATED_VIEW_ID" "$probe_url" MUX_SMOKE_SECOND_LOADED
     wait_frame_ack "$ISOLATED_KITTY_ID" "$probe_url" MUX_SMOKE_SECOND_LOADED "$fence"
-    wait_engine_diagnostic_screen absent
+    wait_engine_diagnostic_screen absent automatic-recovered
 
     owned_web_process crash "$ISOLATED_ENGINE_PID" "$replacement_process" >>"$trace" 2>&1 ||
         fail "second owned WebProcess crash failed its safety checks"
-    wait_engine_diagnostic_screen present
-    capture_screenshot 09-engine-error-diagnostic
+    # This is an intentionally active structured prompt, not raw diagnostic
+    # residue. It must remain visible until its normal reload action resolves it.
+    wait_web_process_crash_prompt
+    capture_screenshot 11-web-process-crash-prompt
+    wait_web_process_crash_prompt
 
-    # This URI has never been loaded, so earlier frames cannot supply its
-    # matching URI/title ACK. Also require a new WebProcess and a clean screen.
     fence=$(frame_ack_fence)
-    run_muxctl open "$ISOLATED_VIEW_ID" "$recovered_url" \
-        >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
-        fail "normal navigation after the engine diagnostic failed"
+    kitty_rc send-key --match "id:$ISOLATED_KITTY_ID" r \
+        >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
+        fail "normal crash-prompt reload action could not be delivered"
     recovered_process=$(wait_owned_web_process "$ISOLATED_ENGINE_PID" "$replacement_process") ||
-        fail "explicit recovery did not create a fresh WebProcess"
-    wait_title "$ISOLATED_VIEW_ID" "$recovered_url" MUX_SMOKE_SECOND_LOADED
-    wait_frame_ack "$ISOLATED_KITTY_ID" "$recovered_url" MUX_SMOKE_SECOND_LOADED "$fence"
-    wait_engine_diagnostic_screen absent
-    capture_screenshot 10-engine-error-recovered
-    printf 'ENGINE_ERROR_RECOVERY\tkitty_sha256=%s\turi_sha256=%s\toriginal=%s\tautomatic=%s\trecovered=%s\tack_after_line=%s\tresult=PASS\n' \
-        "$(sha256_text "$ISOLATED_KITTY_ID")" "$(sha256_text "$recovered_url")" \
+        fail "crash-prompt reload did not create a fresh WebProcess"
+    wait_title "$ISOLATED_VIEW_ID" "$probe_url" MUX_SMOKE_SECOND_LOADED
+    wait_frame_ack "$ISOLATED_KITTY_ID" "$probe_url" MUX_SMOKE_SECOND_LOADED "$fence"
+    wait_engine_diagnostic_screen absent prompt-recovered
+    capture_screenshot 12-web-process-prompt-recovered
+    printf 'WEB_PROCESS_CRASH_PROMPT_RECOVERY\tkitty_sha256=%s\turi_sha256=%s\toriginal=%s\tautomatic=%s\trecovered=%s\tack_after_line=%s\tresult=PASS\n' \
+        "$(sha256_text "$ISOLATED_KITTY_ID")" "$(sha256_text "$probe_url")" \
         "$original_process" "$replacement_process" "$recovered_process" "$fence" >>"$trace"
 }
 
@@ -1479,7 +1539,8 @@ wait_title "$ISOLATED_VIEW_ID" "$CROSS_PROFILE_TARGET_URL" MUX_CLIP_CROSS_PROFIL
 wait_frame_ack "$ISOLATED_KITTY_ID" "$CROSS_PROFILE_TARGET_URL" MUX_CLIP_CROSS_PROFILE_PASS
 capture_screenshot 08-private-profile-content
 
-qualify_engine_error_recovery
+qualify_raw_engine_error_recovery
+qualify_web_process_crash_recovery
 
 kitty_rc send-key --match "id:$ISOLATED_KITTY_ID" super+q \
     >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
@@ -1509,7 +1570,7 @@ pid_alive "$ENGINE_PID" || fail "central engine exited after its last view close
 pid_alive "$ISOLATED_ENGINE_PID" || fail "isolated engine exited after its last view closed"
 pid_alive "$MUXD_PID" || fail "muxd exited after its last view closed"
 
-printf 'runtime-smoke: browser path, hashed Kitty FRAME_ACK, same-page/cross-pane/cross-profile clipboard, privacy boundaries, focus, layers, navigation, owned WebProcess error recovery, and graceful close passed\n'
+printf 'runtime-smoke: browser path, hashed Kitty FRAME_ACK, same-page/cross-pane/cross-profile clipboard, privacy boundaries, focus, layers, navigation, raw engine diagnostic retirement, owned WebProcess crash-prompt reload, and graceful close passed\n'
 
 timeout 6s "$BIN_DIR/muxctl" stop >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "muxctl stop did not complete within its lifecycle deadline"

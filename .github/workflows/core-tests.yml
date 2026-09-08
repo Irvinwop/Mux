@@ -61,6 +61,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Install tooling test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ripgrep
+
       - name: Test installation and Tor launcher contracts
         run: |
           sh scripts/test-user-install.sh

@@ -67,13 +67,20 @@ XDG, legacy home, Nix profile, and host-like fixture directories. It also plants
 foreign-font configurations in common user and `FONTCONFIG_PATH` locations.
 An explicit permissive positive control must discover each copied font first.
 The actual policy must then expose a nonempty font set whose canonical file
-paths all fall under canonical declared Nix-store font roots, with no foreign
-family. Alias checks and representative script/math/emoji codepoints catch an
-accidentally empty or obviously incomplete replacement.
+paths exactly match files independently enumerated by following symlinks under
+the declared font roots. Every enumerated target must be in the Nix store, but
+store membership alone never authorizes a font. This permits declared package
+links, such as DejaVu's minimal-font dependency, without admitting unrelated
+store or host fonts. Traversal and resolution failures are fatal, and the
+planted foreign family must remain absent. Alias checks and representative
+script/math/emoji codepoints catch an accidentally empty or obviously
+incomplete replacement.
 
 The output retains the configuration, policy identifier, canonical allowed
-roots, effective file/family inventories, alias matches, glyph sample matches,
-and normalized positive-control paths. These are Fontconfig-level checks only.
+roots, sorted reachable canonical files (`allowed-font-files.txt`), sorted
+source-to-target mappings (`declared-font-source-targets.tsv`), effective
+file/family inventories, alias matches, glyph sample matches, and normalized
+positive-control paths. These are Fontconfig-level checks only.
 The host-like directory is a private fixture, not a modification to `/usr` or
 the real user's home. The font policy is not a filesystem security boundary
 against a process or user that can replace the launcher or its environment.
