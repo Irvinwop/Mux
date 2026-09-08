@@ -16,6 +16,8 @@ typedef struct {
     guint64 source_view_id;
     gboolean pinned;
     guint format_count;
+    gchar **mime_types;
+    guint mime_type_count;
     gsize total_bytes;
     gchar *preview;
 } MuxClipboardBrokerSummary;

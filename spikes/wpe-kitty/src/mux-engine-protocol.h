@@ -5,11 +5,17 @@
 G_BEGIN_DECLS
 
 #define MUX_ENGINE_MAGIC 0x4d555831u
-#define MUX_ENGINE_VERSION 1u
+#define MUX_ENGINE_VERSION 4u
 #define MUX_ENGINE_HEADER_SIZE 40u
 #define MUX_ENGINE_MAX_PAYLOAD (256u * 1024u)
 #define MUX_ENGINE_MAX_DAMAGE_RECTS 64u
 #define MUX_ENGINE_MAX_TEXT_BYTES (64u * 1024u)
+#define MUX_DEVICE_SCALE_ENV "MUX_DEVICE_SCALE"
+#define MUX_ENGINE_DEFAULT_SCALE_MILLI 1000u
+#define MUX_ENGINE_MIN_SCALE_MILLI 500u
+#define MUX_ENGINE_MAX_SCALE_MILLI 4000u
+#define MUX_ENGINE_MAX_FIND_TEXT_BYTES 1024u
+#define MUX_ENGINE_MAX_FIND_MATCHES 1000u
 
 typedef enum {
     MUX_ENGINE_MESSAGE_HELLO = 1,
@@ -30,6 +36,14 @@ typedef enum {
     MUX_ENGINE_MESSAGE_PING,
     MUX_ENGINE_MESSAGE_PONG,
     MUX_ENGINE_MESSAGE_TEXT_COMMIT,
+    MUX_ENGINE_MESSAGE_REQUEST_CLOSE,
+    MUX_ENGINE_MESSAGE_CLOSE_READY,
+    MUX_ENGINE_MESSAGE_CLOSE_CANCELLED,
+    MUX_ENGINE_MESSAGE_SET_VISIBILITY,
+    MUX_ENGINE_MESSAGE_CANCEL_CLOSE,
+    MUX_ENGINE_MESSAGE_SET_LAYER,
+    MUX_ENGINE_MESSAGE_FRAME_REJECTED,
+    MUX_ENGINE_MESSAGE_FIND_STATE,
     MUX_ENGINE_MESSAGE_EXTENSION = 64,
 } MuxEngineMessageType;
 
@@ -57,6 +71,14 @@ typedef enum {
 } MuxEnginePixelFormat;
 
 typedef enum {
+    MUX_ENGINE_FRAME_REJECTED_KITTY = 1,
+    MUX_ENGINE_FRAME_REJECTED_NOT_VISIBLE,
+    MUX_ENGINE_FRAME_REJECTED_BACKPRESSURE,
+} MuxEngineFrameRejection;
+
+#define MUX_ENGINE_MAX_FRAME_REJECTION_BYTES 512u
+
+typedef enum {
     MUX_ENGINE_NAVIGATE_LOAD = 1,
     MUX_ENGINE_NAVIGATE_BACK,
     MUX_ENGINE_NAVIGATE_FORWARD,
@@ -69,6 +91,14 @@ typedef enum {
     MUX_ENGINE_KEY_REPEAT,
     MUX_ENGINE_KEY_RELEASE,
 } MuxEngineKeyEvent;
+
+typedef enum {
+    MUX_ENGINE_FIND_CLOSED = 0,
+    MUX_ENGINE_FIND_IDLE,
+    MUX_ENGINE_FIND_PENDING,
+    MUX_ENGINE_FIND_FOUND,
+    MUX_ENGINE_FIND_NOT_FOUND,
+} MuxEngineFindStatus;
 
 typedef enum {
     MUX_ENGINE_POINTER_MOVE = 1,
@@ -95,6 +125,12 @@ typedef enum {
     MUX_ENGINE_ERROR_PROTOCOL,
     MUX_ENGINE_ERROR_TOO_LARGE,
 } MuxEngineError;
+
+typedef enum {
+    MUX_ENGINE_RECEIVE_ERROR = -1,
+    MUX_ENGINE_RECEIVE_WOULD_BLOCK = 0,
+    MUX_ENGINE_RECEIVE_MESSAGE = 1,
+} MuxEngineReceiveResult;
 
 #define MUX_ENGINE_ERROR (mux_engine_error_quark())
 GQuark mux_engine_error_quark(void);
@@ -128,9 +164,11 @@ void mux_engine_message_clear(MuxEngineMessage *message);
 gboolean mux_engine_send_message(int fd,
                                  const MuxEngineMessage *message,
                                  GError **error);
-gboolean mux_engine_receive_message(int fd,
-                                    MuxEngineMessage *message,
-                                    GError **error);
+GBytes *mux_engine_serialize_message(const MuxEngineMessage *message,
+                                     GError **error);
+MuxEngineReceiveResult mux_engine_receive_message(int fd,
+                                                  MuxEngineMessage *message,
+                                                  GError **error);
 
 void mux_engine_builder_init(MuxEngineBuilder *builder);
 void mux_engine_builder_clear(MuxEngineBuilder *builder);
@@ -154,5 +192,10 @@ gboolean mux_engine_cursor_get_bytes(MuxEngineCursor *cursor,
 gboolean mux_engine_cursor_get_string(MuxEngineCursor *cursor,
                                       gchar **value);
 gboolean mux_engine_cursor_done(const MuxEngineCursor *cursor);
+
+/* NULL selects 1.0. Explicit values use strict decimal milliscale syntax. */
+gboolean mux_engine_parse_device_scale(const gchar *value,
+                                       guint32 *scale_milli,
+                                       GError **error);
 
 G_END_DECLS

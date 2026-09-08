@@ -28,6 +28,19 @@ This document defines that boundary for the shared `mux-engine`, the thin
 7. Requests display their security origin. A pane must not show an untrusted
    message where an origin is expected.
 
+## Browser shortcut modifiers
+
+For browser-owned commands, WPE Meta (`Super`, or `Command` on an Apple keyboard
+mapped into Linux) is canonical. Conventional Control forms are matched only as
+explicit Linux compatibility aliases. Every shortcut requires an exact modifier
+set, and handled press, repeat, and release records are consumed together.
+Unmatched input is sent to web content with its original modifier bits, so Meta
+is never rewritten to Control for a page.
+
+On an Apple keyboard, Linux normally exposes the Command key as Super/Meta.
+This alias does not add native macOS support: Mux remains a Linux-only WPE and
+Kitty application.
+
 ## WPE hooks
 
 WPE WebKit 2.52 exposes the required embedder signals directly on
@@ -145,30 +158,25 @@ The default is deny. Decisions can be:
 
 - Allow once.
 - Deny once.
-- Remember allow for this origin and permission kind.
 - Remember deny for this origin and permission kind.
 
-Remembered policy is stored by `mux-engine` in the selected profile with owner-
-only permissions and atomic replacement. Private profiles never persist it.
-`query-permission-state` consults the same store, so JavaScript observes a state
-consistent with prior decisions.
-
-Camera, microphone, display capture, encrypted media, and XR are initially
-compiled in but policy-disabled until their Linux device and sandbox behavior
-is exercised. The pane explains that distinction instead of silently claiming
-the feature is unavailable.
+Powerful permissions are never granted persistently. The generic WebKit request
+interface does not always expose the exact requesting origin, so every allow is
+limited to that one request. Only denies may be remembered by profile, top-level
+origin, and permission kind. They are stored with owner-only permissions and
+atomic replacement; private profiles never persist them.
 
 ## File chooser
 
 For `run-file-chooser`, the engine sends accepted MIME types, multi-select state,
 and the current origin. The pane temporarily suspends raw browsing input and
-uses `kitten choose-files` when Kitty 0.45 or newer is available. Multiple mode
+uses `kitten choose-files`, which requires Kitty 0.45 or newer. Multiple mode
 maps to `--mode=files`; otherwise it uses `--mode=file`.
 
-On older Kitty versions, the overlay accepts newline-separated absolute paths.
-Before answering WebKit, the pane canonicalizes paths and the engine validates
-that each path is absolute, exists, is a regular readable file, and was returned
-for the current request. No directory is recursively exposed.
+Mux has no manual path-entry fallback. On older Kitty versions the upload is
+cancelled. Selected files are validated and copied into bounded, owner-only
+staging before WebKit receives them; symlinks, special files, and directory
+uploads are rejected.
 
 Kitty chooser reference:
 <https://sw.kovidgoyal.net/kitty/kittens/choose-files/>
@@ -188,6 +196,24 @@ Default behavior:
 4. Write a partial file with owner-only permissions.
 5. Atomically rename on completion.
 6. Remove the partial file on cancellation or failure unless explicitly kept.
+
+The trusted context menu prepends `Download ... to clipboard` for image, media,
+and link targets, with the current page as a fallback. This uses the same
+WebKit session and download state machine, but selects a private `0700`
+directory below the user's temporary directory instead of prompting for a
+destination. Completed files remain available for the memory-only browser
+session and are removed when that profile's download manager shuts down.
+
+The resulting clipboard snapshot keeps the backing file URI together with
+`text/uri-list`, GNOME and KDE file-copy variants, `public.file-url`, and a
+plain path. The response MIME bytes are included when the file is no larger
+than the clipboard's 16 MiB per-item limit. Repeating an identical ordinary
+copy does not append history: `muxd` compares the complete MIME snapshot and
+returns the existing entry ID.
+
+File clipboard publication is not equivalent to drag-and-drop. A site that
+requires `DataTransfer.files` will not accept a synthetic paste of the URI;
+that path requires real terminal-to-WPE drag event transport.
 
 `DOWNLOAD_EVENT` reports started, progress, finished, failed, and cancelled
 states. Progress updates are coalesced to at most four per second. The global bar

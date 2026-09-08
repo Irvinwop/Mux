@@ -110,15 +110,17 @@ MuxIpc *mux_ipc_connect(
     gchar *socket = mux_encode(kitty_socket ? kitty_socket : "");
     gchar *encoded_layer = mux_encode(layer ? layer : "main");
     gchar *uri = mux_encode(initial_uri ? initial_uri : "");
+    g_autofree gchar *public_key = mux_encode(g_getenv("KITTY_PUBLIC_KEY"));
     gboolean sent = mux_send_line(
         fd,
-        "VIEW\t%s\t%ld\t%s\t%s\t%s\t%s",
+        "VIEW\t%s\t%ld\t%s\t%s\t%s\t%s\t%s",
         id,
         (long)getpid(),
         kitty,
         socket,
         encoded_layer,
-        uri);
+        uri,
+        public_key);
     g_free(uri);
     g_free(encoded_layer);
     g_free(socket);

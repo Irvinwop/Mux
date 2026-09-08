@@ -1,11 +1,23 @@
 #include "mux-kitty-clipboard.h"
 
+#include <string.h>
 #include <unistd.h>
+
+#define MAX_MIME_LIST_BYTES \
+    ((MUX_CLIPBOARD_MAX_MIME + 1U) * MUX_CLIPBOARD_MAX_ITEMS)
+
+typedef enum {
+    READ_STAGE_CONTENT,
+    READ_STAGE_TARGETS
+} ReadStage;
 
 typedef struct {
     gchar *id;
     MuxOsc5522Location location;
     gboolean is_paste;
+    ReadStage stage;
+    gchar *password;
+    gchar *human_name;
     gboolean acknowledged;
     GPtrArray *order;
     GHashTable *buffers;
@@ -16,6 +28,7 @@ typedef struct {
 typedef struct {
     MuxOsc5522Location location;
     GPtrArray *mimes;
+    GByteArray *mime_list;
     gchar *password;
     gchar *human_name;
     gint64 deadline_us;
@@ -25,6 +38,23 @@ typedef struct {
     MuxOsc5522Location location;
     MuxClipboardSnapshot *snapshot;
 } PendingWrite;
+
+typedef enum {
+    WRITE_STAGE_BEGIN,
+    WRITE_STAGE_DATA,
+    WRITE_STAGE_END,
+    WRITE_STAGE_WAIT_DONE
+} WriteStage;
+
+typedef struct {
+    gchar *id;
+    MuxOsc5522Location location;
+    MuxClipboardSnapshot *snapshot;
+    WriteStage stage;
+    guint item_index;
+    gsize item_offset;
+    gint64 deadline_us;
+} WriteTransaction;
 
 struct _MuxKittyClipboard {
     gint reference_count;
@@ -41,8 +71,7 @@ struct _MuxKittyClipboard {
     ReadTransaction *read;
     PasteOffer *offer;
     PasteOffer *pending_offer;
-    gchar *write_id;
-    gint64 write_deadline_us;
+    WriteTransaction *write;
     PendingWrite *queued_write;
 };
 
@@ -60,6 +89,8 @@ read_transaction_free(ReadTransaction *transaction)
         return;
 
     g_free(transaction->id);
+    g_free(transaction->password);
+    g_free(transaction->human_name);
     g_ptr_array_unref(transaction->order);
     g_hash_table_unref(transaction->buffers);
     g_free(transaction);
@@ -72,6 +103,7 @@ paste_offer_free(PasteOffer *offer)
         return;
 
     g_ptr_array_unref(offer->mimes);
+    g_clear_pointer(&offer->mime_list, g_byte_array_unref);
     g_free(offer->password);
     g_free(offer->human_name);
     g_free(offer);
@@ -83,6 +115,17 @@ pending_write_free(PendingWrite *write)
     if (write == NULL)
         return;
 
+    mux_clipboard_snapshot_unref(write->snapshot);
+    g_free(write);
+}
+
+static void
+write_transaction_free(WriteTransaction *write)
+{
+    if (write == NULL)
+        return;
+
+    g_free(write->id);
     mux_clipboard_snapshot_unref(write->snapshot);
     g_free(write);
 }
@@ -139,13 +182,19 @@ report_literal(MuxKittyClipboard *clipboard,
 static ReadTransaction *
 read_transaction_new(gchar *id,
                      MuxOsc5522Location location,
-                     gboolean is_paste)
+                     gboolean is_paste,
+                     ReadStage stage,
+                     const gchar *password,
+                     const gchar *human_name)
 {
     ReadTransaction *transaction = g_new0(ReadTransaction, 1);
 
     transaction->id = id;
     transaction->location = location;
     transaction->is_paste = is_paste;
+    transaction->stage = stage;
+    transaction->password = g_strdup(password);
+    transaction->human_name = g_strdup(human_name);
     transaction->order = g_ptr_array_new_with_free_func(g_free);
     transaction->buffers = g_hash_table_new_full(
         g_str_hash,
@@ -163,6 +212,7 @@ start_read(MuxKittyClipboard *clipboard,
            const gchar *password,
            const gchar *human_name,
            gboolean is_paste,
+           ReadStage stage,
            GError **error)
 {
     gchar *id;
@@ -188,7 +238,12 @@ start_read(MuxKittyClipboard *clipboard,
         return FALSE;
     }
 
-    clipboard->read = read_transaction_new(id, location, is_paste);
+    clipboard->read = read_transaction_new(id,
+                                           location,
+                                           is_paste,
+                                           stage,
+                                           password,
+                                           human_name);
     if (!emit_packet(clipboard, packet, error)) {
         g_clear_pointer(&clipboard->read, read_transaction_free);
         return FALSE;
@@ -271,6 +326,114 @@ finish_snapshot(MuxKittyClipboard *clipboard,
 }
 
 static gboolean launch_pending_offer(MuxKittyClipboard *clipboard);
+static void activate_queued_write(MuxKittyClipboard *clipboard);
+
+static GPtrArray *
+parse_mime_list(const guint8 *data, gsize length, GError **error)
+{
+    GPtrArray *mimes = g_ptr_array_new_with_free_func(g_free);
+    gchar **tokens = NULL;
+    gchar *payload = NULL;
+    guint i;
+
+    if (length > MAX_MIME_LIST_BYTES) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "Kitty MIME list exceeds its byte limit");
+        goto fail;
+    }
+    if (length == 0)
+        goto done;
+    if (memchr(data, '\0', length) != NULL ||
+        !g_utf8_validate((const gchar *)data, length, NULL)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_DATA,
+                            "Kitty MIME discovery returned invalid text");
+        goto fail;
+    }
+
+    payload = g_strndup((const gchar *)data, length);
+    tokens = g_strsplit_set(payload, " \t\r\n", -1);
+    for (i = 0; tokens[i] != NULL; i++) {
+        guint j;
+        gboolean duplicate = FALSE;
+
+        if (tokens[i][0] == '\0')
+            continue;
+        if (g_str_equal(tokens[i], ".") ||
+            !mux_clipboard_mime_is_valid(tokens[i])) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_DATA,
+                                "Kitty MIME discovery returned an invalid type");
+            goto fail;
+        }
+        for (j = 0; j < mimes->len; j++) {
+            if (g_str_equal(g_ptr_array_index(mimes, j), tokens[i])) {
+                duplicate = TRUE;
+                break;
+            }
+        }
+        if (duplicate)
+            continue;
+        if (mimes->len >= MUX_CLIPBOARD_MAX_ITEMS) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_NO_SPACE,
+                                "Kitty MIME discovery returned too many types");
+            goto fail;
+        }
+        g_ptr_array_add(mimes, g_strdup(tokens[i]));
+    }
+
+done:
+    g_ptr_array_add(mimes, NULL);
+    g_strfreev(tokens);
+    g_free(payload);
+    return mimes;
+
+fail:
+    g_strfreev(tokens);
+    g_free(payload);
+    g_ptr_array_unref(mimes);
+    return NULL;
+}
+
+static GPtrArray *
+parse_discovered_mimes(ReadTransaction *transaction, GError **error)
+{
+    GByteArray *buffer;
+
+    if (transaction->order->len > 1 ||
+        (transaction->order->len == 1 &&
+         !g_str_equal(g_ptr_array_index(transaction->order, 0), "."))) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_DATA,
+                            "Kitty MIME discovery returned an unexpected type");
+        return NULL;
+    }
+    buffer = g_hash_table_lookup(transaction->buffers, ".");
+    return parse_mime_list(buffer != NULL ? buffer->data : NULL,
+                           buffer != NULL ? buffer->len : 0,
+                           error);
+}
+
+static void
+receive_empty_snapshot(MuxKittyClipboard *clipboard,
+                        MuxOsc5522Location location,
+                        gboolean is_paste)
+{
+    g_autoptr(MuxClipboardSnapshot) snapshot =
+        mux_clipboard_snapshot_new(++clipboard->next_serial);
+
+    mux_clipboard_snapshot_seal(snapshot);
+    if (clipboard->receive_func != NULL)
+        clipboard->receive_func(clipboard, location, snapshot, is_paste,
+                                clipboard->user_data);
+}
 
 static gboolean
 complete_read(MuxKittyClipboard *clipboard, GError **error)
@@ -279,6 +442,59 @@ complete_read(MuxKittyClipboard *clipboard, GError **error)
     MuxClipboardSnapshot *snapshot;
     MuxOsc5522Location location;
     gboolean is_paste;
+
+    if (transaction->stage == READ_STAGE_TARGETS) {
+        GPtrArray *mimes = parse_discovered_mimes(transaction, error);
+        g_autofree gchar *password = g_strdup(transaction->password);
+        g_autofree gchar *human_name = g_strdup(transaction->human_name);
+        gboolean result;
+
+        clipboard->read = NULL;
+        location = transaction->location;
+        is_paste = transaction->is_paste;
+        read_transaction_free(transaction);
+        if (mimes == NULL) {
+            launch_pending_offer(clipboard);
+            return FALSE;
+        }
+        if (mimes->len == 1) {
+            g_ptr_array_unref(mimes);
+            receive_empty_snapshot(clipboard, location, is_paste);
+            launch_pending_offer(clipboard);
+            return TRUE;
+        }
+        {
+            gboolean has_text_plain = FALSE;
+            guint format_count = mimes->len > 0 ? mimes->len - 1 : 0;
+            guint i;
+
+            for (i = 0; i < format_count; i++) {
+                if (g_str_has_prefix(g_ptr_array_index(mimes, i),
+                                     "text/plain")) {
+                    has_text_plain = TRUE;
+                    break;
+                }
+            }
+            mux_clipboard_smoke_trace(
+                MUX_CLIPBOARD_TRACE_MIME_DISCOVERY,
+                &(MuxClipboardTraceFields) {
+                    .format_count = format_count,
+                    .has_text_plain = has_text_plain
+                });
+        }
+        result = start_read(clipboard,
+                            location,
+                            (const gchar *const *)mimes->pdata,
+                            password,
+                            human_name,
+                            is_paste,
+                            READ_STAGE_CONTENT,
+                            error);
+        g_ptr_array_unref(mimes);
+        if (!result)
+            launch_pending_offer(clipboard);
+        return result;
+    }
 
     clipboard->read = NULL;
     snapshot = finish_snapshot(clipboard, transaction, error);
@@ -345,6 +561,50 @@ offer_add_mime(PasteOffer *offer, const gchar *mime, GError **error)
     return TRUE;
 }
 
+static gboolean
+offer_add_data(PasteOffer *offer,
+                const MuxOsc5522Event *event,
+                GError **error)
+{
+    gsize length;
+    const guint8 *data = g_bytes_get_data(event->data, &length);
+
+    if (event->has_location && event->location != offer->location) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "Kitty paste offer changed location");
+        return FALSE;
+    }
+    if (!offer_set_text(&offer->password, event->password, "password", error) ||
+        !offer_set_text(&offer->human_name, event->human_name, "name", error))
+        return FALSE;
+
+    if (g_str_equal(event->mime, ".")) {
+        if (offer->mimes->len != 0) {
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                "Kitty paste offer mixed MIME list formats");
+            return FALSE;
+        }
+        if (offer->mime_list == NULL)
+            offer->mime_list = g_byte_array_new();
+        if (length > MAX_MIME_LIST_BYTES - offer->mime_list->len) {
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NO_SPACE,
+                                "Kitty paste MIME list exceeds its byte limit");
+            return FALSE;
+        }
+        if (length > 0)
+            g_byte_array_append(offer->mime_list, data, length);
+        return TRUE;
+    }
+
+    /* Older senders advertise individual MIME types with empty DATA. */
+    if (offer->mime_list != NULL || length != 0) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "Kitty paste offer has unexpected MIME data");
+        return FALSE;
+    }
+    return offer_add_mime(offer, event->mime, error);
+}
+
 static PasteOffer *
 paste_offer_new(const MuxOsc5522Event *event)
 {
@@ -368,6 +628,10 @@ start_offer_read(MuxKittyClipboard *clipboard,
     guint i;
 
     if (offer->mimes->len == 0) {
+        if (offer->mime_list != NULL) {
+            receive_empty_snapshot(clipboard, offer->location, TRUE);
+            return TRUE;
+        }
         g_set_error_literal(error,
                             G_IO_ERROR,
                             G_IO_ERROR_INVALID_DATA,
@@ -382,8 +646,10 @@ start_offer_read(MuxKittyClipboard *clipboard,
                         offer->location,
                         mimes,
                         offer->password,
-                        offer->human_name,
+                        offer->human_name != NULL
+                            ? offer->human_name : "Paste event",
                         TRUE,
+                        READ_STAGE_CONTENT,
                         error);
     g_free(mimes);
     return result;
@@ -425,6 +691,26 @@ remote_error_code(MuxOsc5522RemoteError remote_error)
     }
 }
 
+static const gchar *
+remote_error_name(MuxOsc5522RemoteError remote_error)
+{
+    switch (remote_error) {
+    case MUX_OSC5522_REMOTE_ERROR_IO:
+        return "EIO";
+    case MUX_OSC5522_REMOTE_ERROR_INVALID:
+        return "EINVAL";
+    case MUX_OSC5522_REMOTE_ERROR_UNSUPPORTED:
+        return "ENOSYS";
+    case MUX_OSC5522_REMOTE_ERROR_PERMISSION:
+        return "EPERM";
+    case MUX_OSC5522_REMOTE_ERROR_BUSY:
+        return "EBUSY";
+    case MUX_OSC5522_REMOTE_ERROR_NONE:
+    default:
+        return "EUNKNOWN";
+    }
+}
+
 static void
 handle_remote_error(MuxKittyClipboard *clipboard,
                     const MuxOsc5522Event *event)
@@ -432,9 +718,10 @@ handle_remote_error(MuxKittyClipboard *clipboard,
     g_autoptr(GError) error = g_error_new(
         G_IO_ERROR,
         remote_error_code(event->remote_error),
-        "Kitty rejected clipboard transaction%s%s",
+        "Kitty rejected OSC 5522 clipboard transaction%s%s with %s",
         event->id != NULL ? " " : "",
-        event->id != NULL ? event->id : "");
+        event->id != NULL ? event->id : "",
+        remote_error_name(event->remote_error));
 
     if (event->id != NULL && clipboard->read != NULL &&
         g_str_equal(event->id, clipboard->read->id)) {
@@ -443,11 +730,10 @@ handle_remote_error(MuxKittyClipboard *clipboard,
         launch_pending_offer(clipboard);
         return;
     }
-    if (event->id != NULL && clipboard->write_id != NULL &&
-        g_str_equal(event->id, clipboard->write_id)) {
-        g_clear_pointer(&clipboard->write_id, g_free);
-        clipboard->write_deadline_us = 0;
-        g_clear_pointer(&clipboard->queued_write, pending_write_free);
+    if (event->id != NULL && clipboard->write != NULL &&
+        g_str_equal(event->id, clipboard->write->id)) {
+        g_clear_pointer(&clipboard->write, write_transaction_free);
+        activate_queued_write(clipboard);
         report_failure(clipboard, "clipboard-write", error);
         return;
     }
@@ -457,89 +743,201 @@ handle_remote_error(MuxKittyClipboard *clipboard,
     }
 }
 
-static gboolean
-send_write(MuxKittyClipboard *clipboard,
-           MuxOsc5522Location location,
-           const MuxClipboardSnapshot *snapshot,
-           GError **error)
+static WriteTransaction *
+write_transaction_new(MuxKittyClipboard *clipboard,
+                      MuxOsc5522Location location,
+                      MuxClipboardSnapshot *snapshot)
 {
-    gchar *id = new_request_id(clipboard);
-    gboolean began = FALSE;
-    guint i;
+    WriteTransaction *write = g_new0(WriteTransaction, 1);
 
-    clipboard->write_id = g_strdup(id);
-    clipboard->write_deadline_us = new_deadline();
-    if (!emit_packet(clipboard,
-                     mux_osc5522_write_begin(id,
-                                             location,
-                                             NULL,
-                                             "Mux browser",
-                                             error),
-                     error))
-        goto fail;
-    began = TRUE;
-
-    for (i = 0; i < mux_clipboard_snapshot_get_count(snapshot); i++) {
-        const gchar *mime = NULL;
-        GBytes *bytes = NULL;
-        const guint8 *data;
-        gsize length;
-        gsize offset = 0;
-
-        mux_clipboard_snapshot_get_item(snapshot, i, &mime, &bytes);
-        data = g_bytes_get_data(bytes, &length);
-        do {
-            gsize amount = MIN((gsize)MUX_OSC5522_MAX_CHUNK,
-                               length - offset);
-
-            if (!emit_packet(clipboard,
-                             mux_osc5522_write_data(mime,
-                                                    amount > 0
-                                                        ? data + offset
-                                                        : NULL,
-                                                    amount,
-                                                    error),
-                             error))
-                goto fail;
-            offset += amount;
-        } while (offset < length);
-    }
-
-    if (!emit_packet(clipboard, mux_osc5522_write_end(error), error))
-        goto fail;
-    g_free(id);
-    return TRUE;
-
-fail:
-    if (began) {
-        GBytes *end = mux_osc5522_write_end(NULL);
-
-        if (end != NULL)
-            emit_packet(clipboard, end, NULL);
-    }
-    g_clear_pointer(&clipboard->write_id, g_free);
-    clipboard->write_deadline_us = 0;
-    g_free(id);
-    return FALSE;
+    write->id = new_request_id(clipboard);
+    write->location = location;
+    write->snapshot = snapshot;
+    write->stage = WRITE_STAGE_BEGIN;
+    write->deadline_us = new_deadline();
+    return write;
 }
 
 static void
-flush_queued_write(MuxKittyClipboard *clipboard)
+activate_queued_write(MuxKittyClipboard *clipboard)
 {
-    PendingWrite *write;
-    g_autoptr(GError) error = NULL;
+    PendingWrite *pending;
 
-    if (clipboard->write_id != NULL || clipboard->queued_write == NULL)
+    if (clipboard->write != NULL || clipboard->queued_write == NULL)
         return;
 
-    write = clipboard->queued_write;
+    pending = clipboard->queued_write;
     clipboard->queued_write = NULL;
-    if (!send_write(clipboard,
-                    write->location,
-                    write->snapshot,
-                    &error))
-        report_failure(clipboard, "clipboard-write", error);
-    pending_write_free(write);
+    clipboard->write = write_transaction_new(clipboard,
+                                             pending->location,
+                                             pending->snapshot);
+    pending->snapshot = NULL;
+    pending_write_free(pending);
+}
+
+static gboolean
+flush_write_budget(MuxKittyClipboard *clipboard, GError **error)
+{
+    guint packet_count = 0;
+    gsize byte_count = 0;
+
+    while (clipboard->write != NULL &&
+           clipboard->write->stage != WRITE_STAGE_WAIT_DONE &&
+           packet_count < MUX_KITTY_CLIPBOARD_WRITE_PACKETS_PER_TICK &&
+           byte_count < MUX_KITTY_CLIPBOARD_WRITE_BYTES_PER_TICK) {
+        WriteTransaction *write = clipboard->write;
+        WriteStage next_stage = write->stage;
+        guint next_item_index = write->item_index;
+        gsize next_item_offset = write->item_offset;
+        WriteStage previous_stage = write->stage;
+        guint previous_item_index = write->item_index;
+        gsize previous_item_offset = write->item_offset;
+        gint64 previous_deadline_us = write->deadline_us;
+        GBytes *packet = NULL;
+        gsize packet_size;
+
+        switch (write->stage) {
+        case WRITE_STAGE_BEGIN:
+            packet = mux_osc5522_write_begin(write->id,
+                                             write->location,
+                                             NULL,
+                                             "Mux browser",
+                                             error);
+            next_stage = mux_clipboard_snapshot_get_count(write->snapshot) > 0
+                             ? WRITE_STAGE_DATA
+                             : WRITE_STAGE_END;
+            break;
+        case WRITE_STAGE_DATA: {
+            const gchar *mime = NULL;
+            GBytes *bytes = NULL;
+            const guint8 *data;
+            gsize length;
+            gsize amount;
+
+            if (write->item_index >=
+                mux_clipboard_snapshot_get_count(write->snapshot)) {
+                write->stage = WRITE_STAGE_END;
+                continue;
+            }
+
+            mux_clipboard_snapshot_get_item(write->snapshot,
+                                            write->item_index,
+                                            &mime,
+                                            &bytes);
+            data = g_bytes_get_data(bytes, &length);
+            if (write->item_offset > length) {
+                g_set_error_literal(error,
+                                    G_IO_ERROR,
+                                    G_IO_ERROR_INVALID_DATA,
+                                    "clipboard write cursor exceeds item size");
+                break;
+            }
+
+            amount = MIN((gsize)MUX_OSC5522_MAX_CHUNK,
+                         length - write->item_offset);
+            /* Kitty decodes a continuous base64 stream for each MIME type.
+             * Padding must occur only in the final chunk of that type. */
+            if (amount < length - write->item_offset)
+                amount -= amount % 3U;
+            packet = mux_osc5522_write_data(
+                mime,
+                amount > 0 ? data + write->item_offset : NULL,
+                amount,
+                error);
+            if (length == 0 || amount == length - write->item_offset) {
+                next_item_index++;
+                next_item_offset = 0;
+                if (next_item_index >=
+                    mux_clipboard_snapshot_get_count(write->snapshot))
+                    next_stage = WRITE_STAGE_END;
+            } else {
+                next_item_offset += amount;
+            }
+            break;
+        }
+        case WRITE_STAGE_END:
+            packet = mux_osc5522_write_end(error);
+            next_stage = WRITE_STAGE_WAIT_DONE;
+            break;
+        case WRITE_STAGE_WAIT_DONE:
+        default:
+            break;
+        }
+
+        if (packet == NULL) {
+            if (error != NULL && *error == NULL) {
+                g_set_error_literal(error,
+                                    G_IO_ERROR,
+                                    G_IO_ERROR_FAILED,
+                                    "could not encode Kitty clipboard packet");
+            }
+            if (clipboard->write == write)
+                g_clear_pointer(&clipboard->write, write_transaction_free);
+            activate_queued_write(clipboard);
+            return FALSE;
+        }
+
+        packet_size = g_bytes_get_size(packet);
+        if (packet_count > 0 &&
+            packet_size >
+                MUX_KITTY_CLIPBOARD_WRITE_BYTES_PER_TICK - byte_count) {
+            g_bytes_unref(packet);
+            break;
+        }
+
+        write->stage = next_stage;
+        write->item_index = next_item_index;
+        write->item_offset = next_item_offset;
+        write->deadline_us = new_deadline();
+        packet_count++;
+        byte_count += packet_size;
+
+        if (!emit_packet(clipboard, packet, error)) {
+            if (error != NULL && *error != NULL &&
+                g_error_matches(*error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_WOULD_BLOCK)) {
+                if (clipboard->write == write) {
+                    write->stage = previous_stage;
+                    write->item_index = previous_item_index;
+                    write->item_offset = previous_item_offset;
+                    write->deadline_us = previous_deadline_us;
+                }
+                g_clear_error(error);
+                return TRUE;
+            }
+            if (error != NULL && *error == NULL) {
+                g_set_error_literal(error,
+                                    G_IO_ERROR,
+                                    G_IO_ERROR_FAILED,
+                                    "could not write Kitty clipboard packet");
+            }
+            if (clipboard->write == write)
+                g_clear_pointer(&clipboard->write, write_transaction_free);
+            if (clipboard->queued_write != NULL) {
+                PendingWrite *queued = clipboard->queued_write;
+
+                clipboard->queued_write = NULL;
+                if (error != NULL && *error != NULL)
+                    report_failure(clipboard,
+                                   "queued-clipboard-write",
+                                   *error);
+                else
+                    report_literal(clipboard,
+                                   "queued-clipboard-write",
+                                   G_IO_ERROR_BROKEN_PIPE,
+                                   "terminal output failed");
+                pending_write_free(queued);
+            }
+            return FALSE;
+        }
+
+        /* The output callback may synchronously complete or reject the write. */
+        if (clipboard->write != write)
+            break;
+    }
+
+    return TRUE;
 }
 
 MuxKittyClipboard *
@@ -584,7 +982,7 @@ mux_kitty_clipboard_unref(MuxKittyClipboard *clipboard)
     g_clear_pointer(&clipboard->read, read_transaction_free);
     g_clear_pointer(&clipboard->offer, paste_offer_free);
     g_clear_pointer(&clipboard->pending_offer, paste_offer_free);
-    g_clear_pointer(&clipboard->write_id, g_free);
+    g_clear_pointer(&clipboard->write, write_transaction_free);
     g_clear_pointer(&clipboard->queued_write, pending_write_free);
     if (clipboard->user_data_destroy != NULL)
         clipboard->user_data_destroy(clipboard->user_data);
@@ -647,9 +1045,48 @@ mux_kitty_clipboard_request(MuxKittyClipboard *clipboard,
                         password,
                         human_name,
                         is_paste,
+                        READ_STAGE_CONTENT,
                         error);
     mux_kitty_clipboard_unref(guard);
     return result;
+}
+
+gboolean
+mux_kitty_clipboard_request_all(MuxKittyClipboard *clipboard,
+                                MuxOsc5522Location location,
+                                const gchar *password,
+                                const gchar *human_name,
+                                gboolean is_paste,
+                                GError **error)
+{
+    static const gchar *const targets[] = { ".", NULL };
+    MuxKittyClipboard *guard;
+    gboolean result;
+
+    g_return_val_if_fail(clipboard != NULL, FALSE);
+    guard = mux_kitty_clipboard_ref(clipboard);
+    result = start_read(clipboard,
+                        location,
+                        targets,
+                        password,
+                        human_name,
+                        is_paste,
+                        READ_STAGE_TARGETS,
+                        error);
+    mux_kitty_clipboard_unref(guard);
+    return result;
+}
+
+void
+mux_kitty_clipboard_cancel_read(MuxKittyClipboard *clipboard)
+{
+    MuxKittyClipboard *guard;
+
+    g_return_if_fail(clipboard != NULL);
+    guard = mux_kitty_clipboard_ref(clipboard);
+    g_clear_pointer(&clipboard->read, read_transaction_free);
+    launch_pending_offer(clipboard);
+    mux_kitty_clipboard_unref(guard);
 }
 
 gboolean
@@ -676,17 +1113,22 @@ mux_kitty_clipboard_publish(MuxKittyClipboard *clipboard,
         goto out;
     }
 
-    if (clipboard->write_id != NULL) {
+    if (clipboard->write != NULL) {
         PendingWrite *write = g_new0(PendingWrite, 1);
 
         write->location = location;
         write->snapshot = copy;
         g_clear_pointer(&clipboard->queued_write, pending_write_free);
         clipboard->queued_write = write;
+        copy = NULL;
     } else {
-        result = send_write(clipboard, location, copy, error);
-        mux_clipboard_snapshot_unref(copy);
+        clipboard->write = write_transaction_new(clipboard, location, copy);
+        copy = NULL;
+        result = flush_write_budget(clipboard, error);
     }
+
+    if (copy != NULL)
+        mux_clipboard_snapshot_unref(copy);
 
 out:
     mux_kitty_clipboard_unref(guard);
@@ -713,8 +1155,6 @@ handle_offer_event(MuxKittyClipboard *clipboard,
                    MuxOsc5522Event *event,
                    GError **error)
 {
-    gsize data_length = 0;
-
     switch (event->type) {
     case MUX_OSC5522_EVENT_READ_OK:
         g_clear_pointer(&clipboard->offer, paste_offer_free);
@@ -728,18 +1168,7 @@ handle_offer_event(MuxKittyClipboard *clipboard,
                                 "Kitty paste data arrived before its offer");
             return FALSE;
         }
-        g_bytes_get_data(event->data, &data_length);
-        if (data_length != 0 ||
-            event->location != clipboard->offer->location ||
-            !offer_set_text(&clipboard->offer->password,
-                            event->password,
-                            "password",
-                            error) ||
-            !offer_set_text(&clipboard->offer->human_name,
-                            event->human_name,
-                            "name",
-                            error) ||
-            !offer_add_mime(clipboard->offer, event->mime, error)) {
+        if (!offer_add_data(clipboard->offer, event, error)) {
             g_clear_pointer(&clipboard->offer, paste_offer_free);
             return FALSE;
         }
@@ -756,6 +1185,24 @@ handle_offer_event(MuxKittyClipboard *clipboard,
             return FALSE;
         }
         clipboard->offer = NULL;
+        if (event->has_location && event->location != offer->location) {
+            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                "Kitty paste offer changed location");
+            paste_offer_free(offer);
+            return FALSE;
+        }
+        if (offer->mime_list != NULL) {
+            GPtrArray *mimes = parse_mime_list(offer->mime_list->data,
+                                              offer->mime_list->len, error);
+
+            if (mimes == NULL) {
+                paste_offer_free(offer);
+                return FALSE;
+            }
+            g_ptr_array_remove_index(mimes, mimes->len - 1U);
+            g_ptr_array_unref(offer->mimes);
+            offer->mimes = mimes;
+        }
         if (clipboard->read != NULL) {
             g_clear_pointer(&clipboard->pending_offer, paste_offer_free);
             clipboard->pending_offer = offer;
@@ -779,6 +1226,28 @@ handle_offer_event(MuxKittyClipboard *clipboard,
                             "invalid unsolicited Kitty clipboard event");
         return FALSE;
     }
+}
+
+gboolean
+mux_kitty_clipboard_osc_matches_pending_read(
+    const MuxKittyClipboard *clipboard,
+    const guint8 *sequence,
+    gsize length,
+    gboolean *matches,
+    GError **error)
+{
+    MuxOsc5522Event *event = NULL;
+
+    g_return_val_if_fail(clipboard != NULL, FALSE);
+    g_return_val_if_fail(matches != NULL, FALSE);
+    *matches = FALSE;
+    if (!mux_osc5522_parse(sequence, length, &event, error))
+        return FALSE;
+    if (clipboard->read != NULL && event->id != NULL &&
+        g_str_equal(event->id, clipboard->read->id))
+        *matches = TRUE;
+    mux_osc5522_event_free(event);
+    return TRUE;
 }
 
 gboolean
@@ -806,11 +1275,11 @@ mux_kitty_clipboard_handle_osc(MuxKittyClipboard *clipboard,
         goto out;
     }
     if (event->type == MUX_OSC5522_EVENT_WRITE_DONE) {
-        if (clipboard->write_id != NULL &&
-            g_str_equal(event->id, clipboard->write_id)) {
-            g_clear_pointer(&clipboard->write_id, g_free);
-            clipboard->write_deadline_us = 0;
-            flush_queued_write(clipboard);
+        if (clipboard->write != NULL &&
+            clipboard->write->stage == WRITE_STAGE_WAIT_DONE &&
+            g_str_equal(event->id, clipboard->write->id)) {
+            g_clear_pointer(&clipboard->write, write_transaction_free);
+            activate_queued_write(clipboard);
         }
         result = TRUE;
         goto out;
@@ -820,7 +1289,8 @@ mux_kitty_clipboard_handle_osc(MuxKittyClipboard *clipboard,
         result = TRUE;
         goto out;
     }
-    if (event->location != clipboard->read->location) {
+    if ((event->has_location || event->type == MUX_OSC5522_EVENT_READ_OK) &&
+        event->location != clipboard->read->location) {
         g_set_error_literal(error,
                             G_IO_ERROR,
                             G_IO_ERROR_INVALID_DATA,
@@ -922,11 +1392,10 @@ mux_kitty_clipboard_tick(MuxKittyClipboard *clipboard,
                        "queued Kitty paste request timed out");
         expired++;
     }
-    if (clipboard->write_id != NULL &&
-        clipboard->write_deadline_us <= monotonic_us) {
-        g_clear_pointer(&clipboard->write_id, g_free);
-        clipboard->write_deadline_us = 0;
-        g_clear_pointer(&clipboard->queued_write, pending_write_free);
+    if (clipboard->write != NULL &&
+        clipboard->write->deadline_us <= monotonic_us) {
+        g_clear_pointer(&clipboard->write, write_transaction_free);
+        activate_queued_write(clipboard);
         report_literal(clipboard,
                        "clipboard-write",
                        G_IO_ERROR_TIMED_OUT,
@@ -935,6 +1404,14 @@ mux_kitty_clipboard_tick(MuxKittyClipboard *clipboard,
     }
 
     launch_pending_offer(clipboard);
+    activate_queued_write(clipboard);
+    if (clipboard->write != NULL &&
+        clipboard->write->stage != WRITE_STAGE_WAIT_DONE) {
+        g_autoptr(GError) error = NULL;
+
+        if (!flush_write_budget(clipboard, &error))
+            report_failure(clipboard, "clipboard-write", error);
+    }
     mux_kitty_clipboard_unref(guard);
     return expired;
 }
@@ -958,5 +1435,5 @@ gboolean
 mux_kitty_clipboard_write_pending(const MuxKittyClipboard *clipboard)
 {
     g_return_val_if_fail(clipboard != NULL, FALSE);
-    return clipboard->write_id != NULL;
+    return clipboard->write != NULL || clipboard->queued_write != NULL;
 }

@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "mux-download-engine.h"
@@ -7,6 +8,7 @@
 #include <glib/gstdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -18,10 +20,15 @@
 #define O_NOFOLLOW 0
 #endif
 
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1U << 1)
+#endif
+
 typedef enum {
     DOWNLOAD_STATE_NEW,
     DOWNLOAD_STATE_WAITING_DESTINATION,
     DOWNLOAD_STATE_TRANSFERRING,
+    DOWNLOAD_STATE_CANCELLING,
     DOWNLOAD_STATE_FAILED,
     DOWNLOAD_STATE_FINISHED,
 } DownloadState;
@@ -35,11 +42,20 @@ typedef struct {
     gchar *suggested_filename;
     gchar *final_path;
     gchar *partial_path;
+    gchar *final_name;
+    gchar *partial_name;
     gchar *failure_message;
-    dev_t reservation_device;
-    ino_t reservation_inode;
+    gint directory_fd;
+    gint reservation_fd;
+    gint partial_fd;
     gboolean reservation_active;
+    gboolean identity_mismatch;
+    gboolean pending_slot_held;
+    gboolean active_slot_held;
+    gboolean destination_emitted;
+    gboolean clipboard_target;
     gint64 last_progress_us;
+    guint destination_timeout_id;
     gulong decide_destination_handler;
     gulong created_destination_handler;
     gulong received_data_handler;
@@ -47,16 +63,158 @@ typedef struct {
     gulong finished_handler;
 } PendingDownload;
 
+typedef struct {
+    guint64 size;
+    gchar *public_path;
+} ClipboardFileRecord;
+
 struct _MuxDownloadManager {
     WebKitNetworkSession *network_session;
     GHashTable *by_download;
     GHashTable *by_id;
+    GHashTable *pending_by_view;
+    GHashTable *active_by_view;
+    guint pending_count;
+    guint active_count;
     MuxDownloadSendFunc send_func;
     MuxDownloadEventFunc event_func;
+    MuxDownloadClipboardFunc clipboard_func;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
     gulong download_started_handler;
+    GHashTable *clipboard_requests;
+    GPtrArray *clipboard_paths;
+    GHashTable *clipboard_files;
+    guint64 clipboard_bytes;
+    gchar *clipboard_directory;
+    gchar *clipboard_host_directory;
 };
+
+static gboolean safe_destination_directory(const struct stat *status);
+
+static void
+clipboard_file_record_free(ClipboardFileRecord *record)
+{
+    if (!record)
+        return;
+    g_free(record->public_path);
+    g_free(record);
+}
+
+static gpointer
+download_view_key(MuxDownloadManager *manager,
+                  WebKitWebView *source_view)
+{
+    return source_view ? (gpointer)source_view : (gpointer)manager;
+}
+
+static gboolean
+reserve_count(MuxDownloadManager *manager,
+              WebKitWebView *source_view,
+              GHashTable *by_view,
+              guint *global_count,
+              guint per_view_limit,
+              guint global_limit)
+{
+    gpointer key = download_view_key(manager, source_view);
+    guint view_count =
+        GPOINTER_TO_UINT(g_hash_table_lookup(by_view, key));
+
+    if (*global_count >= global_limit ||
+        view_count >= per_view_limit)
+        return FALSE;
+    (*global_count)++;
+    g_hash_table_insert(
+        by_view, key, GUINT_TO_POINTER(view_count + 1));
+    return TRUE;
+}
+
+static void
+release_count(MuxDownloadManager *manager,
+              WebKitWebView *source_view,
+              GHashTable *by_view,
+              guint *global_count)
+{
+    gpointer key = download_view_key(manager, source_view);
+    guint view_count =
+        GPOINTER_TO_UINT(g_hash_table_lookup(by_view, key));
+
+    g_assert(*global_count > 0);
+    g_assert(view_count > 0);
+    (*global_count)--;
+    if (view_count == 1)
+        g_hash_table_remove(by_view, key);
+    else
+        g_hash_table_insert(
+            by_view, key, GUINT_TO_POINTER(view_count - 1));
+}
+
+static gboolean
+reserve_pending_slot(PendingDownload *pending)
+{
+    MuxDownloadManager *manager = pending->manager;
+
+    if (!reserve_count(manager,
+                       pending->source_view,
+                       manager->pending_by_view,
+                       &manager->pending_count,
+                       MUX_DOWNLOAD_MAX_PENDING_PER_VIEW,
+                       MUX_DOWNLOAD_MAX_PENDING_GLOBAL))
+        return FALSE;
+    pending->pending_slot_held = TRUE;
+    return TRUE;
+}
+
+static gboolean
+reserve_active_slot(PendingDownload *pending)
+{
+    MuxDownloadManager *manager = pending->manager;
+
+    if (!reserve_count(manager,
+                       pending->source_view,
+                       manager->active_by_view,
+                       &manager->active_count,
+                       MUX_DOWNLOAD_MAX_ACTIVE_PER_VIEW,
+                       MUX_DOWNLOAD_MAX_ACTIVE_GLOBAL))
+        return FALSE;
+    pending->active_slot_held = TRUE;
+    return TRUE;
+}
+
+static void
+release_pending_slot(PendingDownload *pending)
+{
+    MuxDownloadManager *manager = pending->manager;
+
+    if (!pending->pending_slot_held)
+        return;
+    release_count(manager,
+                  pending->source_view,
+                  manager->pending_by_view,
+                  &manager->pending_count);
+    pending->pending_slot_held = FALSE;
+}
+
+static void
+release_active_slot(PendingDownload *pending)
+{
+    MuxDownloadManager *manager = pending->manager;
+
+    if (!pending->active_slot_held)
+        return;
+    release_count(manager,
+                  pending->source_view,
+                  manager->active_by_view,
+                  &manager->active_count);
+    pending->active_slot_held = FALSE;
+}
+
+static void
+release_download_slots(PendingDownload *pending)
+{
+    release_pending_slot(pending);
+    release_active_slot(pending);
+}
 
 static guint64
 next_download_id(MuxDownloadManager *manager)
@@ -129,6 +287,169 @@ default_download_directory(void)
 }
 
 static gchar *
+configured_absolute_path(const gchar *variable)
+{
+    const gchar *value = g_getenv(variable);
+    const gchar *cursor;
+
+    if (!value || !*value || !g_path_is_absolute(value) ||
+        !g_utf8_validate(value, -1, NULL))
+        return NULL;
+    for (cursor = value; *cursor; cursor = g_utf8_next_char(cursor)) {
+        if (g_unichar_iscntrl(g_utf8_get_char(cursor)))
+            return NULL;
+    }
+    return g_canonicalize_filename(value, NULL);
+}
+
+static gboolean
+ensure_secure_export_root(const gchar *path)
+{
+    struct stat status;
+
+    if (g_mkdir_with_parents(path, 0700) < 0 ||
+        g_chmod(path, 0700) < 0 ||
+        g_stat(path, &status) < 0)
+        return FALSE;
+    return safe_destination_directory(&status) &&
+           (status.st_mode & 0777) == 0700;
+}
+
+static gboolean
+ensure_clipboard_directory(MuxDownloadManager *manager, GError **error)
+{
+    g_autofree gchar *export_root = NULL;
+    g_autofree gchar *host_root = NULL;
+    g_autofree gchar *directory_template = NULL;
+    g_autofree gchar *directory_name = NULL;
+    struct stat status;
+    gboolean exported = FALSE;
+
+    if (manager->clipboard_directory)
+        return TRUE;
+
+    export_root = configured_absolute_path("MUX_CLIPBOARD_EXPORT_ROOT");
+    if (export_root && ensure_secure_export_root(export_root)) {
+        directory_template = g_build_filename(
+            export_root, "mux-download-clipboard-XXXXXX", NULL);
+        if (g_mkdtemp_full(directory_template, 0700)) {
+            manager->clipboard_directory =
+                g_steal_pointer(&directory_template);
+            exported = TRUE;
+        } else {
+            g_warning("cannot create configured clipboard export directory: %s",
+                      g_strerror(errno));
+        }
+    } else if (export_root) {
+        g_warning("ignoring unsafe MUX_CLIPBOARD_EXPORT_ROOT");
+    }
+
+    if (!manager->clipboard_directory)
+        manager->clipboard_directory =
+            g_dir_make_tmp("mux-download-clipboard-XXXXXX", error);
+    if (!manager->clipboard_directory)
+        return FALSE;
+    errno = 0;
+    if (g_chmod(manager->clipboard_directory, 0700) < 0 ||
+        g_stat(manager->clipboard_directory, &status) < 0 ||
+        !safe_destination_directory(&status) ||
+        (status.st_mode & 0777) != 0700) {
+        gint saved_errno = errno != 0 ? errno : EPERM;
+
+        g_rmdir(manager->clipboard_directory);
+        g_clear_pointer(&manager->clipboard_directory, g_free);
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "cannot secure clipboard download directory: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+
+    if (exported) {
+        host_root = configured_absolute_path(
+            "MUX_CLIPBOARD_HOST_EXPORT_ROOT");
+        if (host_root) {
+            directory_name = g_path_get_basename(
+                manager->clipboard_directory);
+            manager->clipboard_host_directory = g_build_filename(
+                host_root, directory_name, NULL);
+        }
+    }
+    return TRUE;
+}
+
+static void
+cleanup_clipboard_directory(MuxDownloadManager *manager)
+{
+    guint i;
+
+    if (manager->clipboard_paths) {
+        for (i = 0; i < manager->clipboard_paths->len; i++)
+            g_unlink(g_ptr_array_index(manager->clipboard_paths, i));
+        g_ptr_array_set_size(manager->clipboard_paths, 0);
+    }
+    if (manager->clipboard_directory) {
+        g_rmdir(manager->clipboard_directory);
+        g_clear_pointer(&manager->clipboard_directory, g_free);
+    }
+    if (manager->clipboard_files)
+        g_hash_table_remove_all(manager->clipboard_files);
+    manager->clipboard_bytes = 0;
+    g_clear_pointer(&manager->clipboard_host_directory, g_free);
+}
+
+static gchar *
+validated_destination_path(const gchar *path, GError **error)
+{
+    g_autofree gchar *canonical = NULL;
+    g_autofree gchar *directory = NULL;
+    g_autofree gchar *basename = NULL;
+    g_autofree gchar *safe_basename = NULL;
+    gsize length;
+
+    if (!path || !g_path_is_absolute(path)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "download destination must be absolute");
+        return NULL;
+    }
+    length = strlen(path);
+    if (!length || path[length - 1] == G_DIR_SEPARATOR) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "download destination must name a file");
+        return NULL;
+    }
+
+    canonical = g_canonicalize_filename(path, NULL);
+    directory = g_path_get_dirname(canonical);
+    basename = g_path_get_basename(canonical);
+    safe_basename = sanitize_filename(basename);
+    if (!*basename || !g_str_equal(basename, safe_basename)) {
+        g_set_error_literal(
+            error,
+            G_IO_ERROR,
+            G_IO_ERROR_INVALID_ARGUMENT,
+            "download filename contains hidden, control, path-like, or "
+            "overlong content");
+        return NULL;
+    }
+    if (g_file_test(canonical, G_FILE_TEST_IS_DIR) ||
+        !g_file_test(directory, G_FILE_TEST_IS_DIR)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "download destination must name a file in an "
+                            "existing directory");
+        return NULL;
+    }
+    return g_steal_pointer(&canonical);
+}
+
+static gchar *
 origin_for_view(WebKitWebView *web_view)
 {
     const gchar *uri_string =
@@ -185,34 +506,452 @@ emit_event(PendingDownload *pending,
     manager->event_func(&event, manager->user_data);
 }
 
+static void
+close_owned_fd(gint *descriptor)
+{
+    if (*descriptor >= 0)
+        close(*descriptor);
+    *descriptor = -1;
+}
+
+static gboolean
+same_inode(const struct stat *left, const struct stat *right)
+{
+    return left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino;
+}
+
+static gboolean
+safe_destination_directory(const struct stat *status)
+{
+    return S_ISDIR(status->st_mode) && status->st_uid == geteuid() &&
+           !(status->st_mode & (S_IWGRP | S_IWOTH));
+}
+
+static gboolean
+directory_path_matches(PendingDownload *pending)
+{
+    g_autofree gchar *directory = NULL;
+    struct stat retained_status;
+    struct stat pathname_status;
+    gint pathname_fd;
+    gboolean matches;
+
+    if (pending->directory_fd < 0 || !pending->final_path)
+        return FALSE;
+    directory = g_path_get_dirname(pending->final_path);
+    pathname_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (pathname_fd < 0)
+        return FALSE;
+    matches = fstat(pending->directory_fd, &retained_status) == 0 &&
+              fstat(pathname_fd, &pathname_status) == 0 &&
+              safe_destination_directory(&retained_status) &&
+              safe_destination_directory(&pathname_status) &&
+              same_inode(&retained_status, &pathname_status);
+    close(pathname_fd);
+    return matches;
+}
+
+static gboolean
+safe_owned_regular(const struct stat *status)
+{
+    return S_ISREG(status->st_mode) && status->st_uid == geteuid() &&
+           status->st_nlink == 1;
+}
+
+static gchar *
+clipboard_file_sha256(const gchar *path,
+                      guint64 *size_out,
+                      GError **error)
+{
+    g_autofree guint8 *buffer = g_malloc(128U * 1024U);
+    GChecksum *checksum = NULL;
+    struct stat before;
+    struct stat after;
+    gchar *digest = NULL;
+    gint descriptor;
+
+    descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "cannot open clipboard download for hashing: %s",
+                    g_strerror(errno));
+        return NULL;
+    }
+    if (fstat(descriptor, &before) < 0 ||
+        !safe_owned_regular(&before) || before.st_size < 0) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_DATA,
+                            "clipboard download is not a stable owned file");
+        close(descriptor);
+        return NULL;
+    }
+    if ((guint64)before.st_size > MUX_DOWNLOAD_CLIPBOARD_MAX_BYTES) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "clipboard download exceeds the 512 MiB store limit");
+        close(descriptor);
+        return NULL;
+    }
+
+    checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    for (;;) {
+        ssize_t received = read(descriptor, buffer, 128U * 1024U);
+
+        if (received > 0) {
+            g_checksum_update(checksum, buffer, (gsize)received);
+            continue;
+        }
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received < 0) {
+            g_set_error(error,
+                        G_FILE_ERROR,
+                        g_file_error_from_errno(errno),
+                        "cannot hash clipboard download: %s",
+                        g_strerror(errno));
+            goto out;
+        }
+        break;
+    }
+    if (fstat(descriptor, &after) < 0 ||
+        !same_inode(&before, &after) || before.st_size != after.st_size ||
+        before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+        before.st_mtim.tv_nsec != after.st_mtim.tv_nsec) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_BUSY,
+                            "clipboard download changed while it was hashed");
+        goto out;
+    }
+    digest = g_strdup(g_checksum_get_string(checksum));
+    if (size_out)
+        *size_out = (guint64)before.st_size;
+
+out:
+    g_checksum_free(checksum);
+    close(descriptor);
+    return digest;
+}
+
+static gchar *
+clipboard_stable_filename(const gchar *digest, const gchar *suggested)
+{
+    g_autofree gchar *safe = sanitize_filename(suggested);
+    gsize length = MIN(strlen(safe), (gsize)180);
+
+    while (length && !g_utf8_validate(safe, length, NULL))
+        length--;
+    return g_strdup_printf("%s-%.*s", digest, (gint)length, safe);
+}
+
+static gboolean
+prepare_clipboard_file(PendingDownload *pending,
+                       gchar **local_path_out,
+                       gchar **public_path_out,
+                       guint64 *size_out,
+                       gboolean *already_retained_out,
+                       GError **error)
+{
+    MuxDownloadManager *manager = pending->manager;
+    g_autofree gchar *digest = NULL;
+    g_autofree gchar *filename = NULL;
+    g_autofree gchar *stable_path = NULL;
+    g_autofree gchar *public_path = NULL;
+    ClipboardFileRecord *record;
+    struct stat status;
+    guint64 size = 0;
+
+    digest = clipboard_file_sha256(pending->final_path, &size, error);
+    if (!digest)
+        return FALSE;
+    filename = clipboard_stable_filename(
+        digest,
+        pending->suggested_filename ? pending->suggested_filename
+                                    : pending->final_name);
+    stable_path = g_build_filename(manager->clipboard_directory,
+                                   filename,
+                                   NULL);
+    record = manager->clipboard_files
+                 ? g_hash_table_lookup(manager->clipboard_files, stable_path)
+                 : NULL;
+    if (record) {
+        if (record->size != size || g_stat(stable_path, &status) < 0 ||
+            !safe_owned_regular(&status) || (guint64)status.st_size != size) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_DATA,
+                                "retained clipboard download failed validation");
+            return FALSE;
+        }
+        if (g_unlink(pending->final_path) < 0) {
+            g_set_error(error,
+                        G_FILE_ERROR,
+                        g_file_error_from_errno(errno),
+                        "cannot discard duplicate clipboard download: %s",
+                        g_strerror(errno));
+            return FALSE;
+        }
+        g_free(pending->final_path);
+        pending->final_path = g_strdup(stable_path);
+        *local_path_out = g_strdup(stable_path);
+        *public_path_out = g_strdup(record->public_path);
+        *size_out = size;
+        *already_retained_out = TRUE;
+        return TRUE;
+    }
+
+    if ((manager->clipboard_files &&
+         g_hash_table_size(manager->clipboard_files) >=
+             MUX_DOWNLOAD_CLIPBOARD_MAX_FILES) ||
+        manager->clipboard_bytes > MUX_DOWNLOAD_CLIPBOARD_MAX_BYTES ||
+        size > MUX_DOWNLOAD_CLIPBOARD_MAX_BYTES -
+                   manager->clipboard_bytes) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NO_SPACE,
+                            "clipboard download store is full");
+        return FALSE;
+    }
+    if (g_file_test(stable_path, G_FILE_TEST_EXISTS)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_EXISTS,
+                            "clipboard content-addressed path already exists");
+        return FALSE;
+    }
+    if (g_rename(pending->final_path, stable_path) < 0) {
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "cannot publish content-addressed clipboard download: %s",
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (manager->clipboard_host_directory)
+        public_path = g_build_filename(manager->clipboard_host_directory,
+                                       filename,
+                                       NULL);
+    else
+        public_path = g_strdup(stable_path);
+    g_free(pending->final_path);
+    pending->final_path = g_strdup(stable_path);
+    *local_path_out = g_steal_pointer(&stable_path);
+    *public_path_out = g_steal_pointer(&public_path);
+    *size_out = size;
+    *already_retained_out = FALSE;
+    return TRUE;
+}
+
+static void
+retain_clipboard_file(MuxDownloadManager *manager,
+                      const gchar *local_path,
+                      const gchar *public_path,
+                      guint64 size)
+{
+    ClipboardFileRecord *record = g_new0(ClipboardFileRecord, 1);
+
+    record->size = size;
+    record->public_path = g_strdup(public_path);
+    g_hash_table_insert(manager->clipboard_files,
+                        g_strdup(local_path),
+                        record);
+    g_ptr_array_add(manager->clipboard_paths, g_strdup(local_path));
+    manager->clipboard_bytes += size;
+}
+
+static gboolean
+path_matches_descriptor(gint directory_fd,
+                        const gchar *name,
+                        gint descriptor)
+{
+    struct stat descriptor_status;
+    struct stat path_status;
+
+    if (directory_fd < 0 || descriptor < 0 || !name || !*name ||
+        fstat(descriptor, &descriptor_status) < 0 ||
+        fstatat(directory_fd,
+                name,
+                &path_status,
+                AT_SYMLINK_NOFOLLOW) < 0)
+        return FALSE;
+    return safe_owned_regular(&descriptor_status) &&
+           safe_owned_regular(&path_status) &&
+           same_inode(&descriptor_status, &path_status);
+}
+
 static gboolean
 reservation_matches(PendingDownload *pending)
 {
-    struct stat status;
+    return pending->reservation_active &&
+           path_matches_descriptor(pending->directory_fd,
+                                   pending->final_name,
+                                   pending->reservation_fd);
+}
 
-    if (!pending->reservation_active || !pending->final_path ||
-        g_lstat(pending->final_path, &status) < 0)
-        return FALSE;
-    return S_ISREG(status.st_mode) &&
-           status.st_uid == getuid() &&
-           status.st_dev == pending->reservation_device &&
-           status.st_ino == pending->reservation_inode;
+static gboolean
+partial_matches(PendingDownload *pending)
+{
+    return path_matches_descriptor(pending->directory_fd,
+                                   pending->partial_name,
+                                   pending->partial_fd);
+}
+
+static void
+remove_partial(PendingDownload *pending)
+{
+    if (!pending->identity_mismatch && partial_matches(pending))
+        unlinkat(pending->directory_fd, pending->partial_name, 0);
+    close_owned_fd(&pending->partial_fd);
 }
 
 static void
 remove_reservation(PendingDownload *pending)
 {
-    if (reservation_matches(pending))
-        g_unlink(pending->final_path);
+    if (!pending->identity_mismatch && reservation_matches(pending))
+        unlinkat(pending->directory_fd, pending->final_name, 0);
     pending->reservation_active = FALSE;
+    close_owned_fd(&pending->reservation_fd);
+}
+
+static void
+close_download_descriptors(PendingDownload *pending)
+{
+    close_owned_fd(&pending->partial_fd);
+    close_owned_fd(&pending->reservation_fd);
+    close_owned_fd(&pending->directory_fd);
 }
 
 static void
 cleanup_files(PendingDownload *pending)
 {
-    if (pending->partial_path)
-        g_unlink(pending->partial_path);
+    remove_partial(pending);
     remove_reservation(pending);
+    close_owned_fd(&pending->directory_fd);
+}
+
+static gint
+rename_exchange(gint directory_fd,
+                const gchar *first_name,
+                const gchar *second_name)
+{
+#if defined(__linux__) && defined(SYS_renameat2)
+    return (gint)syscall(SYS_renameat2,
+                         directory_fd,
+                         first_name,
+                         directory_fd,
+                         second_name,
+                         RENAME_EXCHANGE);
+#else
+    (void)directory_fd;
+    (void)first_name;
+    (void)second_name;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static gboolean
+exchange_unavailable(gint error_number)
+{
+    return error_number == ENOSYS || error_number == EINVAL ||
+           error_number == EOPNOTSUPP || error_number == ENOTSUP;
+}
+
+/* Rollback is permitted only for the exact post-exchange layout, and succeeds
+ * only if both original inode/name relationships are restored. */
+static gboolean
+rollback_exchange(PendingDownload *pending, gint *error_number)
+{
+    if (!path_matches_descriptor(pending->directory_fd,
+                                 pending->final_name,
+                                 pending->partial_fd) ||
+        !path_matches_descriptor(pending->directory_fd,
+                                 pending->partial_name,
+                                 pending->reservation_fd)) {
+        pending->identity_mismatch = TRUE;
+        *error_number = ESTALE;
+        return FALSE;
+    }
+    if (rename_exchange(pending->directory_fd,
+                        pending->partial_name,
+                        pending->final_name) < 0) {
+        pending->identity_mismatch = TRUE;
+        *error_number = errno;
+        return FALSE;
+    }
+    if (!reservation_matches(pending) || !partial_matches(pending)) {
+        pending->identity_mismatch = TRUE;
+        *error_number = ESTALE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static gboolean
+retain_partial_descriptor(PendingDownload *pending, GError **error)
+{
+    struct stat status;
+    gint descriptor;
+
+    if (pending->partial_fd >= 0) {
+        if (partial_matches(pending))
+            return TRUE;
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "partial download pathname changed");
+        return FALSE;
+    }
+    descriptor = openat(pending->directory_fd,
+                        pending->partial_name,
+                        O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        if (errno == ENOENT || errno == ELOOP)
+            pending->identity_mismatch = TRUE;
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(errno),
+                    "cannot open partial download: %s",
+                    g_strerror(errno));
+        return FALSE;
+    }
+    if (fstat(descriptor, &status) < 0) {
+        gint saved_errno = errno;
+
+        close(descriptor);
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "cannot inspect partial download: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (!safe_owned_regular(&status)) {
+        pending->identity_mismatch = TRUE;
+        close(descriptor);
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "partial download is not a private regular file");
+        return FALSE;
+    }
+    pending->partial_fd = descriptor;
+    if (!partial_matches(pending)) {
+        pending->identity_mismatch = TRUE;
+        close_owned_fd(&pending->partial_fd);
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "partial download pathname changed while opening");
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static void
@@ -241,18 +980,69 @@ disconnect_download(PendingDownload *pending)
 }
 
 static void
+clear_destination_timeout(PendingDownload *pending)
+{
+    if (pending->destination_timeout_id)
+        g_source_remove(pending->destination_timeout_id);
+    pending->destination_timeout_id = 0;
+}
+
+static gboolean
+prepare_download_cancel(PendingDownload *pending,
+                        const gchar *failure_message)
+{
+    if (pending->state == DOWNLOAD_STATE_CANCELLING ||
+        pending->state == DOWNLOAD_STATE_FAILED ||
+        pending->state == DOWNLOAD_STATE_FINISHED)
+        return FALSE;
+    clear_destination_timeout(pending);
+    if (failure_message) {
+        g_free(pending->failure_message);
+        pending->failure_message = bounded_utf8(failure_message, 8192);
+    }
+    pending->state = DOWNLOAD_STATE_CANCELLING;
+    return TRUE;
+}
+
+static void
+request_download_cancel(PendingDownload *pending,
+                        const gchar *failure_message)
+{
+    if (prepare_download_cancel(pending, failure_message))
+        webkit_download_cancel(pending->download);
+}
+
+static MuxDownloadEventType
+failure_event_type(const PendingDownload *pending,
+                   const GError *error)
+{
+    if (!pending->failure_message && error &&
+        g_error_matches(error,
+                        WEBKIT_DOWNLOAD_ERROR,
+                        WEBKIT_DOWNLOAD_ERROR_CANCELLED_BY_USER))
+        return MUX_DOWNLOAD_EVENT_CANCELLED;
+    return MUX_DOWNLOAD_EVENT_FAILED;
+}
+
+static void
 pending_download_free(PendingDownload *pending)
 {
     if (!pending)
         return;
+    clear_destination_timeout(pending);
+    release_download_slots(pending);
     disconnect_download(pending);
     if (pending->state != DOWNLOAD_STATE_FINISHED)
         cleanup_files(pending);
+    else
+        close_download_descriptors(pending);
     g_clear_object(&pending->download);
     g_clear_object(&pending->source_view);
     g_free(pending->suggested_filename);
     g_free(pending->final_path);
     g_free(pending->partial_path);
+    g_free(pending->final_name);
+    g_free(pending->partial_name);
     g_free(pending->failure_message);
     g_free(pending);
 }
@@ -292,19 +1082,59 @@ reserve_final_path(PendingDownload *pending,
                    const gchar *requested,
                    GError **error)
 {
+    g_autofree gchar *directory = g_path_get_dirname(requested);
+    struct stat directory_status;
+    gint directory_fd;
     guint number;
+
+    directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0) {
+        gint saved_errno = errno;
+
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "cannot open download directory: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (fstat(directory_fd, &directory_status) < 0) {
+        gint saved_errno = errno;
+
+        close(directory_fd);
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "cannot inspect download directory: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (!safe_destination_directory(&directory_status)) {
+        close(directory_fd);
+        g_set_error_literal(
+            error,
+            G_IO_ERROR,
+            G_IO_ERROR_PERMISSION_DENIED,
+            "download directory must be owned by the current user and not "
+            "group- or other-writable");
+        return FALSE;
+    }
 
     for (number = 0; number < 10000; number++) {
         g_autofree gchar *candidate = numbered_path(requested, number);
+        g_autofree gchar *candidate_name =
+            g_path_get_basename(candidate);
         struct stat status;
-        gint descriptor = open(candidate,
-                               O_WRONLY | O_CREAT | O_EXCL |
-                                   O_CLOEXEC | O_NOFOLLOW,
-                               0600);
+        gint descriptor = openat(directory_fd,
+                                 candidate_name,
+                                 O_WRONLY | O_CREAT | O_EXCL |
+                                     O_CLOEXEC | O_NOFOLLOW,
+                                 0600);
 
         if (descriptor < 0) {
             if (errno == EEXIST || errno == ELOOP)
                 continue;
+            close(directory_fd);
             g_set_error(error,
                         G_FILE_ERROR,
                         g_file_error_from_errno(errno),
@@ -315,8 +1145,11 @@ reserve_final_path(PendingDownload *pending,
         if (fstat(descriptor, &status) < 0) {
             gint saved_errno = errno;
 
+            if (path_matches_descriptor(
+                    directory_fd, candidate_name, descriptor))
+                unlinkat(directory_fd, candidate_name, 0);
             close(descriptor);
-            g_unlink(candidate);
+            close(directory_fd);
             g_set_error(error,
                         G_FILE_ERROR,
                         g_file_error_from_errno(saved_errno),
@@ -324,24 +1157,29 @@ reserve_final_path(PendingDownload *pending,
                         g_strerror(saved_errno));
             return FALSE;
         }
-        if (close(descriptor) < 0) {
-            gint saved_errno = errno;
-
-            g_unlink(candidate);
-            g_set_error(error,
-                        G_FILE_ERROR,
-                        g_file_error_from_errno(saved_errno),
-                        "cannot close download destination: %s",
-                        g_strerror(saved_errno));
+        if (!safe_owned_regular(&status) ||
+            !path_matches_descriptor(
+                directory_fd, candidate_name, descriptor)) {
+            if (path_matches_descriptor(
+                    directory_fd, candidate_name, descriptor))
+                unlinkat(directory_fd, candidate_name, 0);
+            close(descriptor);
+            close(directory_fd);
+            g_set_error_literal(error,
+                                G_FILE_ERROR,
+                                G_FILE_ERROR_FAILED,
+                                "download reservation pathname changed");
             return FALSE;
         }
         pending->final_path = g_steal_pointer(&candidate);
-        pending->reservation_device = status.st_dev;
-        pending->reservation_inode = status.st_ino;
+        pending->final_name = g_steal_pointer(&candidate_name);
+        pending->directory_fd = directory_fd;
+        pending->reservation_fd = descriptor;
         pending->reservation_active = TRUE;
         return TRUE;
     }
 
+    close(directory_fd);
     g_set_error_literal(error,
                         G_FILE_ERROR,
                         G_FILE_ERROR_EXIST,
@@ -364,13 +1202,24 @@ choose_partial_path(PendingDownload *pending, GError **error)
             basename,
             pending->download_id,
             g_random_int());
-        g_autofree gchar *candidate =
-            g_build_filename(directory, name, NULL);
         struct stat status;
 
-        if (g_lstat(candidate, &status) < 0 && errno == ENOENT) {
-            pending->partial_path = g_steal_pointer(&candidate);
-            return TRUE;
+        if (fstatat(pending->directory_fd,
+                    name,
+                    &status,
+                    AT_SYMLINK_NOFOLLOW) < 0) {
+            if (errno == ENOENT) {
+                pending->partial_path =
+                    g_build_filename(directory, name, NULL);
+                pending->partial_name = g_steal_pointer(&name);
+                return TRUE;
+            }
+            g_set_error(error,
+                        G_FILE_ERROR,
+                        g_file_error_from_errno(errno),
+                        "cannot inspect partial download destination: %s",
+                        g_strerror(errno));
+            return FALSE;
         }
     }
     g_set_error_literal(error,
@@ -386,29 +1235,12 @@ begin_destination(PendingDownload *pending,
                   GError **error)
 {
     g_autofree gchar *canonical = NULL;
-    g_autofree gchar *directory = NULL;
-    g_autofree gchar *basename = NULL;
     g_autofree gchar *partial_uri = NULL;
 
-    if (!path || !g_path_is_absolute(path)) {
-        g_set_error_literal(error,
-                            G_IO_ERROR,
-                            G_IO_ERROR_INVALID_ARGUMENT,
-                            "download destination must be absolute");
+    clear_destination_timeout(pending);
+    canonical = validated_destination_path(path, error);
+    if (!canonical)
         return FALSE;
-    }
-    canonical = g_canonicalize_filename(path, NULL);
-    directory = g_path_get_dirname(canonical);
-    basename = g_path_get_basename(canonical);
-    if (!g_file_test(directory, G_FILE_TEST_IS_DIR) ||
-        !*basename || g_str_equal(basename, ".") ||
-        g_str_equal(basename, "..")) {
-        g_set_error_literal(error,
-                            G_IO_ERROR,
-                            G_IO_ERROR_INVALID_ARGUMENT,
-                            "download destination directory is invalid");
-        return FALSE;
-    }
     if (!reserve_final_path(pending, canonical, error) ||
         !choose_partial_path(pending, error)) {
         cleanup_files(pending);
@@ -419,32 +1251,175 @@ begin_destination(PendingDownload *pending,
         cleanup_files(pending);
         return FALSE;
     }
+    if (!directory_path_matches(pending)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "download directory pathname changed before "
+                            "handoff");
+        cleanup_files(pending);
+        return FALSE;
+    }
     webkit_download_set_allow_overwrite(pending->download, FALSE);
-    webkit_download_set_destination(pending->download, partial_uri);
     pending->state = DOWNLOAD_STATE_TRANSFERRING;
+    release_pending_slot(pending);
+    webkit_download_set_destination(pending->download, partial_uri);
     return TRUE;
 }
 
 static gboolean
 finalize_download(PendingDownload *pending, GError **error)
 {
+    struct stat reservation_status;
+    gint exchange_errno;
+    gint rollback_errno = 0;
+
+    if (!directory_path_matches(pending)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "download directory pathname changed before "
+                            "finalization");
+        return FALSE;
+    }
+    if (!retain_partial_descriptor(pending, error))
+        return FALSE;
     if (!reservation_matches(pending)) {
+        pending->identity_mismatch = TRUE;
         g_set_error_literal(error,
                             G_FILE_ERROR,
                             G_FILE_ERROR_FAILED,
                             "download destination reservation changed");
         return FALSE;
     }
-    if (g_rename(pending->partial_path, pending->final_path) < 0) {
+    if (!partial_matches(pending)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "partial download pathname changed");
+        return FALSE;
+    }
+    if (fsync(pending->partial_fd) < 0) {
+        gint saved_errno = errno;
+
         g_set_error(error,
                     G_FILE_ERROR,
-                    g_file_error_from_errno(errno),
+                    g_file_error_from_errno(saved_errno),
+                    "cannot synchronize completed download: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (rename_exchange(pending->directory_fd,
+                        pending->partial_name,
+                        pending->final_name) < 0) {
+        exchange_errno = errno;
+        if (exchange_unavailable(exchange_errno)) {
+            g_set_error(error,
+                        G_IO_ERROR,
+                        G_IO_ERROR_NOT_SUPPORTED,
+                        "atomic download finalization is unavailable: %s",
+                        g_strerror(exchange_errno));
+            return FALSE;
+        }
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(exchange_errno),
                     "cannot finalize download: %s",
-                    g_strerror(errno));
+                    g_strerror(exchange_errno));
+        return FALSE;
+    }
+
+    if (!path_matches_descriptor(pending->directory_fd,
+                                 pending->final_name,
+                                 pending->partial_fd) ||
+        !path_matches_descriptor(pending->directory_fd,
+                                 pending->partial_name,
+                                 pending->reservation_fd)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(
+            error,
+            G_FILE_ERROR,
+            G_FILE_ERROR_FAILED,
+            "download destination changed during atomic finalization; no "
+            "further pathname operation was attempted");
+        return FALSE;
+    }
+
+    if (unlinkat(pending->directory_fd, pending->partial_name, 0) < 0) {
+        exchange_errno = errno;
+        if (rollback_exchange(pending, &rollback_errno)) {
+            g_set_error(error,
+                        G_FILE_ERROR,
+                        g_file_error_from_errno(exchange_errno),
+                        "cannot remove download reservation; the exchange "
+                        "was rolled back: %s",
+                        g_strerror(exchange_errno));
+        } else {
+            g_set_error(error,
+                        G_FILE_ERROR,
+                        G_FILE_ERROR_FAILED,
+                        "cannot remove download reservation (%s) and safe "
+                        "rollback failed (%s)",
+                        g_strerror(exchange_errno),
+                        g_strerror(rollback_errno));
+        }
+        return FALSE;
+    }
+
+    if (fstat(pending->reservation_fd, &reservation_status) < 0 ||
+        reservation_status.st_nlink != 0 ||
+        !path_matches_descriptor(pending->directory_fd,
+                                 pending->final_name,
+                                 pending->partial_fd)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "atomic download finalization postcondition "
+                            "failed");
         return FALSE;
     }
     pending->reservation_active = FALSE;
+    if (fsync(pending->directory_fd) < 0) {
+        gint saved_errno = errno;
+
+        g_set_error(error,
+                    G_FILE_ERROR,
+                    g_file_error_from_errno(saved_errno),
+                    "cannot synchronize finalized download directory: %s",
+                    g_strerror(saved_errno));
+        return FALSE;
+    }
+    if (!directory_path_matches(pending) ||
+        !path_matches_descriptor(pending->directory_fd,
+                                 pending->final_name,
+                                 pending->partial_fd)) {
+        pending->identity_mismatch = TRUE;
+        g_set_error_literal(error,
+                            G_FILE_ERROR,
+                            G_FILE_ERROR_FAILED,
+                            "download directory pathname changed while "
+                            "finalizing");
+        return FALSE;
+    }
+    close_download_descriptors(pending);
     return TRUE;
+}
+
+static gboolean
+destination_timeout(gpointer data)
+{
+    PendingDownload *pending = data;
+
+    pending->destination_timeout_id = 0;
+    if (pending->state != DOWNLOAD_STATE_WAITING_DESTINATION)
+        return G_SOURCE_REMOVE;
+    request_download_cancel(pending,
+                            "download destination prompt timed out");
+    return G_SOURCE_REMOVE;
 }
 
 static gboolean
@@ -452,28 +1427,56 @@ on_decide_destination(WebKitDownload *download,
                       const gchar *suggested_filename,
                       PendingDownload *pending)
 {
-    g_autofree gchar *download_directory =
-        default_download_directory();
+    g_autofree gchar *download_directory = NULL;
     g_autofree gchar *safe_name =
         sanitize_filename(suggested_filename);
-    g_autofree gchar *default_path =
-        g_build_filename(download_directory, safe_name, NULL);
+    g_autofree gchar *default_path = NULL;
     g_autoptr(MuxUiRequest) request =
         mux_ui_request_new(MUX_UI_REQUEST_DOWNLOAD_DESTINATION);
     g_autoptr(GBytes) payload = NULL;
     g_autoptr(GError) error = NULL;
+    g_autofree gchar *failure = NULL;
 
     (void)download;
-    if (g_mkdir_with_parents(download_directory, 0700) < 0) {
-        webkit_download_cancel(pending->download);
+    if (pending->state != DOWNLOAD_STATE_NEW) {
+        request_download_cancel(pending,
+                                "download requested a destination twice");
+        return TRUE;
+    }
+    if (pending->clipboard_target) {
+        if (!ensure_clipboard_directory(pending->manager, &error)) {
+            request_download_cancel(pending, error->message);
+            return TRUE;
+        }
+        download_directory =
+            g_strdup(pending->manager->clipboard_directory);
+    } else {
+        download_directory = default_download_directory();
+    }
+    default_path = g_build_filename(download_directory, safe_name, NULL);
+    if (!pending->clipboard_target &&
+        g_mkdir_with_parents(download_directory, 0700) < 0) {
+        failure = g_strdup_printf("cannot create download directory: %s",
+                                  g_strerror(errno));
+        request_download_cancel(pending, failure);
         return TRUE;
     }
     g_free(pending->suggested_filename);
     pending->suggested_filename = g_strdup(safe_name);
     pending->state = DOWNLOAD_STATE_WAITING_DESTINATION;
+    if (pending->clipboard_target) {
+        if (!begin_destination(pending, default_path, &error))
+            request_download_cancel(pending, error->message);
+        return TRUE;
+    }
+    clear_destination_timeout(pending);
+    pending->destination_timeout_id = g_timeout_add(
+        MUX_DOWNLOAD_DESTINATION_TIMEOUT_MS,
+        destination_timeout,
+        pending);
 
     request->request_id = pending->download_id;
-    request->deadline_ms = 300000;
+    request->deadline_ms = MUX_DOWNLOAD_DESTINATION_TIMEOUT_MS;
     request->origin = origin_for_view(pending->source_view);
     request->heading = g_strdup("Download");
     request->message =
@@ -484,8 +1487,12 @@ on_decide_destination(WebKitDownload *download,
         !pending->manager->send_func(pending->source_view,
                                      payload,
                                      pending->manager->user_data,
-                                     &error))
-        webkit_download_cancel(pending->download);
+                                     &error)) {
+        request_download_cancel(
+            pending,
+            error ? error->message
+                  : "could not show the download destination prompt");
+    }
     return TRUE;
 }
 
@@ -494,8 +1501,18 @@ on_created_destination(WebKitDownload *download,
                        const gchar *destination,
                        PendingDownload *pending)
 {
+    g_autoptr(GError) error = NULL;
+
     (void)download;
     (void)destination;
+    if (pending->state != DOWNLOAD_STATE_TRANSFERRING ||
+        pending->destination_emitted)
+        return;
+    if (!retain_partial_descriptor(pending, &error)) {
+        request_download_cancel(pending, error->message);
+        return;
+    }
+    pending->destination_emitted = TRUE;
     emit_event(pending, MUX_DOWNLOAD_EVENT_DESTINATION, NULL);
 }
 
@@ -508,6 +1525,8 @@ on_received_data(WebKitDownload *download,
 
     (void)download;
     (void)data_length;
+    if (pending->state != DOWNLOAD_STATE_TRANSFERRING)
+        return;
     if (now - pending->last_progress_us < 250000)
         return;
     pending->last_progress_us = now;
@@ -519,20 +1538,23 @@ on_failed(WebKitDownload *download,
           GError *error,
           PendingDownload *pending)
 {
-    gboolean cancelled =
-        g_error_matches(error,
-                        WEBKIT_DOWNLOAD_ERROR,
-                        WEBKIT_DOWNLOAD_ERROR_CANCELLED_BY_USER);
+    MuxDownloadEventType event_type;
 
     (void)download;
+    if (pending->state == DOWNLOAD_STATE_FAILED ||
+        pending->state == DOWNLOAD_STATE_FINISHED)
+        return;
+    clear_destination_timeout(pending);
+    event_type = failure_event_type(pending, error);
     pending->state = DOWNLOAD_STATE_FAILED;
-    g_free(pending->failure_message);
-    pending->failure_message = bounded_utf8(error->message, 8192);
+    release_download_slots(pending);
+    if (!pending->failure_message &&
+        event_type == MUX_DOWNLOAD_EVENT_FAILED) {
+        pending->failure_message = bounded_utf8(
+            error ? error->message : "download failed", 8192);
+    }
     cleanup_files(pending);
-    emit_event(pending,
-               cancelled ? MUX_DOWNLOAD_EVENT_CANCELLED
-                         : MUX_DOWNLOAD_EVENT_FAILED,
-               pending->failure_message);
+    emit_event(pending, event_type, pending->failure_message);
 }
 
 static void
@@ -549,14 +1571,92 @@ on_finished(WebKitDownload *download, PendingDownload *pending)
     gboolean emit_terminal = FALSE;
 
     (void)download;
-    if (pending->state != DOWNLOAD_STATE_FAILED) {
-        if (finalize_download(pending, &error)) {
+    clear_destination_timeout(pending);
+    if (pending->state == DOWNLOAD_STATE_CANCELLING) {
+        release_download_slots(pending);
+        cleanup_files(pending);
+        pending->state = DOWNLOAD_STATE_FAILED;
+        event.type = pending->failure_message
+                         ? MUX_DOWNLOAD_EVENT_FAILED
+                         : MUX_DOWNLOAD_EVENT_CANCELLED;
+        event_message = g_strdup(pending->failure_message);
+        emit_terminal = TRUE;
+    } else if (pending->state != DOWNLOAD_STATE_FAILED) {
+        if (finalize_download(pending, &error) &&
+            pending->clipboard_target) {
+            MuxDownloadManager *manager = pending->manager;
+            MuxDownloadClipboardFunc clipboard_func =
+                manager->clipboard_func;
+            WebKitURIResponse *response =
+                webkit_download_get_response(pending->download);
+            g_autofree gchar *mime_type = g_strdup(
+                response ? webkit_uri_response_get_mime_type(response)
+                         : NULL);
+            g_autofree gchar *local_path = NULL;
+            g_autofree gchar *public_path = NULL;
+            WebKitWebView *view = pending->source_view
+                                      ? g_object_ref(pending->source_view)
+                                      : NULL;
+            gpointer callback_data = manager->user_data;
+            guint64 clipboard_size = 0;
+            gboolean already_retained = FALSE;
+            gboolean published = FALSE;
+
+            if (g_chmod(pending->final_path, 0600) < 0) {
+                g_set_error(&error,
+                            G_FILE_ERROR,
+                            g_file_error_from_errno(errno),
+                            "cannot secure clipboard file: %s",
+                            g_strerror(errno));
+            } else if (!clipboard_func) {
+                g_set_error_literal(&error,
+                                    G_IO_ERROR,
+                                    G_IO_ERROR_NOT_SUPPORTED,
+                                    "clipboard publication is unavailable");
+            } else if (prepare_clipboard_file(pending,
+                                              &local_path,
+                                              &public_path,
+                                              &clipboard_size,
+                                              &already_retained,
+                                              &error)) {
+                published = clipboard_func(view,
+                                           local_path,
+                                           public_path,
+                                           mime_type,
+                                           callback_data,
+                                           &error);
+            }
+            if (published && !already_retained)
+                retain_clipboard_file(manager,
+                                      local_path,
+                                      public_path,
+                                      clipboard_size);
+            if (!published && local_path && !already_retained)
+                g_unlink(local_path);
+            if (!published && !local_path)
+                g_unlink(pending->final_path);
+
+            pending->state = published ? DOWNLOAD_STATE_FINISHED
+                                       : DOWNLOAD_STATE_FAILED;
+            event.type = published
+                             ? MUX_DOWNLOAD_EVENT_CLIPBOARD_READY
+                             : MUX_DOWNLOAD_EVENT_CLIPBOARD_FAILED;
+            if (!published)
+                event_message = g_strdup(
+                    error ? error->message
+                          : "clipboard publication failed");
+            emit_terminal = TRUE;
+            if (view)
+                g_object_unref(view);
+        } else if (!error) {
             pending->state = DOWNLOAD_STATE_FINISHED;
             event.type = MUX_DOWNLOAD_EVENT_FINISHED;
         } else {
             pending->state = DOWNLOAD_STATE_FAILED;
             cleanup_files(pending);
-            event.type = MUX_DOWNLOAD_EVENT_FAILED;
+            event.type = pending->clipboard_target
+                             ? MUX_DOWNLOAD_EVENT_CLIPBOARD_FAILED
+                             : MUX_DOWNLOAD_EVENT_FAILED;
             event_message = g_strdup(error->message);
         }
         emit_terminal = TRUE;
@@ -597,14 +1697,24 @@ on_download_started(WebKitNetworkSession *network_session,
                     MuxDownloadManager *manager)
 {
     PendingDownload *pending = g_new0(PendingDownload, 1);
+    WebKitWebView *source_view =
+        webkit_download_get_web_view(download);
 
     (void)network_session;
+    pending->directory_fd = -1;
+    pending->reservation_fd = -1;
+    pending->partial_fd = -1;
     pending->manager = manager;
     pending->download = g_object_ref(download);
-    pending->source_view = webkit_download_get_web_view(download)
-                               ? g_object_ref(
-                                     webkit_download_get_web_view(download))
-                               : NULL;
+    pending->source_view = source_view ? g_object_ref(source_view) : NULL;
+    pending->clipboard_target =
+        g_hash_table_remove(manager->clipboard_requests, download);
+    if (!reserve_pending_slot(pending) ||
+        !reserve_active_slot(pending)) {
+        pending_download_free(pending);
+        webkit_download_cancel(download);
+        return;
+    }
     pending->download_id = next_download_id(manager);
     pending->state = DOWNLOAD_STATE_NEW;
     pending->last_progress_us = g_get_monotonic_time();
@@ -658,6 +1768,20 @@ mux_download_manager_new(WebKitNetworkSession *network_session,
         NULL,
         (GDestroyNotify)pending_download_free);
     manager->by_id = g_hash_table_new(g_int64_hash, g_int64_equal);
+    manager->pending_by_view =
+        g_hash_table_new(g_direct_hash, g_direct_equal);
+    manager->active_by_view =
+        g_hash_table_new(g_direct_hash, g_direct_equal);
+    manager->clipboard_requests = g_hash_table_new_full(g_direct_hash,
+                                                        g_direct_equal,
+                                                        g_object_unref,
+                                                        NULL);
+    manager->clipboard_paths = g_ptr_array_new_with_free_func(g_free);
+    manager->clipboard_files = g_hash_table_new_full(
+        g_str_hash,
+        g_str_equal,
+        g_free,
+        (GDestroyNotify)clipboard_file_record_free);
     manager->send_func = send_func;
     manager->event_func = event_func;
     manager->user_data = user_data;
@@ -692,10 +1816,82 @@ mux_download_manager_free(MuxDownloadManager *manager)
     g_hash_table_remove_all(manager->by_id);
     g_clear_pointer(&manager->by_download, g_hash_table_unref);
     g_clear_pointer(&manager->by_id, g_hash_table_unref);
+    g_assert(manager->pending_count == 0);
+    g_assert(manager->active_count == 0);
+    g_clear_pointer(&manager->pending_by_view, g_hash_table_unref);
+    g_clear_pointer(&manager->active_by_view, g_hash_table_unref);
+    g_clear_pointer(&manager->clipboard_requests, g_hash_table_unref);
+    cleanup_clipboard_directory(manager);
+    g_clear_pointer(&manager->clipboard_files, g_hash_table_unref);
+    g_clear_pointer(&manager->clipboard_paths, g_ptr_array_unref);
     if (manager->user_data_destroy)
         manager->user_data_destroy(manager->user_data);
     g_clear_object(&manager->network_session);
     g_free(manager);
+}
+
+void
+mux_download_manager_set_clipboard_func(
+    MuxDownloadManager *manager,
+    MuxDownloadClipboardFunc clipboard_func)
+{
+    g_return_if_fail(manager);
+    manager->clipboard_func = clipboard_func;
+}
+
+gboolean
+mux_download_manager_download_uri_to_clipboard(
+    MuxDownloadManager *manager,
+    WebKitWebView *source_view,
+    const gchar *uri,
+    GError **error)
+{
+    g_autofree gchar *scheme = NULL;
+    WebKitDownload *download;
+    PendingDownload *pending;
+
+    g_return_val_if_fail(manager, FALSE);
+    g_return_val_if_fail(WEBKIT_IS_WEB_VIEW(source_view), FALSE);
+    if (!uri || !*uri || strlen(uri) > MUX_UI_MAX_PATH ||
+        !g_utf8_validate(uri, -1, NULL)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_INVALID_ARGUMENT,
+                            "clipboard download URI is invalid");
+        return FALSE;
+    }
+    scheme = g_uri_parse_scheme(uri);
+    if (!scheme ||
+        !(g_ascii_strcasecmp(scheme, "http") == 0 ||
+          g_ascii_strcasecmp(scheme, "https") == 0 ||
+          g_ascii_strcasecmp(scheme, "ftp") == 0 ||
+          g_ascii_strcasecmp(scheme, "data") == 0 ||
+          g_ascii_strcasecmp(scheme, "blob") == 0 ||
+          g_ascii_strcasecmp(scheme, "file") == 0)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_NOT_SUPPORTED,
+                            "clipboard download URI scheme is unsupported");
+        return FALSE;
+    }
+
+    download = webkit_web_view_download_uri(source_view, uri);
+    if (!download) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "WebKit did not create the clipboard download");
+        return FALSE;
+    }
+    pending = g_hash_table_lookup(manager->by_download, download);
+    if (pending) {
+        pending->clipboard_target = TRUE;
+    } else {
+        g_hash_table_add(manager->clipboard_requests,
+                         g_object_ref(download));
+    }
+    g_object_unref(download);
+    return TRUE;
 }
 
 gboolean
@@ -719,8 +1915,9 @@ mux_download_manager_handle_payload(MuxDownloadManager *manager,
                 data, length, &download_id, &reason, error))
             return FALSE;
         pending = g_hash_table_lookup(manager->by_id, &download_id);
-        if (pending)
-            webkit_download_cancel(pending->download);
+        if (pending) {
+            request_download_cancel(pending, NULL);
+        }
         return TRUE;
     }
 
@@ -736,20 +1933,25 @@ mux_download_manager_handle_payload(MuxDownloadManager *manager,
             return TRUE;
         if (response->action == MUX_UI_ACTION_CANCEL ||
             response->action == MUX_UI_ACTION_UNSUPPORTED) {
-            webkit_download_cancel(pending->download);
+            request_download_cancel(pending, NULL);
             return TRUE;
         }
         if (response->action != MUX_UI_ACTION_SUBMIT) {
-            webkit_download_cancel(pending->download);
             g_set_error_literal(
                 error,
                 MUX_UI_ERROR,
                 MUX_UI_ERROR_INVALID,
                 "invalid download destination response");
+            request_download_cancel(
+                pending, "invalid download destination response");
             return FALSE;
         }
         if (!begin_destination(pending, response->value, error)) {
-            webkit_download_cancel(pending->download);
+            request_download_cancel(
+                pending,
+                error && *error
+                    ? (*error)->message
+                    : "invalid download destination");
             return FALSE;
         }
         return TRUE;
@@ -771,7 +1973,41 @@ mux_download_manager_cancel(MuxDownloadManager *manager,
     g_return_if_fail(manager);
     pending = g_hash_table_lookup(manager->by_id, &download_id);
     if (pending)
-        webkit_download_cancel(pending->download);
+        request_download_cancel(pending, NULL);
+}
+
+void
+mux_download_manager_cancel_view(MuxDownloadManager *manager,
+                                 WebKitWebView *source_view)
+{
+    GHashTableIter iterator;
+    gpointer value;
+    g_autoptr(GPtrArray) downloads =
+        g_ptr_array_new_with_free_func(g_object_unref);
+
+    g_return_if_fail(manager);
+    g_return_if_fail(WEBKIT_IS_WEB_VIEW(source_view));
+
+    g_hash_table_iter_init(&iterator, manager->by_download);
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        PendingDownload *pending = value;
+
+        if (pending->source_view == source_view)
+            g_ptr_array_add(downloads,
+                            g_object_ref(pending->download));
+    }
+    for (guint index = 0; index < downloads->len; index++) {
+        WebKitDownload *download = g_ptr_array_index(downloads, index);
+        PendingDownload *pending =
+            g_hash_table_lookup(manager->by_download, download);
+
+        if (!pending || pending->source_view != source_view)
+            continue;
+        prepare_download_cancel(pending, NULL);
+        disconnect_download(pending);
+        remove_pending(pending);
+        webkit_download_cancel(download);
+    }
 }
 
 void
@@ -785,10 +2021,14 @@ mux_download_manager_cancel_all(MuxDownloadManager *manager)
 
     g_return_if_fail(manager);
     g_hash_table_iter_init(&iterator, manager->by_download);
-    while (g_hash_table_iter_next(&iterator, NULL, &value))
+    while (g_hash_table_iter_next(&iterator, NULL, &value)) {
+        PendingDownload *pending = value;
+
+        prepare_download_cancel(pending, NULL);
         g_ptr_array_add(
             downloads,
-            g_object_ref(((PendingDownload *)value)->download));
+            g_object_ref(pending->download));
+    }
     for (i = 0; i < downloads->len; i++)
         webkit_download_cancel(g_ptr_array_index(downloads, i));
 }

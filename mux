@@ -1,28 +1,74 @@
 #!/bin/sh
 set -eu
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 
 if [ "$(uname -s)" != "Linux" ]; then
     printf '%s\n' "Mux currently runs on Linux because WPEPlatform is Linux-only." >&2
     exit 1
 fi
 
-for command in kitty kitten meson ninja pkg-config; do
+for command in id kitty kitten meson ninja pkg-config sha256sum stat; do
     if ! command -v "$command" >/dev/null 2>&1; then
         printf '%s\n' "Missing required command: $command" >&2
         exit 1
     fi
 done
 
-if ! pkg-config --atleast-version=2.52 wpe-webkit-2.0 ||
-   ! pkg-config --atleast-version=2.52 wpe-platform-2.0; then
+if [ "$(id -u)" -eq 0 ]; then
+    printf '%s\n' "Run ./mux as an ordinary user, not root." >&2
+    exit 1
+fi
+
+require_kitty_045() {
+    if ! kitty_version_output=$(LC_ALL=C kitty --version 2>/dev/null); then
+        printf '%s\n' "Mux requires Kitty 0.45 or newer, but kitty --version failed." >&2
+        exit 1
+    fi
+
+    case $kitty_version_output in
+        "kitty "*) kitty_version=${kitty_version_output#kitty } ;;
+        *)
+            printf '%s\n' "Mux could not parse Kitty's version output: $kitty_version_output" >&2
+            printf '%s\n' "Install Kitty 0.45 or newer." >&2
+            exit 1
+            ;;
+    esac
+    kitty_version=${kitty_version%% *}
+    case $kitty_version in
+        ''|*[!0-9.]*|.*|*.|*..*|*.*.*.*)
+            printf '%s\n' "Mux could not parse Kitty's version output: $kitty_version_output" >&2
+            printf '%s\n' "Install Kitty 0.45 or newer." >&2
+            exit 1
+            ;;
+        *.*) ;;
+        *)
+            printf '%s\n' "Mux could not parse Kitty's version output: $kitty_version_output" >&2
+            printf '%s\n' "Install Kitty 0.45 or newer." >&2
+            exit 1
+            ;;
+    esac
+
+    kitty_version_major=${kitty_version%%.*}
+    kitty_version_remainder=${kitty_version#*.}
+    kitty_version_minor=${kitty_version_remainder%%.*}
+    if [ "$kitty_version_major" -eq 0 ] && [ "$kitty_version_minor" -lt 45 ]; then
+        printf '%s\n' "Mux requires Kitty 0.45 or newer; found $kitty_version." >&2
+        exit 1
+    fi
+}
+
+require_kitty_045
+
+if ! pkg-config --atleast-version=2.52.5 wpe-webkit-2.0 ||
+   ! pkg-config --atleast-version=2.52.5 wpe-platform-2.0; then
     cat >&2 <<'EOF'
-Mux needs WPE WebKit 2.52 or newer built with:
+Mux needs WPE WebKit 2.52.5 or newer built with:
 
     -DENABLE_WPE_PLATFORM=ON
 
-The required pkg-config modules are wpe-webkit-2.0 and wpe-platform-2.0.
+The required pkg-config modules are wpe-webkit-2.0 and wpe-platform-2.0,
+both at version 2.52.5 or newer.
 See docs/running-wpe.md for the exact runtime boundary.
 EOF
     exit 1
@@ -32,34 +78,22 @@ cache_root=$(printenv XDG_CACHE_HOME 2>/dev/null || true)
 if [ -z "$cache_root" ]; then
     cache_root=$HOME/.cache
 fi
-build_dir=$cache_root/mux/wpe-kitty
+repo_key=$(printf '%s' "$repo_root" | sha256sum)
+repo_key=${repo_key%% *}
+build_dir=$cache_root/mux/checkouts/$repo_key/wpe-kitty
 
 if [ ! -f "$build_dir/build.ninja" ]; then
     mkdir -p "$build_dir"
-    meson setup \
-        --buildtype=release \
-        "$build_dir" \
-        "$repo_root/spikes/wpe-kitty"
+    meson setup --buildtype=release "$build_dir" "$repo_root/spikes/wpe-kitty"
 fi
 
 meson compile -C "$build_dir"
-"$build_dir/muxd" --ensure
 
-PATH=$build_dir:$PATH
-export PATH
+MUX_LAUNCH_MODE=development
+MUX_DEVELOPMENT_ROOT=$repo_root
+MUX_DEVELOPMENT_BIN_DIR=$build_dir
+MUX_DEVELOPMENT_CONFIG=$repo_root/kitty/wpe.conf
+export MUX_LAUNCH_MODE MUX_DEVELOPMENT_ROOT
+export MUX_DEVELOPMENT_BIN_DIR MUX_DEVELOPMENT_CONFIG
 
-if [ "$#" -gt 0 ] && [ "$1" = "ctl" ]; then
-    shift
-    exec "$build_dir/muxctl" "$@"
-fi
-
-MUX_LAYER=main
-MUX_GLOBAL_BAR=1
-KITTY_LISTEN_ON=unix:@mux-kitty-$$
-export MUX_LAYER MUX_GLOBAL_BAR KITTY_LISTEN_ON
-
-exec kitty \
-    --config "$repo_root/kitty/wpe.conf" \
-    --listen-on "$KITTY_LISTEN_ON" \
-    --title Mux \
-    "$build_dir/mux-layer" "$@"
+exec "$repo_root/spikes/wpe-kitty/packaging/mux" "$@"

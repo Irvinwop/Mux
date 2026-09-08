@@ -19,6 +19,22 @@ typedef void (*MuxPaneClipboardFailureFunc)(MuxPaneClipboard *clipboard,
                                            const GError *error,
                                            gpointer user_data);
 
+#define MUX_PANE_CLIPBOARD_FRESH_DISPATCH_TIMEOUT_MS 2000U
+#define MUX_PANE_CLIPBOARD_FRESH_READ_TIMEOUT_MS 10000U
+#define MUX_PANE_CLIPBOARD_FRESH_ENGINE_TIMEOUT_MS 2000U
+#define MUX_PANE_CLIPBOARD_FRESH_PASTE_TIMEOUT_MS \
+    MUX_PANE_CLIPBOARD_FRESH_ENGINE_TIMEOUT_MS
+#define MUX_PANE_CLIPBOARD_MAX_PENDING_PASTES 4U
+#define MUX_PANE_CLIPBOARD_MAX_PENDING_OBSERVATIONS 25U
+#define MUX_PANE_CLIPBOARD_MAX_OBSERVATION_BYTES \
+    MUX_CLIPBOARD_MAX_TOTAL_BYTES
+
+typedef void (*MuxPaneClipboardFreshPasteFunc)(
+    MuxPaneClipboard *clipboard,
+    guint64 request_id,
+    gboolean fresh,
+    gpointer user_data);
+
 MuxPaneClipboard *mux_pane_clipboard_new(
     const gchar *profile,
     gboolean ephemeral,
@@ -50,6 +66,15 @@ gboolean mux_pane_clipboard_handle_engine_packet(
     const guint8 *packet,
     gsize packet_length,
     GError **error);
+
+gboolean mux_pane_clipboard_request_fresh_paste(
+    MuxPaneClipboard *clipboard,
+    guint64 request_id,
+    MuxPaneClipboardFreshPasteFunc callback,
+    gpointer callback_data,
+    GError **error);
+gboolean mux_pane_clipboard_fresh_paste_pending(
+    const MuxPaneClipboard *clipboard);
 
 void mux_pane_clipboard_open_picker(MuxPaneClipboard *clipboard);
 void mux_pane_clipboard_close_picker(MuxPaneClipboard *clipboard);

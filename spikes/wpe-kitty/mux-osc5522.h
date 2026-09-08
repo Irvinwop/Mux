@@ -54,6 +54,8 @@ typedef struct {
     MuxOsc5522EventType type;
     MuxOsc5522RemoteError remote_error;
     MuxOsc5522Location location;
+    /* DATA and DONE may inherit the location from the opening OK. */
+    gboolean has_location;
     gchar *id;
     gchar *mime;
     gchar *password;

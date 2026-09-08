@@ -68,6 +68,8 @@ gboolean mux_clipboard_pane_link_handle_packet(
     const guint8 *packet,
     gsize packet_length,
     GError **error);
+gboolean mux_clipboard_pane_link_write_pending(
+    const MuxClipboardPaneLink *link);
 
 gboolean mux_clipboard_pane_link_apply_history(
     MuxClipboardPaneLink *link,

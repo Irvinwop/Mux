@@ -1,6 +1,7 @@
 #include "mux-engine-protocol.h"
 
 #include <errno.h>
+#include <gio/gio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -98,19 +99,17 @@ send_packet(int fd, const guint8 *data, gsize length)
     return result;
 }
 
-gboolean
-mux_engine_send_message(int fd,
-                        const MuxEngineMessage *message,
-                        GError **error)
+GBytes *
+mux_engine_serialize_message(const MuxEngineMessage *message,
+                             GError **error)
 {
     const guint8 *payload;
     gsize payload_size;
     gsize packet_size;
     guint8 *packet;
-    ssize_t sent;
 
-    g_return_val_if_fail(message != NULL, FALSE);
-    g_return_val_if_fail(message->payload != NULL, FALSE);
+    g_return_val_if_fail(message != NULL, NULL);
+    g_return_val_if_fail(message->payload != NULL, NULL);
 
     payload = g_bytes_get_data(message->payload, &payload_size);
     if (payload_size > MUX_ENGINE_MAX_PAYLOAD) {
@@ -120,7 +119,7 @@ mux_engine_send_message(int fd,
                     "engine payload is %" G_GSIZE_FORMAT " bytes; maximum is %u",
                     payload_size,
                     MUX_ENGINE_MAX_PAYLOAD);
-        return FALSE;
+        return NULL;
     }
 
     if (!message->type) {
@@ -128,7 +127,7 @@ mux_engine_send_message(int fd,
                             MUX_ENGINE_ERROR,
                             MUX_ENGINE_ERROR_PROTOCOL,
                             "engine message type zero is invalid");
-        return FALSE;
+        return NULL;
     }
 
     packet_size = MUX_ENGINE_HEADER_SIZE + payload_size;
@@ -144,8 +143,24 @@ mux_engine_send_message(int fd,
     if (payload_size)
         memcpy(packet + MUX_ENGINE_HEADER_SIZE, payload, payload_size);
 
-    sent = send_packet(fd, packet, packet_size);
-    g_free(packet);
+    return g_bytes_new_take(packet, packet_size);
+}
+
+gboolean
+mux_engine_send_message(int fd,
+                        const MuxEngineMessage *message,
+                        GError **error)
+{
+    g_autoptr(GBytes) packet = NULL;
+    gsize packet_size;
+    gconstpointer packet_data;
+    ssize_t sent;
+
+    packet = mux_engine_serialize_message(message, error);
+    if (!packet)
+        return FALSE;
+    packet_data = g_bytes_get_data(packet, &packet_size);
+    sent = send_packet(fd, packet_data, packet_size);
 
     if (sent < 0) {
         g_set_error(error,
@@ -176,7 +191,10 @@ peek_packet_size(int fd)
     ssize_t result;
 
     do {
-        result = recv(fd, &byte, sizeof(byte), MSG_PEEK | MSG_TRUNC);
+        result = recv(fd,
+                      &byte,
+                      sizeof(byte),
+                      MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT);
     } while (result < 0 && errno == EINTR);
 
     return result;
@@ -187,11 +205,12 @@ discard_packet(int fd)
 {
     guint8 byte;
 
-    while (recv(fd, &byte, sizeof(byte), 0) < 0 && errno == EINTR)
+    while (recv(fd, &byte, sizeof(byte), MSG_DONTWAIT) < 0 &&
+           errno == EINTR)
         ;
 }
 
-gboolean
+MuxEngineReceiveResult
 mux_engine_receive_message(int fd,
                            MuxEngineMessage *message,
                            GError **error)
@@ -203,7 +222,7 @@ mux_engine_receive_message(int fd,
     gsize expected_size;
     GBytes *payload;
 
-    g_return_val_if_fail(message != NULL, FALSE);
+    g_return_val_if_fail(message != NULL, MUX_ENGINE_RECEIVE_ERROR);
     memset(message, 0, sizeof(*message));
 
     peeked = peek_packet_size(fd);
@@ -212,15 +231,17 @@ mux_engine_receive_message(int fd,
                             MUX_ENGINE_ERROR,
                             MUX_ENGINE_ERROR_CLOSED,
                             "engine connection closed");
-        return FALSE;
+        return MUX_ENGINE_RECEIVE_ERROR;
     }
     if (peeked < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return MUX_ENGINE_RECEIVE_WOULD_BLOCK;
         g_set_error(error,
                     MUX_ENGINE_ERROR,
                     MUX_ENGINE_ERROR_IO,
                     "peek engine packet: %s",
                     g_strerror(errno));
-        return FALSE;
+        return MUX_ENGINE_RECEIVE_ERROR;
     }
     if ((gsize)peeked > MUX_ENGINE_HEADER_SIZE + MUX_ENGINE_MAX_PAYLOAD) {
         discard_packet(fd);
@@ -230,22 +251,26 @@ mux_engine_receive_message(int fd,
                     "engine packet is %zd bytes; maximum is %u",
                     peeked,
                     MUX_ENGINE_HEADER_SIZE + MUX_ENGINE_MAX_PAYLOAD);
-        return FALSE;
+        return MUX_ENGINE_RECEIVE_ERROR;
     }
 
     packet = g_malloc((gsize)peeked);
     do {
-        received = recv(fd, packet, (gsize)peeked, 0);
+        received = recv(fd, packet, (gsize)peeked, MSG_DONTWAIT);
     } while (received < 0 && errno == EINTR);
 
     if (received < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            g_free(packet);
+            return MUX_ENGINE_RECEIVE_WOULD_BLOCK;
+        }
         g_set_error(error,
                     MUX_ENGINE_ERROR,
                     MUX_ENGINE_ERROR_IO,
                     "receive engine packet: %s",
                     g_strerror(errno));
         g_free(packet);
-        return FALSE;
+        return MUX_ENGINE_RECEIVE_ERROR;
     }
     if (received != peeked) {
         g_set_error(error,
@@ -255,7 +280,7 @@ mux_engine_receive_message(int fd,
                     peeked,
                     received);
         g_free(packet);
-        return FALSE;
+        return MUX_ENGINE_RECEIVE_ERROR;
     }
     if ((gsize)received < MUX_ENGINE_HEADER_SIZE) {
         g_set_error(error,
@@ -264,7 +289,7 @@ mux_engine_receive_message(int fd,
                     "engine packet is shorter than its %u-byte header",
                     MUX_ENGINE_HEADER_SIZE);
         g_free(packet);
-        return FALSE;
+        return MUX_ENGINE_RECEIVE_ERROR;
     }
     if (read_u32(packet) != MUX_ENGINE_MAGIC) {
         g_set_error_literal(error,
@@ -272,7 +297,7 @@ mux_engine_receive_message(int fd,
                             MUX_ENGINE_ERROR_PROTOCOL,
                             "engine packet has the wrong magic");
         g_free(packet);
-        return FALSE;
+        return MUX_ENGINE_RECEIVE_ERROR;
     }
     if (read_u16(packet + 4) != MUX_ENGINE_VERSION) {
         g_set_error(error,
@@ -281,7 +306,7 @@ mux_engine_receive_message(int fd,
                     "unsupported engine protocol version %u",
                     read_u16(packet + 4));
         g_free(packet);
-        return FALSE;
+        return MUX_ENGINE_RECEIVE_ERROR;
     }
 
     payload_size = read_u32(packet + 12);
@@ -294,7 +319,7 @@ mux_engine_receive_message(int fd,
                     payload_size,
                     (gsize)received - MUX_ENGINE_HEADER_SIZE);
         g_free(packet);
-        return FALSE;
+        return MUX_ENGINE_RECEIVE_ERROR;
     }
     if (!read_u16(packet + 6)) {
         g_set_error_literal(error,
@@ -302,7 +327,7 @@ mux_engine_receive_message(int fd,
                             MUX_ENGINE_ERROR_PROTOCOL,
                             "engine message type zero is invalid");
         g_free(packet);
-        return FALSE;
+        return MUX_ENGINE_RECEIVE_ERROR;
     }
 
     payload = g_bytes_new(packet + MUX_ENGINE_HEADER_SIZE, payload_size);
@@ -312,7 +337,7 @@ mux_engine_receive_message(int fd,
     message->serial = read_u64(packet + 24);
     message->payload = payload;
     g_free(packet);
-    return TRUE;
+    return MUX_ENGINE_RECEIVE_MESSAGE;
 }
 
 void
@@ -480,4 +505,68 @@ mux_engine_cursor_done(const MuxEngineCursor *cursor)
 {
     g_return_val_if_fail(cursor != NULL, FALSE);
     return cursor->offset == cursor->length;
+}
+
+gboolean
+mux_engine_parse_device_scale(const gchar *value,
+                              guint32 *scale_milli,
+                              GError **error)
+{
+    const gchar *cursor;
+    guint64 whole = 0;
+    guint32 fraction = 0;
+    guint fraction_digits = 0;
+    guint64 parsed;
+
+    g_return_val_if_fail(scale_milli != NULL, FALSE);
+    if (value == NULL) {
+        *scale_milli = MUX_ENGINE_DEFAULT_SCALE_MILLI;
+        return TRUE;
+    }
+
+    cursor = value;
+    if (!g_ascii_isdigit(*cursor))
+        goto invalid;
+    while (g_ascii_isdigit(*cursor)) {
+        whole = whole * 10u + (guint)(*cursor - '0');
+        if (whole > MUX_ENGINE_MAX_SCALE_MILLI / 1000u)
+            goto invalid;
+        cursor++;
+    }
+    if (*cursor == '.') {
+        cursor++;
+        if (!g_ascii_isdigit(*cursor))
+            goto invalid;
+        while (g_ascii_isdigit(*cursor)) {
+            if (fraction_digits == 3)
+                goto invalid;
+            fraction = fraction * 10u + (guint)(*cursor - '0');
+            fraction_digits++;
+            cursor++;
+        }
+    }
+    if (*cursor != '\0')
+        goto invalid;
+    while (fraction_digits < 3) {
+        fraction *= 10u;
+        fraction_digits++;
+    }
+    parsed = whole * 1000u + fraction;
+    if (parsed < MUX_ENGINE_MIN_SCALE_MILLI ||
+        parsed > MUX_ENGINE_MAX_SCALE_MILLI)
+        goto invalid;
+
+    *scale_milli = (guint32)parsed;
+    return TRUE;
+
+invalid:
+    g_set_error(error,
+                G_IO_ERROR,
+                G_IO_ERROR_INVALID_ARGUMENT,
+                "%s must be a decimal from %.3f through %.3f with at most "
+                "three fractional digits",
+                MUX_DEVICE_SCALE_ENV,
+                MUX_ENGINE_MIN_SCALE_MILLI / 1000.0,
+                MUX_ENGINE_MAX_SCALE_MILLI / 1000.0);
+    return FALSE;
 }

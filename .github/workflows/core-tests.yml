@@ -1,0 +1,93 @@
+name: Core tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Core / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Linux core dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang libglib2.0-dev meson ninja-build pkg-config
+
+      - name: Install macOS core dependencies
+        if: runner.os == 'macOS'
+        run: brew install glib meson ninja pkgconf
+
+      - name: Configure core with memory and undefined behavior checks
+        env:
+          CC: clang
+        run: >-
+          meson setup build/core spikes/wpe-kitty
+          -Druntime=false --werror --buildtype=debug
+          -Db_sanitize=address,undefined -Db_lundef=false
+
+      - name: Compile core
+        run: meson compile -C build/core -j 2
+
+      - name: Test core
+        env:
+          G_DEBUG: fatal-warnings
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: meson test -C build/core --print-errorlogs --no-rebuild
+
+  privacy-tooling:
+    name: Privacy tooling and dependency integrity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install tooling test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ripgrep
+
+      - name: Test installation and Tor launcher contracts
+        run: |
+          sh scripts/test-user-install.sh
+          bash scripts/test-tor-launcher.sh
+
+      - name: Test privacy report collection and comparison
+        run: |
+          node --test scripts/privacy-evaluation/check.mjs
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/privacy-evaluation/check_server.py
+
+      - name: Test pinned uBlock Origin artifacts and safe staging
+        run: |
+          ubo_dir=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/mux-ubo.XXXXXX")
+          trap 'rm -rf "$ubo_dir"' EXIT
+          for variant in firefox chromium; do
+            python3 scripts/fetch-ublock-origin.py \
+              --variant "$variant" --download \
+              --destination "$ubo_dir/acquired-$variant"
+          done
+          cp "$ubo_dir/acquired-firefox/uBlock0_1.74.0.firefox.signed.xpi" "$ubo_dir/"
+          cp "$ubo_dir/acquired-chromium/uBlock0_1.74.0.chromium.zip" "$ubo_dir/"
+          python3 scripts/test-fetch-ublock-origin.py -v --upstream-artifacts "$ubo_dir"
+          python3 scripts/fetch-ublock-origin.py \
+            --archive "$ubo_dir/uBlock0_1.74.0.firefox.signed.xpi" \
+            --destination "$ubo_dir/default-firefox"

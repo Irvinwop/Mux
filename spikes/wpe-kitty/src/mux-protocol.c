@@ -136,6 +136,22 @@ gchar *mux_read_line(int fd, int timeout_ms)
     }
 }
 
+gboolean mux_require_tor_policy(int fd)
+{
+    g_autofree gchar *response = NULL;
+    g_autofree gchar *expected =
+        g_strdup_printf("TOR_POLICY_OK\t%d", MUX_TOR_POLICY_VERSION);
+
+    if (!mux_send_line(fd, "TOR_POLICY\t%d", MUX_TOR_POLICY_VERSION))
+        return FALSE;
+    response = mux_read_line(fd, 1000);
+    if (g_strcmp0(response, expected) != 0) {
+        errno = EPROTONOSUPPORT;
+        return FALSE;
+    }
+    return TRUE;
+}
+
 gchar *mux_encode(const gchar *value)
 {
     if (!value)

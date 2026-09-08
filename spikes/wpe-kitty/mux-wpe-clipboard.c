@@ -5,32 +5,136 @@
 struct _MuxWpeClipboard {
     WPEClipboard parent_instance;
     MuxClipboardSnapshot *external;
+    MuxWpeClipboardPublishBeginFunc publish_begin_func;
     MuxWpeClipboardPublishFunc publish_func;
+    GDestroyNotify publication_data_destroy;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
+    GMainContext *context;
+    GQueue pending_publications;
     guint64 next_serial;
 };
 
+typedef struct {
+    MuxWpeClipboard *clipboard;
+    MuxClipboardSnapshot *snapshot;
+    MuxWpeClipboardPublishFunc publish_func;
+    GDestroyNotify publication_data_destroy;
+    gpointer publication_data;
+    gpointer user_data;
+    GSource *source;
+} PendingPublication;
+
 G_DEFINE_TYPE(MuxWpeClipboard, mux_wpe_clipboard, WPE_TYPE_CLIPBOARD)
 
+static gboolean
+dispatch_publication(gpointer user_data)
+{
+    PendingPublication *pending = user_data;
+
+    g_queue_remove(&pending->clipboard->pending_publications, pending);
+    pending->source = NULL;
+    pending->publish_func(pending->clipboard,
+                          pending->snapshot,
+                          pending->publication_data,
+                          pending->user_data);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+pending_publication_free(gpointer user_data)
+{
+    PendingPublication *pending = user_data;
+
+    if (pending->source != NULL)
+        g_queue_remove(&pending->clipboard->pending_publications, pending);
+    if (pending->publication_data_destroy != NULL)
+        pending->publication_data_destroy(pending->publication_data);
+    mux_clipboard_snapshot_unref(pending->snapshot);
+    g_object_unref(pending->clipboard);
+    g_free(pending);
+}
+
+static void
+queue_publication(MuxWpeClipboard *clipboard,
+                  MuxClipboardSnapshot *snapshot,
+                  MuxWpeClipboardPublishFunc publish_func,
+                  GDestroyNotify publication_data_destroy,
+                  gpointer publication_data,
+                  gpointer user_data)
+{
+    PendingPublication *pending = g_new0(PendingPublication, 1);
+    GSource *source = g_idle_source_new();
+
+    pending->clipboard = g_object_ref(clipboard);
+    pending->snapshot = mux_clipboard_snapshot_ref(snapshot);
+    pending->publish_func = publish_func;
+    pending->publication_data_destroy = publication_data_destroy;
+    pending->publication_data = publication_data;
+    pending->user_data = user_data;
+    pending->source = source;
+    g_queue_push_tail(&clipboard->pending_publications, pending);
+    g_source_set_callback(source,
+                          dispatch_publication,
+                          pending,
+                          pending_publication_free);
+    g_source_set_name(source, "mux-wpe-clipboard-publication");
+    g_source_attach(source, clipboard->context);
+    g_source_unref(source);
+}
+
+static gpointer
+bounded_realloc(gpointer data, gsize size)
+{
+    if (size > MUX_CLIPBOARD_MAX_ITEM_BYTES)
+        return NULL;
+    return g_realloc(data, size);
+}
+
 static GBytes *
-serialize_content(WPEClipboardContent *content, const gchar *format)
+serialize_content(WPEClipboardContent *content,
+                  const gchar *format,
+                  GError **error)
 {
     GBytes *bytes;
     const gchar *text;
     GOutputStream *stream;
+    gsize length;
 
     bytes = wpe_clipboard_content_get_bytes(content, format);
-    if (bytes != NULL)
+    if (bytes != NULL) {
+        if (g_bytes_get_size(bytes) > MUX_CLIPBOARD_MAX_ITEM_BYTES) {
+            g_set_error_literal(error,
+                                MUX_CLIPBOARD_ERROR,
+                                MUX_CLIPBOARD_ERROR_LIMIT,
+                                "WebKit clipboard format exceeds 16 MiB");
+            return NULL;
+        }
         return g_bytes_ref(bytes);
+    }
 
     text = wpe_clipboard_content_get_text(content);
-    if (text != NULL && g_str_has_prefix(format, "text/plain"))
-        return g_bytes_new(text, strlen(text));
+    if (text != NULL && g_str_has_prefix(format, "text/plain")) {
+        length = strlen(text);
+        if (length > MUX_CLIPBOARD_MAX_ITEM_BYTES) {
+            g_set_error_literal(error,
+                                MUX_CLIPBOARD_ERROR,
+                                MUX_CLIPBOARD_ERROR_LIMIT,
+                                "WebKit clipboard text exceeds 16 MiB");
+            return NULL;
+        }
+        return g_bytes_new(text, length);
+    }
 
-    stream = g_memory_output_stream_new_resizable();
+    stream = g_memory_output_stream_new(NULL, 0, bounded_realloc, g_free);
     if (!wpe_clipboard_content_serialize(content, format, stream) ||
-        !g_output_stream_close(stream, NULL, NULL)) {
+        !g_output_stream_close(stream, NULL, error)) {
+        if (error != NULL && *error == NULL)
+            g_set_error_literal(
+                error,
+                MUX_CLIPBOARD_ERROR,
+                MUX_CLIPBOARD_ERROR_LIMIT,
+                "WebKit clipboard format could not be serialized within 16 MiB");
         g_object_unref(stream);
         return NULL;
     }
@@ -44,41 +148,107 @@ serialize_content(WPEClipboardContent *content, const gchar *format)
 static MuxClipboardSnapshot *
 snapshot_from_content(MuxWpeClipboard *clipboard,
                       GPtrArray *formats,
-                      WPEClipboardContent *content)
+                      WPEClipboardContent *content,
+                      GError **error)
 {
-    MuxClipboardSnapshot *snapshot;
-    g_autoptr(GError) error = NULL;
+    MuxClipboardSnapshotItem items[MUX_CLIPBOARD_MAX_ITEMS] = { 0 };
+    g_autoptr(GHashTable) seen = NULL;
+    g_autoptr(GPtrArray) selected = NULL;
+    g_autoptr(GPtrArray) text_selected = NULL;
+    g_autoptr(GPtrArray) other_selected = NULL;
+    MuxClipboardSnapshot *snapshot = NULL;
+    gsize total = 0;
+    guint item_count = 0;
+    guint pass;
     guint i;
 
-    snapshot = mux_clipboard_snapshot_new(++clipboard->next_serial);
     if (formats == NULL || content == NULL) {
-        mux_clipboard_snapshot_seal(snapshot);
+        snapshot = mux_clipboard_snapshot_new_sealed_from_items(
+            clipboard->next_serial + 1,
+            items,
+            0,
+            error);
+        if (snapshot != NULL)
+            clipboard->next_serial++;
         return snapshot;
     }
 
+    seen = g_hash_table_new(g_str_hash, g_str_equal);
+    selected = g_ptr_array_new();
+    text_selected = g_ptr_array_new();
+    other_selected = g_ptr_array_new();
+
     for (i = 0; i < formats->len; i++) {
         const gchar *format = g_ptr_array_index(formats, i);
-        g_autoptr(GBytes) bytes = NULL;
 
         if (format == NULL)
             break;
-        if (!mux_clipboard_mime_is_valid(format))
+        if (!mux_clipboard_mime_is_valid(format)) {
+            g_warning("WebKit clipboard omitted an invalid MIME type");
             continue;
-        if (mux_clipboard_snapshot_find(snapshot, format) != NULL)
+        }
+        if (g_hash_table_contains(seen, format))
             continue;
+        g_hash_table_add(seen, (gpointer)format);
+        if (g_ascii_strncasecmp(format, "text/", 5) == 0) {
+            if (text_selected->len < MUX_CLIPBOARD_MAX_ITEMS)
+                g_ptr_array_add(text_selected, (gpointer)format);
+        } else if (other_selected->len < MUX_CLIPBOARD_MAX_ITEMS) {
+            g_ptr_array_add(other_selected, (gpointer)format);
+        }
+    }
+    for (i = 0; i < text_selected->len &&
+                selected->len < MUX_CLIPBOARD_MAX_ITEMS; i++)
+        g_ptr_array_add(selected, g_ptr_array_index(text_selected, i));
+    for (i = 0; i < other_selected->len &&
+                selected->len < MUX_CLIPBOARD_MAX_ITEMS; i++)
+        g_ptr_array_add(selected, g_ptr_array_index(other_selected, i));
+    if (text_selected->len + other_selected->len > selected->len) {
+        g_warning("WebKit clipboard omitted excess MIME variants");
+    }
 
-        bytes = serialize_content(content, format);
-        if (bytes == NULL)
-            continue;
-        if (!mux_clipboard_snapshot_add(snapshot, format, bytes, &error)) {
-            g_warning("could not export WebKit clipboard: %s", error->message);
-            mux_clipboard_snapshot_unref(snapshot);
-            snapshot = mux_clipboard_snapshot_new(++clipboard->next_serial);
-            break;
+    /* Prefer text when bounded policy requires omitting MIME variants. */
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i < selected->len; i++) {
+            const gchar *format = g_ptr_array_index(selected, i);
+            g_autoptr(GError) item_error = NULL;
+            gboolean is_text =
+                g_ascii_strncasecmp(format, "text/", 5) == 0;
+            GBytes *bytes;
+            gsize length;
+
+            if (is_text != (pass == 0))
+                continue;
+            bytes = serialize_content(content, format, &item_error);
+            if (bytes == NULL) {
+                g_warning("WebKit clipboard MIME variant omitted: %s",
+                          item_error != NULL ? item_error->message
+                                             : "serialization failed");
+                continue;
+            }
+            length = g_bytes_get_size(bytes);
+            if (length > MUX_CLIPBOARD_MAX_TOTAL_BYTES - total) {
+                g_warning("WebKit clipboard MIME variant omitted: total exceeds 32 MiB");
+                g_bytes_unref(bytes);
+                continue;
+            }
+            items[item_count].mime = format;
+            items[item_count].bytes = bytes;
+            item_count++;
+            total += length;
         }
     }
 
-    mux_clipboard_snapshot_seal(snapshot);
+    snapshot = mux_clipboard_snapshot_new_sealed_from_items(
+        clipboard->next_serial + 1,
+        items,
+        item_count,
+        error);
+    if (snapshot != NULL)
+        clipboard->next_serial++;
+
+    for (i = 0; i < item_count; i++)
+        g_bytes_unref(items[i].bytes);
     return snapshot;
 }
 
@@ -92,6 +262,13 @@ mux_wpe_clipboard_read(WPEClipboard *base, const gchar *format)
         return NULL;
 
     bytes = mux_clipboard_snapshot_find(clipboard->external, format);
+    mux_clipboard_smoke_trace(
+        bytes != NULL ? MUX_CLIPBOARD_TRACE_WPE_READ_HIT
+                      : MUX_CLIPBOARD_TRACE_WPE_READ_MISS,
+        &(MuxClipboardTraceFields) {
+            .snapshot = clipboard->external,
+            .has_text_plain = g_str_has_prefix(format, "text/plain")
+        });
     return bytes != NULL ? g_bytes_ref(bytes) : NULL;
 }
 
@@ -105,13 +282,42 @@ mux_wpe_clipboard_changed(WPEClipboard *base,
     WPEClipboardClass *parent_class =
         WPE_CLIPBOARD_CLASS(mux_wpe_clipboard_parent_class);
     g_autoptr(MuxClipboardSnapshot) snapshot = NULL;
+    g_autoptr(GError) error = NULL;
+    MuxWpeClipboardPublishFunc publish_func = clipboard->publish_func;
+    GDestroyNotify publication_data_destroy =
+        clipboard->publication_data_destroy;
+    gpointer user_data = clipboard->user_data;
+    gpointer publication_data = NULL;
+    gboolean should_publish = is_local && publish_func != NULL;
 
+    if (should_publish && clipboard->publish_begin_func != NULL)
+        publication_data = clipboard->publish_begin_func(clipboard,
+                                                         user_data);
+    if (is_local)
+        snapshot = snapshot_from_content(clipboard,
+                                         formats,
+                                         content,
+                                         &error);
+    if (snapshot != NULL) {
+        g_clear_pointer(&clipboard->external,
+                        mux_clipboard_snapshot_unref);
+        clipboard->external = mux_clipboard_snapshot_ref(snapshot);
+    }
+    if (should_publish && snapshot != NULL) {
+        queue_publication(clipboard,
+                          snapshot,
+                          publish_func,
+                          publication_data_destroy,
+                          publication_data,
+                          user_data);
+        publication_data = NULL;
+    } else if (should_publish && error != NULL) {
+        g_warning("WebKit clipboard publication rejected: %s",
+                  error->message);
+    }
+    if (publication_data != NULL && publication_data_destroy != NULL)
+        publication_data_destroy(publication_data);
     parent_class->changed(base, formats, is_local, content);
-    if (!is_local || clipboard->publish_func == NULL)
-        return;
-
-    snapshot = snapshot_from_content(clipboard, formats, content);
-    clipboard->publish_func(clipboard, snapshot, clipboard->user_data);
 }
 
 static void
@@ -122,6 +328,7 @@ mux_wpe_clipboard_finalize(GObject *object)
     g_clear_pointer(&clipboard->external, mux_clipboard_snapshot_unref);
     if (clipboard->user_data_destroy != NULL)
         clipboard->user_data_destroy(clipboard->user_data);
+    g_clear_pointer(&clipboard->context, g_main_context_unref);
 
     G_OBJECT_CLASS(mux_wpe_clipboard_parent_class)->finalize(object);
 }
@@ -140,12 +347,14 @@ mux_wpe_clipboard_class_init(MuxWpeClipboardClass *clipboard_class)
 static void
 mux_wpe_clipboard_init(MuxWpeClipboard *clipboard)
 {
-    (void)clipboard;
+    g_queue_init(&clipboard->pending_publications);
 }
 
 MuxWpeClipboard *
 mux_wpe_clipboard_new(WPEDisplay *display,
+                      MuxWpeClipboardPublishBeginFunc publish_begin_func,
                       MuxWpeClipboardPublishFunc publish_func,
+                      GDestroyNotify publication_data_destroy,
                       gpointer user_data,
                       GDestroyNotify user_data_destroy)
 {
@@ -157,10 +366,30 @@ mux_wpe_clipboard_new(WPEDisplay *display,
                              "display",
                              display,
                              NULL);
+    clipboard->publish_begin_func = publish_begin_func;
     clipboard->publish_func = publish_func;
+    clipboard->publication_data_destroy = publication_data_destroy;
     clipboard->user_data = user_data;
     clipboard->user_data_destroy = user_data_destroy;
+    clipboard->context = g_main_context_ref_thread_default();
     return clipboard;
+}
+
+void
+mux_wpe_clipboard_stop_publishing(MuxWpeClipboard *clipboard)
+{
+    PendingPublication *pending;
+
+    g_return_if_fail(MUX_IS_WPE_CLIPBOARD(clipboard));
+
+    clipboard->publish_begin_func = NULL;
+    clipboard->publish_func = NULL;
+    while ((pending = g_queue_pop_head(&clipboard->pending_publications))) {
+        GSource *source = pending->source;
+
+        pending->source = NULL;
+        g_source_destroy(source);
+    }
 }
 
 void
@@ -181,12 +410,13 @@ mux_wpe_clipboard_set_external(MuxWpeClipboard *clipboard,
     g_clear_pointer(&clipboard->external, mux_clipboard_snapshot_unref);
     clipboard->external = copy;
 
-    formats = g_ptr_array_new_with_free_func(g_free);
+    formats = g_ptr_array_new();
     for (i = 0; i < mux_clipboard_snapshot_get_count(copy); i++) {
         const gchar *mime = NULL;
 
         mux_clipboard_snapshot_get_item(copy, i, &mime, NULL);
-        g_ptr_array_add(formats, g_strdup(mime));
+        /* WPE matches advertised formats against interned MIME pointers. */
+        g_ptr_array_add(formats, (gpointer)g_intern_string(mime));
     }
     g_ptr_array_add(formats, NULL);
 

@@ -9,6 +9,19 @@ the entry ID, age, source origin and view, pin state, total byte size, safe text
 preview, and every advertised MIME type. Arbitrary binary formats remain fully
 selectable even when their visible preview is only `[binary data]`.
 
+## Panel surface
+
+The picker is a compact opaque panel, bounded to 88 columns and 14 rows with
+up to six visible entries. Empty history and an empty search result have
+different messages, and the footer only offers actions available in the
+current state. While an action is pending, Escape remains available to close
+the panel.
+
+Opening, resizing, and closing the picker clears only its terminal-cell
+footprint rather than deleting the browser image. The detailed
+[rendering contract](../spikes/wpe-kitty/docs/clipboard-picker.md) covers
+geometry, cleanup, and regression tests.
+
 ## Search and ordering
 
 Typing performs case-folded fuzzy subsequence search across the preview, source
@@ -19,15 +32,16 @@ exists.
 
 ## Pane key mapping
 
-The pane adapter will open the picker with `Ctrl+Shift+V` and map Kitty keyboard
+The pane adapter opens the picker with `Super+Shift+V` (`Ctrl+Shift+V` as a
+Linux compatibility alias) and maps Kitty keyboard
 events as follows:
 
 | Key | Picker command |
 | --- | --- |
 | Printable text | Extend query |
 | Backspace | Delete character |
-| `Ctrl+W` | Delete query word |
-| `Ctrl+U` | Clear query |
+| `Super+W` (`Ctrl+W` Linux alias) | Delete query word |
+| `Super+U` (`Ctrl+U` Linux alias) | Clear query |
 | Up/Down | Move selection |
 | Page Up/Page Down | Move one visible page |
 | Home/End | First/last match |

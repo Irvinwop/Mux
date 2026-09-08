@@ -1,0 +1,354 @@
+#!/bin/sh
+set -eu
+
+die() {
+    printf '%s\n' "mux: $1" >&2
+    exit 1
+}
+
+resolve_program() {
+    resolved=$1
+    case $resolved in
+        */*) ;;
+        *)
+            resolved=$(command -v "$resolved" 2>/dev/null) || return 1
+            ;;
+    esac
+    case $resolved in
+        /*) ;;
+        *) resolved=$PWD/$resolved ;;
+    esac
+
+    link_count=0
+    while [ -L "$resolved" ]; do
+        link_count=$((link_count + 1))
+        [ "$link_count" -le 40 ] || return 1
+        resolved_dir=$(
+            CDPATH='' cd -P -- "$(dirname "$resolved")" && pwd -P
+        ) || return 1
+        link_target=$(readlink "$resolved") || return 1
+        case $link_target in
+            /*) resolved=$link_target ;;
+            *) resolved=$resolved_dir/$link_target ;;
+        esac
+    done
+
+    resolved_dir=$(
+        CDPATH='' cd -P -- "$(dirname "$resolved")" && pwd -P
+    ) || return 1
+    printf '%s/%s\n' "$resolved_dir" "$(basename "$resolved")"
+}
+
+launcher_path=$(resolve_program "$0") ||
+    die "could not resolve the launcher path: $0"
+launcher_dir=${launcher_path%/*}
+
+case ${MUX_LAUNCH_MODE:-installed} in
+    installed)
+        launch_mode=installed
+        install_prefix=$(
+            CDPATH='' cd -P -- "$launcher_dir/.." && pwd -P
+        ) || die "could not resolve the installation prefix"
+        bin_dir=$install_prefix/libexec/mux
+        kitty_config=$install_prefix/share/mux/kitty/wpe.conf
+        ;;
+    development)
+        launch_mode=development
+        [ -n "${MUX_DEVELOPMENT_ROOT:-}" ] ||
+            die "development mode needs MUX_DEVELOPMENT_ROOT"
+        [ -n "${MUX_DEVELOPMENT_BIN_DIR:-}" ] ||
+            die "development mode needs MUX_DEVELOPMENT_BIN_DIR"
+        [ -n "${MUX_DEVELOPMENT_CONFIG:-}" ] ||
+            die "development mode needs MUX_DEVELOPMENT_CONFIG"
+        case $MUX_DEVELOPMENT_ROOT:$MUX_DEVELOPMENT_BIN_DIR:$MUX_DEVELOPMENT_CONFIG in
+            /*:/*:/*) ;;
+            *) die "development paths must be absolute" ;;
+        esac
+        install_prefix=$MUX_DEVELOPMENT_ROOT
+        bin_dir=$MUX_DEVELOPMENT_BIN_DIR
+        kitty_config=$MUX_DEVELOPMENT_CONFIG
+        ;;
+    *) die "unknown MUX_LAUNCH_MODE: $MUX_LAUNCH_MODE" ;;
+esac
+
+config_dir=${kitty_config%/*}
+runtime_programs='muxd muxctl mux-bar mux-layer mux-engine mux-pane'
+
+print_paths() {
+    printf 'mode=%s\n' "$launch_mode"
+    printf 'launcher=%s\n' "$launcher_path"
+    printf 'prefix=%s\n' "$install_prefix"
+    printf 'libexec=%s\n' "$bin_dir"
+    printf 'kitty_config=%s\n' "$kitty_config"
+}
+
+uninstall_mux() {
+    [ "$launch_mode" = installed ] ||
+        die "--uninstall is available only from an installed launcher"
+    [ "$launcher_path" = "$install_prefix/bin/mux" ] ||
+        die "refusing to uninstall from a nonstandard launcher path"
+
+    for directory in \
+        "$install_prefix/bin" \
+        "$install_prefix/libexec" \
+        "$bin_dir" \
+        "$install_prefix/share" \
+        "$install_prefix/share/mux" \
+        "$config_dir"
+    do
+        if [ -e "$directory" ] || [ -L "$directory" ]; then
+            [ -d "$directory" ] ||
+                die "refusing to uninstall through a nondirectory path: $directory"
+            [ ! -L "$directory" ] ||
+                die "refusing to uninstall through symlinked directory: $directory"
+        fi
+    done
+
+    for program in $runtime_programs; do
+        rm -f "$bin_dir/$program"
+    done
+    rm -f "$config_dir/kitty.conf" "$config_dir/wpe.conf"
+    rm -f "$launcher_path"
+
+    rmdir "$config_dir" 2>/dev/null || true
+    rmdir "$install_prefix/share/mux" 2>/dev/null || true
+    rmdir "$bin_dir" 2>/dev/null || true
+
+    printf 'Removed Mux program files from %s.\n' "$install_prefix"
+    printf 'Profile data, caches, build trees, and system packages were left intact.\n'
+}
+
+usage() {
+    cat <<'EOF'
+Usage: mux [URL]
+       mux --tor --tor-socks-proxy socks5://127.0.0.1:9050 [URL]
+       mux ctl COMMAND [ARGUMENTS...]
+       mux --print-install-paths
+       mux --uninstall
+
+Launch Mux, send a headless control command, inspect the resolved relocatable
+installation, or remove only the installed Mux program files.
+
+--tor starts a fresh, memory-only profile through an already-running local Tor
+SOCKS5 endpoint. MUX_TOR_SOCKS_PROXY can supply the endpoint instead of the flag.
+Only numeric loopback endpoints are accepted. No Tor service is installed or
+started. This is not Tor Browser and does not provide its anonymity guarantees.
+EOF
+}
+
+positional_only=0
+case ${1:-} in
+    --print-install-paths)
+        [ "$#" -eq 1 ] || die "--print-install-paths takes no arguments"
+        print_paths
+        exit 0
+        ;;
+    --uninstall)
+        [ "$#" -eq 1 ] || die "--uninstall takes no arguments"
+        uninstall_mux
+        exit 0
+        ;;
+    --version)
+        printf 'Mux 0.1.0\n'
+        exit 0
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    --) shift; positional_only=1 ;;
+esac
+
+network_mode=${MUX_NETWORK_MODE-direct}
+network_options=0
+while [ "$#" -gt 0 ] && [ "$positional_only" -eq 0 ]; do
+    case $1 in
+        --tor)
+            network_mode=tor
+            network_options=1
+            shift
+            ;;
+        --tor-socks-proxy)
+            [ "$#" -ge 2 ] || die "--tor-socks-proxy needs a SOCKS5 URI"
+            MUX_TOR_SOCKS_PROXY=$2
+            network_options=1
+            export MUX_TOR_SOCKS_PROXY
+            shift 2
+            ;;
+        --tor-socks-proxy=*)
+            MUX_TOR_SOCKS_PROXY=${1#*=}
+            network_options=1
+            export MUX_TOR_SOCKS_PROXY
+            shift
+            ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+
+if [ "$(uname -s)" != "Linux" ]; then
+    die "Mux currently runs on Linux because WPEPlatform is Linux-only"
+fi
+command -v id >/dev/null 2>&1 || die "missing required command: id"
+uid=$(id -u)
+[ "$uid" -ne 0 ] || die "run Mux as an ordinary user, not root"
+
+for program in $runtime_programs; do
+    [ -x "$bin_dir/$program" ] ||
+        die "missing installed runtime program: $bin_dir/$program"
+done
+
+PATH=$bin_dir:${PATH:-/usr/bin:/bin}
+export PATH
+
+if [ "$#" -gt 0 ] && [ "$1" = ctl ]; then
+    [ "$network_options" -eq 0 ] ||
+        die "Tor launch options cannot be combined with ctl"
+    shift
+    if [ "$#" -gt 0 ] && [ "$1" != stop ]; then
+        "$bin_dir/muxd" --ensure
+    fi
+    exec "$bin_dir/muxctl" "$@"
+fi
+
+case $network_mode in
+    direct)
+        [ "${MUX_TOR_SOCKS_PROXY+x}" != x ] ||
+            die "MUX_TOR_SOCKS_PROXY/--tor-socks-proxy requires --tor"
+        ;;
+    tor)
+        [ -n "${MUX_TOR_SOCKS_PROXY:-}" ] ||
+            die "--tor requires an explicit local SOCKS endpoint: --tor-socks-proxy socks5://127.0.0.1:9050"
+        ;;
+    *) die "unknown MUX_NETWORK_MODE: $network_mode" ;;
+esac
+MUX_NETWORK_MODE=$network_mode
+export MUX_NETWORK_MODE
+
+for command in kitty kitten stat; do
+    command -v "$command" >/dev/null 2>&1 ||
+        die "missing required command: $command"
+done
+[ -r "$kitty_config" ] || die "missing Kitty configuration: $kitty_config"
+
+require_kitty_045() {
+    if ! kitty_version_output=$(LC_ALL=C kitty --version 2>/dev/null); then
+        die "Kitty 0.45 or newer is required, but kitty --version failed"
+    fi
+    case $kitty_version_output in
+        "kitty "*) kitty_version=${kitty_version_output#kitty } ;;
+        *) die "could not parse Kitty's version output: $kitty_version_output" ;;
+    esac
+    kitty_version=${kitty_version%% *}
+    case $kitty_version in
+        ''|*[!0-9.]*|.*|*.|*..*|*.*.*.*)
+            die "could not parse Kitty's version output: $kitty_version_output"
+            ;;
+        *.*) ;;
+        *) die "could not parse Kitty's version output: $kitty_version_output" ;;
+    esac
+    kitty_version_major=${kitty_version%%.*}
+    kitty_version_remainder=${kitty_version#*.}
+    kitty_version_minor=${kitty_version_remainder%%.*}
+    if [ "$kitty_version_major" -eq 0 ] && [ "$kitty_version_minor" -lt 45 ]; then
+        die "Kitty 0.45 or newer is required; found $kitty_version"
+    fi
+}
+
+require_kitty_045
+
+if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
+    printf '%s\n' "Mux needs a Wayland or X11 graphical session to launch Kitty." >&2
+    printf '%s\n' "Use 'mux ctl ...' for headless control commands." >&2
+    exit 1
+fi
+
+MUX_LAYER=main
+MUX_GLOBAL_BAR=1
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    runtime_parent=$XDG_RUNTIME_DIR
+    case $runtime_parent in
+        /*) ;;
+        *) die "XDG_RUNTIME_DIR must be an absolute path" ;;
+    esac
+    [ ! -L "$runtime_parent" ] ||
+        die "XDG_RUNTIME_DIR must not be a symlink: $runtime_parent"
+    [ -e "$runtime_parent" ] ||
+        die "XDG_RUNTIME_DIR does not exist: $runtime_parent"
+    [ -d "$runtime_parent" ] ||
+        die "XDG_RUNTIME_DIR is not a directory: $runtime_parent"
+    runtime_uid=$(stat -c %u -- "$runtime_parent" 2>/dev/null) ||
+        die "could not inspect XDG_RUNTIME_DIR ownership: $runtime_parent"
+    [ "$runtime_uid" = "$uid" ] ||
+        die "XDG_RUNTIME_DIR must be owned by uid $uid: $runtime_parent"
+    runtime_mode=$(stat -c %a -- "$runtime_parent" 2>/dev/null) ||
+        die "could not inspect XDG_RUNTIME_DIR permissions: $runtime_parent"
+    case $runtime_mode in
+        ''|*[!0-7]*)
+            die "could not parse XDG_RUNTIME_DIR mode '$runtime_mode': $runtime_parent"
+            ;;
+    esac
+    [ $((0$runtime_mode & 077)) -eq 0 ] ||
+        die "XDG_RUNTIME_DIR has group or other permission bits: $runtime_parent (mode $runtime_mode)"
+    [ -w "$runtime_parent" ] && [ -x "$runtime_parent" ] ||
+        die "XDG_RUNTIME_DIR must be writable and searchable by uid $uid: $runtime_parent"
+    kitty_runtime=$runtime_parent/mux
+else
+    kitty_runtime=/tmp/mux-$uid
+fi
+
+umask 077
+[ ! -L "$kitty_runtime" ] ||
+    die "refusing symlinked runtime directory: $kitty_runtime"
+mkdir -p -- "$kitty_runtime"
+if [ ! -d "$kitty_runtime" ] || [ -L "$kitty_runtime" ] ||
+   [ "$(stat -c %u -- "$kitty_runtime")" != "$uid" ]; then
+    die "runtime directory is not owned by the current user: $kitty_runtime"
+fi
+chmod 700 -- "$kitty_runtime"
+
+kitty_socket=$kitty_runtime/kitty-$$.sock
+[ "${#kitty_socket}" -lt 100 ] ||
+    die "Kitty control socket path is too long: $kitty_socket"
+rm -f -- "$kitty_socket"
+KITTY_LISTEN_ON=unix:$kitty_socket
+export MUX_LAYER MUX_GLOBAL_BAR KITTY_LISTEN_ON
+
+tor_runtime=
+cleanup_kitty_socket() {
+    rm -f -- "$kitty_socket"
+    if [ -n "$tor_runtime" ]; then
+        rmdir -- "$tor_runtime" 2>/dev/null || true
+    fi
+}
+trap cleanup_kitty_socket EXIT
+
+kitty_title=Mux
+if [ "$network_mode" = tor ]; then
+    command -v mktemp >/dev/null 2>&1 || die "missing required command: mktemp"
+    tor_runtime=$(mktemp -d "$kitty_runtime/tor-private-XXXXXXXXXXXX") ||
+        die "could not create an isolated Tor launch namespace"
+    MUX_PROFILE=${tor_runtime##*/}
+    MUX_EPHEMERAL=1
+    unset MUX_ENGINE_SOCKET MUX_PROFILE_DATA_DIR MUX_PROFILE_CACHE_DIR
+    unset MUX_POPUP_TOKEN
+    export MUX_PROFILE MUX_EPHEMERAL MUX_TOR_SOCKS_PROXY
+    "$bin_dir/mux-engine" --check-network ||
+        die "Tor SOCKS preflight failed; no browser was started"
+    kitty_title='Mux Tor SOCKS'
+    printf '%s\n' "Mux Tor SOCKS: fresh ephemeral profile; WebRTC disabled." >&2
+    printf '%s\n' "The local SOCKS service must be Tor. This is not Tor Browser or a fingerprint-anonymity guarantee." >&2
+fi
+
+if [ "$network_mode" = tor ]; then
+    "$bin_dir/muxd" --ensure-tor-policy ||
+        die "restart the Mux daemon to use Tor; existing sessions were left running"
+else
+    "$bin_dir/muxd" --ensure
+fi
+
+kitty \
+    --config "$kitty_config" \
+    --listen-on "$KITTY_LISTEN_ON" \
+    --title "$kitty_title" \
+    "$bin_dir/mux-layer" "$@"

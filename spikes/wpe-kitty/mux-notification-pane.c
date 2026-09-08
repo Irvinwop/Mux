@@ -6,17 +6,59 @@
 #define MUX_NOTIFICATION_PANE_MAX_PENDING 64U
 
 typedef struct {
+    grefcount references;
     guint64 request_id;
     gboolean clicked;
 } PaneNotification;
 
+static PaneNotification *
+pane_notification_ref(PaneNotification *notification)
+{
+    g_ref_count_inc(&notification->references);
+    return notification;
+}
+
+static void
+pane_notification_unref(PaneNotification *notification)
+{
+    if (g_ref_count_dec(&notification->references))
+        g_free(notification);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(PaneNotification, pane_notification_unref)
+
 struct _MuxNotificationPane {
+    gatomicrefcount references;
     GHashTable *pending;
     MuxNotificationPaneSendFunc send_func;
     MuxNotificationPaneWriteFunc write_func;
     gpointer user_data;
     GDestroyNotify user_data_destroy;
+    gboolean disposing;
 };
+
+static MuxNotificationPane *
+notification_pane_ref(MuxNotificationPane *pane)
+{
+    g_atomic_ref_count_inc(&pane->references);
+    return pane;
+}
+
+static void
+notification_pane_unref(MuxNotificationPane *pane)
+{
+    if (!g_atomic_ref_count_dec(&pane->references))
+        return;
+    g_clear_pointer(&pane->pending, g_hash_table_unref);
+    if (pane->user_data_destroy)
+        pane->user_data_destroy(pane->user_data);
+    g_free(pane);
+}
+
+typedef MuxNotificationPane MuxNotificationPaneGuard;
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxNotificationPaneGuard,
+                              notification_pane_unref)
 
 static guint64 *
 request_key_new(guint64 request_id)
@@ -39,11 +81,13 @@ write_sequence(MuxNotificationPane *pane,
                const gchar *sequence,
                GError **error)
 {
-    return pane->write_func &&
-           pane->write_func((const guint8 *)sequence,
-                            strlen(sequence),
-                            pane->user_data,
-                            error);
+    gboolean written = pane->write_func &&
+        pane->write_func((const guint8 *)sequence,
+                         strlen(sequence),
+                         pane->user_data,
+                         error);
+
+    return written && !pane->disposing;
 }
 
 static gboolean
@@ -71,6 +115,7 @@ write_chunk(MuxNotificationPane *pane,
 static gboolean
 write_part(MuxNotificationPane *pane,
            const gchar *identifier,
+           PaneNotification *pending,
            const gchar *part,
            const gchar *text,
            gboolean *first,
@@ -88,6 +133,9 @@ write_part(MuxNotificationPane *pane,
                           length - offset);
         gboolean done = final_part && offset + chunk == length;
 
+        if (g_hash_table_lookup(pane->pending,
+                                &pending->request_id) != pending)
+            return FALSE;
         if (!write_chunk(pane,
                          identifier,
                          part,
@@ -106,6 +154,7 @@ write_part(MuxNotificationPane *pane,
 static gboolean
 show_notification(MuxNotificationPane *pane,
                   const MuxUiRequest *request,
+                  PaneNotification *pending,
                   GError **error)
 {
     g_autofree gchar *identifier =
@@ -121,6 +170,7 @@ show_notification(MuxNotificationPane *pane,
         title = "Web notification";
     if (!write_part(pane,
                     identifier,
+                    pending,
                     "title",
                     title,
                     &first,
@@ -130,6 +180,7 @@ show_notification(MuxNotificationPane *pane,
     if (has_body &&
         !write_part(pane,
                     identifier,
+                    pending,
                     "body",
                     body,
                     &first,
@@ -158,12 +209,17 @@ send_action(MuxNotificationPane *pane,
             MuxUiAction action,
             GError **error)
 {
+    if (pane->disposing)
+        return FALSE;
+
     g_autoptr(MuxUiResponse) response =
         mux_ui_response_new(request_id, action);
     g_autoptr(GBytes) payload = mux_ui_response_encode(response, error);
 
-    return payload && pane->send_func &&
-           pane->send_func(payload, pane->user_data, error);
+    gboolean sent = payload && pane->send_func &&
+        pane->send_func(payload, pane->user_data, error);
+
+    return sent && !pane->disposing;
 }
 
 MuxNotificationPane *
@@ -177,10 +233,11 @@ mux_notification_pane_new(MuxNotificationPaneSendFunc send_func,
     g_return_val_if_fail(send_func, NULL);
     g_return_val_if_fail(write_func, NULL);
     pane = g_new0(MuxNotificationPane, 1);
+    g_atomic_ref_count_init(&pane->references);
     pane->pending = g_hash_table_new_full(g_int64_hash,
                                          g_int64_equal,
                                          g_free,
-                                         g_free);
+                                         (GDestroyNotify)pane_notification_unref);
     pane->send_func = send_func;
     pane->write_func = write_func;
     pane->user_data = user_data;
@@ -194,18 +251,16 @@ mux_notification_pane_free(MuxNotificationPane *pane)
     GHashTableIter iterator;
     gpointer value;
 
-    if (!pane)
+    if (!pane || pane->disposing)
         return;
+    pane->disposing = TRUE;
     g_hash_table_iter_init(&iterator, pane->pending);
     while (g_hash_table_iter_next(&iterator, NULL, &value)) {
         PaneNotification *pending = value;
 
         (void)close_notification(pane, pending->request_id, NULL);
     }
-    g_hash_table_unref(pane->pending);
-    if (pane->user_data_destroy)
-        pane->user_data_destroy(pane->user_data);
-    g_free(pane);
+    notification_pane_unref(pane);
 }
 
 gboolean
@@ -215,9 +270,13 @@ mux_notification_pane_handle_payload(MuxNotificationPane *pane,
                                      gboolean *consumed,
                                      GError **error)
 {
+    g_autoptr(MuxNotificationPaneGuard) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(pane, FALSE);
+    guard = notification_pane_ref(pane);
+    if (pane->disposing)
+        return FALSE;
     g_return_val_if_fail(consumed, FALSE);
     *consumed = FALSE;
     if (!mux_ui_record_type(data, length, &type, error))
@@ -225,7 +284,7 @@ mux_notification_pane_handle_payload(MuxNotificationPane *pane,
 
     if (type == MUX_UI_RECORD_REQUEST) {
         g_autoptr(MuxUiRequest) request = NULL;
-        PaneNotification *pending;
+        g_autoptr(PaneNotification) pending = NULL;
 
         if (!mux_ui_request_decode(data, length, &request, error))
             return FALSE;
@@ -237,28 +296,35 @@ mux_notification_pane_handle_payload(MuxNotificationPane *pane,
                                request->request_id,
                                MUX_UI_ACTION_UNSUPPORTED,
                                error);
-        pending = g_hash_table_lookup(pane->pending,
-                                      &request->request_id);
-        if (!pending &&
+        if (!g_hash_table_contains(pane->pending, &request->request_id) &&
             g_hash_table_size(pane->pending) >=
                 MUX_NOTIFICATION_PANE_MAX_PENDING)
             return send_action(pane,
                                request->request_id,
                                MUX_UI_ACTION_UNSUPPORTED,
                                error);
-        if (!show_notification(pane, request, error))
-            return send_action(pane,
-                               request->request_id,
-                               MUX_UI_ACTION_UNSUPPORTED,
-                               error);
-        if (!pending) {
-            pending = g_new0(PaneNotification, 1);
-            pending->request_id = request->request_id;
-            g_hash_table_insert(pane->pending,
-                                request_key_new(pending->request_id),
-                                pending);
-        } else {
-            pending->clicked = FALSE;
+        pending = g_new0(PaneNotification, 1);
+        g_ref_count_init(&pending->references);
+        pending->request_id = request->request_id;
+        /* Publication is visible to reentrant cancellation and disposal.
+         * Retain this exact entry so a replacement cannot reuse its address. */
+        g_hash_table_replace(pane->pending,
+                             request_key_new(pending->request_id),
+                             pane_notification_ref(pending));
+        if (!show_notification(pane, request, pending, error)) {
+            if (pane->disposing)
+                return FALSE;
+            if (g_hash_table_lookup(pane->pending,
+                                    &pending->request_id) != pending)
+                return TRUE;
+            g_hash_table_remove(pane->pending, &pending->request_id);
+            /* Preserve the terminal error. A best-effort engine response
+             * must not pass an already populated GError to the encoder. */
+            (void)send_action(pane,
+                              request->request_id,
+                              MUX_UI_ACTION_UNSUPPORTED,
+                              NULL);
+            return FALSE;
         }
         return TRUE;
     }
@@ -266,7 +332,6 @@ mux_notification_pane_handle_payload(MuxNotificationPane *pane,
     if (type == MUX_UI_RECORD_CANCEL) {
         guint64 request_id = 0;
         MuxUiCancelReason reason;
-        PaneNotification *pending;
 
         if (!mux_ui_cancel_decode(data,
                                   length,
@@ -275,13 +340,10 @@ mux_notification_pane_handle_payload(MuxNotificationPane *pane,
                                   error))
             return FALSE;
         (void)reason;
-        pending = g_hash_table_lookup(pane->pending, &request_id);
-        if (!pending)
+        if (!g_hash_table_remove(pane->pending, &request_id))
             return TRUE;
         *consumed = TRUE;
-        if (!close_notification(pane, request_id, error))
-            return FALSE;
-        g_hash_table_remove(pane->pending, &request_id);
+        return close_notification(pane, request_id, error);
     }
     return TRUE;
 }
@@ -314,6 +376,7 @@ mux_notification_pane_handle_osc(MuxNotificationPane *pane,
                                  gsize length,
                                  GError **error)
 {
+    g_autoptr(MuxNotificationPaneGuard) guard = NULL;
     const guint8 *metadata_end;
     g_autofree gchar *metadata = NULL;
     g_auto(GStrv) fields = NULL;
@@ -324,6 +387,9 @@ mux_notification_pane_handle_osc(MuxNotificationPane *pane,
     guint i;
 
     g_return_val_if_fail(pane, FALSE);
+    guard = notification_pane_ref(pane);
+    if (pane->disposing)
+        return FALSE;
     if (!data || length < 8 || memcmp(data, "\033]99;", 5) != 0) {
         g_set_error_literal(error,
                             G_IO_ERROR,
@@ -355,12 +421,11 @@ mux_notification_pane_handle_osc(MuxNotificationPane *pane,
         return TRUE;
 
     if (g_strcmp0(part, "close") == 0) {
-        if (!send_action(pane,
-                         request_id,
-                         MUX_UI_ACTION_CANCEL,
-                         error))
-            return FALSE;
         g_hash_table_remove(pane->pending, &request_id);
+        return send_action(pane,
+                            request_id,
+                            MUX_UI_ACTION_CANCEL,
+                            error);
     } else if (!pending->clicked) {
         pending->clicked = TRUE;
         if (!send_action(pane,

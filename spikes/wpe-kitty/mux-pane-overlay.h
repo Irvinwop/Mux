@@ -67,6 +67,9 @@ gchar *mux_pane_overlay_render(const MuxPaneOverlay *overlay,
 
 gchar *mux_pane_overlay_render_clear(guint rows);
 
+/* Inclusive terminal row interval, used to retire a previous paint on resize. */
+gchar *mux_pane_overlay_render_clear_region(guint first_row, guint last_row);
+
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxPaneOverlay, mux_pane_overlay_free)
 
 G_END_DECLS

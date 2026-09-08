@@ -3,6 +3,7 @@
 #include <string.h>
 
 struct _MuxUiPaneBridge {
+    gatomicrefcount references;
     MuxPaneOverlay *overlay;
     MuxUiPaneSendFunc send_func;
     MuxUiPaneWriteFunc write_func;
@@ -10,8 +11,34 @@ struct _MuxUiPaneBridge {
     GDestroyNotify user_data_destroy;
     guint columns;
     guint rows;
-    gboolean painted;
+    guint painted_first_row;
+    guint painted_last_row;
+    guint64 paint_generation;
+    gboolean disposing;
 };
+
+/* Public autoptrs dispose the owner; scoped callback guards only release refs. */
+typedef MuxUiPaneBridge MuxUiPaneBridgeRef;
+
+static MuxUiPaneBridge *
+ui_pane_bridge_ref(MuxUiPaneBridge *bridge)
+{
+    g_atomic_ref_count_inc(&bridge->references);
+    return bridge;
+}
+
+static void
+ui_pane_bridge_unref(MuxUiPaneBridge *bridge)
+{
+    if (!g_atomic_ref_count_dec(&bridge->references))
+        return;
+    mux_pane_overlay_free(bridge->overlay);
+    if (bridge->user_data_destroy)
+        bridge->user_data_destroy(bridge->user_data);
+    g_free(bridge);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MuxUiPaneBridgeRef, ui_pane_bridge_unref)
 
 static gboolean
 write_ansi(MuxUiPaneBridge *bridge,
@@ -63,6 +90,7 @@ mux_ui_pane_bridge_new(MuxUiPaneSendFunc send_func,
     g_return_val_if_fail(write_func, NULL);
 
     bridge = g_new0(MuxUiPaneBridge, 1);
+    g_atomic_ref_count_init(&bridge->references);
     bridge->overlay = mux_pane_overlay_new();
     bridge->send_func = send_func;
     bridge->write_func = write_func;
@@ -74,18 +102,18 @@ mux_ui_pane_bridge_new(MuxUiPaneSendFunc send_func,
 void
 mux_ui_pane_bridge_free(MuxUiPaneBridge *bridge)
 {
-    if (!bridge)
+    if (!bridge || bridge->disposing)
         return;
-    if (bridge->painted && bridge->rows) {
+    bridge->disposing = TRUE;
+    if (bridge->painted_first_row && bridge->rows) {
         g_autofree gchar *clear =
-            mux_pane_overlay_render_clear(bridge->rows);
+            mux_pane_overlay_render_clear_region(
+                bridge->painted_first_row,
+                MIN(bridge->painted_last_row, bridge->rows));
 
         write_ansi(bridge, clear, NULL);
     }
-    mux_pane_overlay_free(bridge->overlay);
-    if (bridge->user_data_destroy)
-        bridge->user_data_destroy(bridge->user_data);
-    g_free(bridge);
+    ui_pane_bridge_unref(bridge);
 }
 
 gboolean
@@ -93,29 +121,49 @@ mux_ui_pane_bridge_repaint(MuxUiPaneBridge *bridge,
                            gint64 monotonic_us,
                            GError **error)
 {
+    g_autoptr(MuxUiPaneBridgeRef) guard = NULL;
     g_autofree gchar *sequence = NULL;
+    gboolean active;
+    guint first_row;
+    guint64 generation;
 
     g_return_val_if_fail(bridge, FALSE);
+    guard = ui_pane_bridge_ref(bridge);
+    if (bridge->disposing)
+        return FALSE;
+    generation = ++bridge->paint_generation;
     if (!bridge->columns || !bridge->rows)
         return TRUE;
 
-    if (mux_pane_overlay_is_active(bridge->overlay)) {
-        sequence = mux_pane_overlay_render(bridge->overlay,
-                                           bridge->columns,
-                                           bridge->rows,
-                                           monotonic_us);
-        if (!write_ansi(bridge, sequence, error))
+    active = mux_pane_overlay_is_active(bridge->overlay);
+    first_row = bridge->rows - MIN(bridge->rows, MUX_PANE_OVERLAY_ROWS) + 1;
+    if (bridge->painted_first_row &&
+        (!active || bridge->painted_first_row != first_row ||
+         bridge->painted_last_row != bridge->rows)) {
+        sequence = mux_pane_overlay_render_clear_region(
+            bridge->painted_first_row,
+            MIN(bridge->painted_last_row, bridge->rows));
+        if (!write_ansi(bridge, sequence, error) || bridge->disposing)
             return FALSE;
-        bridge->painted = TRUE;
-        return TRUE;
+        /* A callback may have resized or repainted while writing the clear. */
+        if (bridge->paint_generation != generation)
+            return TRUE;
+        bridge->painted_first_row = 0;
+        bridge->painted_last_row = 0;
+        g_clear_pointer(&sequence, g_free);
     }
-
-    if (!bridge->painted)
+    if (!active)
         return TRUE;
-    sequence = mux_pane_overlay_render_clear(bridge->rows);
-    if (!write_ansi(bridge, sequence, error))
+
+    sequence = mux_pane_overlay_render(bridge->overlay,
+                                       bridge->columns,
+                                       bridge->rows,
+                                       monotonic_us);
+    /* Account for partial writes and disposal from inside the writer. */
+    bridge->painted_first_row = first_row;
+    bridge->painted_last_row = bridge->rows;
+    if (!write_ansi(bridge, sequence, error) || bridge->disposing)
         return FALSE;
-    bridge->painted = FALSE;
     return TRUE;
 }
 
@@ -125,9 +173,13 @@ mux_ui_pane_bridge_handle_payload(MuxUiPaneBridge *bridge,
                                   gsize length,
                                   GError **error)
 {
+    g_autoptr(MuxUiPaneBridgeRef) guard = NULL;
     MuxUiRecordType type;
 
     g_return_val_if_fail(bridge, FALSE);
+    guard = ui_pane_bridge_ref(bridge);
+    if (bridge->disposing)
+        return FALSE;
     if (!mux_ui_record_type(data, length, &type, error))
         return FALSE;
 
@@ -179,12 +231,18 @@ finish_response(MuxUiPaneBridge *bridge,
                 gint64 monotonic_us,
                 GError **error)
 {
+    g_autoptr(MuxUiPaneBridgeRef) guard = ui_pane_bridge_ref(bridge);
     g_autoptr(MuxUiResponse) owned_response = response;
     g_autoptr(GError) send_error = NULL;
     gboolean sent;
     gboolean painted;
 
+    bridge = guard;
+    if (bridge->disposing)
+        return FALSE;
     sent = send_response(bridge, owned_response, &send_error);
+    if (bridge->disposing)
+        return FALSE;
     painted = mux_ui_pane_bridge_repaint(
         bridge, monotonic_us, sent ? error : NULL);
     if (!sent) {

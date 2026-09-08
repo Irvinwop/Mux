@@ -59,7 +59,7 @@ clipboard permission.
 
 ## Picker flow
 
-The intended `Ctrl+Shift+V` flow is:
+The `Super+Shift+V` flow (`Ctrl+Shift+V` as a Linux compatibility alias) is:
 
 1. The focused pane asks `muxd` for summaries from its profile history.
 2. The pane renders a Kitty-native fuzzy picker over the negative-z web frame.
