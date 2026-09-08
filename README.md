@@ -114,6 +114,34 @@ Run `./doctor` for a read-only dependency report. See
 [Installation](docs/install.md) for prefix, staging, uninstall, Arch Linux ARM,
 and Nix details.
 
+## Privacy development
+
+The Tor launcher uses an existing local Tor SOCKS service; it does not start or
+manage Tor. For example, with that service listening on port 9050:
+
+```sh
+MUX_TOR_SOCKS_PROXY=socks5://127.0.0.1:9050 ./mux --tor https://check.torproject.org/
+```
+
+Tor launches use a fresh private profile and require compatible engine and
+daemon policies rather than silently reusing a direct-browsing session. See
+[Tor launcher behavior and limits](docs/tor-launcher.md) and
+[network privacy policy](docs/network-privacy-policy.md).
+
+Mux is not Tor Browser. Proxy configuration, private storage, and local test
+results do not establish anonymity, absence of network leaks, or resistance
+to CreepJS or Fingerprint.com. Native browser measurements and external-site
+qualification remain necessary.
+
+The genuine full uBlock Origin dependency is pinned and integrity-checked,
+but its archive is currently **staged, not loaded** by WPE. It does not yet
+provide active blocking. See [uBlock Origin integration](docs/ublock-origin.md)
+for acquisition, licensing, and the remaining extension-host requirements.
+
+The opt-in [privacy evaluation fixture](docs/privacy-evaluation.md) collects
+local window and worker observations for comparison without assigning a
+misleading anonymity score.
+
 ## Core development tests
 
 Clipboard history, broker messages, permission and session storage, URL

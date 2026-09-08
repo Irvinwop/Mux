@@ -295,6 +295,11 @@ save_bookmarks(const MuxBrowserStore *store,
     gsize length;
     guint i;
 
+    /* In-memory stores commit the candidate array without touching a profile
+     * directory, even when a caller is not operating on a private view. */
+    if (store->bookmark_path == NULL)
+        return TRUE;
+
     if (g_mkdir_with_parents(store->profile_directory, 0700) < 0 ||
         g_chmod(store->profile_directory, 0700) < 0) {
         g_set_error(error,
@@ -338,6 +343,21 @@ save_bookmarks(const MuxBrowserStore *store,
 }
 
 MuxBrowserStore *
+mux_browser_store_new_ephemeral(void)
+{
+    MuxBrowserStore *store = g_new0(MuxBrowserStore, 1);
+
+    store->current_views = g_hash_table_new_full(
+        g_int64_hash,
+        g_int64_equal,
+        g_free,
+        (GDestroyNotify)current_view_free);
+    store->bookmarks = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)mux_browser_entry_free);
+    return store;
+}
+
+MuxBrowserStore *
 mux_browser_store_new(const gchar *profile_directory, GError **error)
 {
     MuxBrowserStore *store;
@@ -351,18 +371,11 @@ mux_browser_store_new(const gchar *profile_directory, GError **error)
         return NULL;
     }
 
-    store = g_new0(MuxBrowserStore, 1);
+    store = mux_browser_store_new_ephemeral();
     store->profile_directory = g_strdup(profile_directory);
     store->bookmark_path = g_build_filename(profile_directory,
                                              MUX_BROWSER_BOOKMARK_FILE,
                                              NULL);
-    store->current_views = g_hash_table_new_full(
-        g_int64_hash,
-        g_int64_equal,
-        g_free,
-        (GDestroyNotify)current_view_free);
-    store->bookmarks = g_ptr_array_new_with_free_func(
-        (GDestroyNotify)mux_browser_entry_free);
     if (!load_bookmarks(store, &load_error)) {
         g_warning("bookmark store ignored: %s", load_error->message);
         g_ptr_array_set_size(store->bookmarks, 0);

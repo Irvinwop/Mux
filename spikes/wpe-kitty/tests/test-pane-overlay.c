@@ -1,4 +1,5 @@
 #include "mux-ui-pane.h"
+#include "mux-pane-diagnostic.h"
 
 #include <string.h>
 
@@ -29,6 +30,8 @@ typedef struct {
     guint writes;
     guint sends;
     guint destroyed;
+    MuxPaneDiagnostic diagnostic;
+    gboolean reject_diagnostic_output;
 } Fixture;
 
 static void
@@ -151,8 +154,13 @@ terminal_write(Terminal *terminal, const gchar *sequence)
             continue;
         }
         character = g_utf8_get_char(cursor);
-        width = g_unichar_iswide(character) ? 2 : 1;
+        width = g_unichar_iszerowidth(character)
+            ? 0 : g_unichar_iswide(character) ? 2 : 1;
         g_assert_true(g_unichar_isprint(character));
+        if (!width) {
+            cursor = g_utf8_next_char(cursor);
+            continue;
+        }
         if (terminal->wrap_pending ||
             terminal->column + width > terminal->columns) {
             terminal->wraps++;
@@ -408,6 +416,214 @@ test_disposal_during_send_does_not_outlive_user_data(void)
     fixture_clear(&fixture);
 }
 
+static gboolean
+write_diagnostic(const guint8 *data,
+                  gsize length,
+                  gpointer user_data,
+                  GError **error)
+{
+    Fixture *fixture = user_data;
+
+    if (fixture->reject_diagnostic_output)
+        return FALSE;
+    return write_ansi(data, length, user_data, error);
+}
+
+static gboolean
+show_diagnostic(Fixture *fixture)
+{
+    return mux_pane_diagnostic_show(&fixture->diagnostic,
+                                     7,
+                                     "Rendering engine temporarily unavailable",
+                                     TRUE,
+                                     fixture->terminal.columns,
+                                     fixture->terminal.rows,
+                                     write_diagnostic,
+                                     fixture,
+                                     NULL);
+}
+
+static gboolean
+recover_diagnostic(Fixture *fixture, guint64 generation)
+{
+    return mux_pane_diagnostic_recover(&fixture->diagnostic,
+                                        generation,
+                                        fixture->terminal.rows,
+                                        write_diagnostic,
+                                        fixture,
+                                        NULL);
+}
+
+static void
+test_diagnostic_recovery_clears_only_owned_rows(void)
+{
+    Fixture fixture = { 0 };
+    guint writes;
+
+    fixture_init(&fixture);
+    terminal_write(&fixture.terminal, "\033[9;1HKEEP");
+    g_assert_true(show_diagnostic(&fixture));
+    g_assert_cmpuint(fixture.terminal.cells[0].character, ==, 'M');
+    g_assert_true(recover_diagnostic(&fixture,
+                                     fixture.diagnostic.generation));
+    assert_clear_rows(&fixture.terminal, 1, MUX_PANE_DIAGNOSTIC_ROWS);
+    g_assert_cmpuint(fixture.terminal.cells[8 * 80].character, ==, 'K');
+    g_assert_cmpuint(fixture.terminal.row, ==, 8);
+    g_assert_cmpuint(fixture.terminal.column, ==, 4);
+    g_assert_cmpuint(fixture.diagnostic.painted_rows, ==, 0);
+    writes = fixture.writes;
+    g_assert_true(recover_diagnostic(&fixture,
+                                     fixture.diagnostic.generation));
+    g_assert_cmpuint(fixture.writes, ==, writes);
+    fixture_clear(&fixture);
+}
+
+static void
+test_diagnostic_ignores_stale_frame_success(void)
+{
+    Fixture fixture = { 0 };
+    guint64 previous_generation;
+    guint writes;
+
+    fixture_init(&fixture);
+    g_assert_true(show_diagnostic(&fixture));
+    writes = fixture.writes;
+    g_assert_true(recover_diagnostic(&fixture, 0));
+    g_assert_cmpuint(fixture.writes, ==, writes);
+    previous_generation = fixture.diagnostic.generation;
+    g_assert_true(show_diagnostic(&fixture));
+    writes = fixture.writes;
+    g_assert_true(recover_diagnostic(&fixture, previous_generation));
+    g_assert_cmpuint(fixture.writes, ==, writes);
+    g_assert_cmpuint(fixture.terminal.cells[0].character, ==, 'M');
+    g_assert_false(fixture.diagnostic.recovered);
+    g_assert_true(recover_diagnostic(&fixture,
+                                     fixture.diagnostic.generation));
+    assert_clear_rows(&fixture.terminal, 1, 10);
+    fixture_clear(&fixture);
+}
+
+static void
+test_diagnostic_backpressure_preserves_cleanup(void)
+{
+    Fixture fixture = { 0 };
+
+    fixture_init(&fixture);
+    fixture.reject_diagnostic_output = TRUE;
+    g_assert_false(show_diagnostic(&fixture));
+    g_assert_cmpuint(fixture.diagnostic.painted_rows, ==, 0);
+    g_assert_cmpuint(fixture.diagnostic.generation, ==, 0);
+    fixture.reject_diagnostic_output = FALSE;
+    g_assert_true(show_diagnostic(&fixture));
+    fixture.reject_diagnostic_output = TRUE;
+    g_assert_false(recover_diagnostic(&fixture,
+                                      fixture.diagnostic.generation));
+    g_assert_cmpuint(fixture.diagnostic.painted_rows,
+                     ==, MUX_PANE_DIAGNOSTIC_ROWS);
+    g_assert_true(fixture.diagnostic.recovered);
+    g_assert_cmpuint(fixture.terminal.cells[0].character, ==, 'M');
+    fixture.reject_diagnostic_output = FALSE;
+    g_assert_true(recover_diagnostic(&fixture,
+                                     fixture.diagnostic.generation));
+    assert_clear_rows(&fixture.terminal, 1, 10);
+    g_assert_false(fixture.diagnostic.recovered);
+    fixture_clear(&fixture);
+}
+
+static void
+test_diagnostic_handoff_preserves_live_prompt(void)
+{
+    Fixture fixture = { 0 };
+    g_autofree Cell *prompt_cells = NULL;
+    gsize cells_size;
+    guint writes;
+
+    fixture_init(&fixture);
+    terminal_resize(&fixture.terminal, 20, 3);
+    g_assert_true(mux_ui_pane_bridge_set_size(fixture.bridge, 20, 3, NULL));
+    g_assert_true(show_diagnostic(&fixture));
+    g_assert_true(mux_pane_diagnostic_clear(&fixture.diagnostic,
+                                            fixture.terminal.rows,
+                                            write_diagnostic,
+                                            &fixture,
+                                            NULL));
+    g_assert_true(fixture_show(&fixture));
+    cells_size = sizeof(Cell) * fixture.terminal.columns * fixture.terminal.rows;
+    prompt_cells = g_memdup2(fixture.terminal.cells, cells_size);
+    writes = fixture.writes;
+    g_assert_true(recover_diagnostic(&fixture,
+                                     fixture.diagnostic.generation));
+    g_assert_cmpuint(fixture.writes, ==, writes);
+    g_assert_cmpmem(fixture.terminal.cells, cells_size,
+                    prompt_cells, cells_size);
+    g_assert_true(mux_ui_pane_bridge_is_active(fixture.bridge));
+    fixture_clear(&fixture);
+}
+
+static void
+test_diagnostic_narrow_geometry_and_resize(void)
+{
+    for (guint columns = 1; columns <= 4; columns++) {
+        for (guint rows = 1; rows <= MUX_PANE_DIAGNOSTIC_ROWS; rows++) {
+            Fixture fixture = { 0 };
+
+            fixture_init(&fixture);
+            terminal_resize(&fixture.terminal, columns, rows);
+            g_assert_true(mux_pane_diagnostic_show(
+                &fixture.diagnostic, 7, "\xe7\x95\x8c e\xcc\x81\033[2J",
+                FALSE, columns, rows, write_diagnostic, &fixture, NULL));
+            for (guint index = 0; index < columns * rows; index++)
+                g_assert_cmpuint(fixture.terminal.cells[index].background,
+                                 ==, 52);
+            g_assert_true(recover_diagnostic(&fixture,
+                                             fixture.diagnostic.generation));
+            assert_clear_rows(&fixture.terminal, 1, rows);
+            fixture_clear(&fixture);
+        }
+    }
+    {
+        Fixture fixture = { 0 };
+
+        fixture_init(&fixture);
+        g_assert_true(show_diagnostic(&fixture));
+        terminal_resize(&fixture.terminal, 2, 1);
+        g_assert_true(recover_diagnostic(&fixture,
+                                         fixture.diagnostic.generation));
+        assert_clear_rows(&fixture.terminal, 1, 1);
+        terminal_resize(&fixture.terminal, 80, 16);
+        g_assert_true(show_diagnostic(&fixture));
+        g_assert_true(recover_diagnostic(&fixture,
+                                         fixture.diagnostic.generation));
+        assert_clear_rows(&fixture.terminal, 1, 16);
+        fixture_clear(&fixture);
+    }
+}
+
+static void
+test_diagnostic_zero_geometry_defers_recovery(void)
+{
+    Fixture fixture = { 0 };
+    guint writes;
+
+    fixture_init(&fixture);
+    g_assert_true(show_diagnostic(&fixture));
+    writes = fixture.writes;
+    g_assert_true(mux_pane_diagnostic_recover(&fixture.diagnostic,
+                                              fixture.diagnostic.generation,
+                                              0,
+                                              write_diagnostic,
+                                              &fixture,
+                                              NULL));
+    g_assert_cmpuint(fixture.writes, ==, writes);
+    g_assert_true(fixture.diagnostic.recovered);
+    g_assert_cmpuint(fixture.diagnostic.painted_rows,
+                     ==, MUX_PANE_DIAGNOSTIC_ROWS);
+    g_assert_true(recover_diagnostic(&fixture,
+                                     fixture.diagnostic.generation));
+    assert_clear_rows(&fixture.terminal, 1, 10);
+    fixture_clear(&fixture);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -426,5 +642,17 @@ main(int argc, char **argv)
                     test_disposal_during_first_write_clears_prompt);
     g_test_add_func("/pane-overlay/lifetime/dispose-during-send",
                     test_disposal_during_send_does_not_outlive_user_data);
+    g_test_add_func("/pane-diagnostic/recovery/owned-rows",
+                    test_diagnostic_recovery_clears_only_owned_rows);
+    g_test_add_func("/pane-diagnostic/recovery/stale-frame",
+                    test_diagnostic_ignores_stale_frame_success);
+    g_test_add_func("/pane-diagnostic/recovery/backpressure",
+                    test_diagnostic_backpressure_preserves_cleanup);
+    g_test_add_func("/pane-diagnostic/recovery/live-prompt",
+                    test_diagnostic_handoff_preserves_live_prompt);
+    g_test_add_func("/pane-diagnostic/geometry/narrow-resize",
+                    test_diagnostic_narrow_geometry_and_resize);
+    g_test_add_func("/pane-diagnostic/geometry/zero-size",
+                    test_diagnostic_zero_geometry_defers_recovery);
     return g_test_run();
 }

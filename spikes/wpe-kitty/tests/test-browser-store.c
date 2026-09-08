@@ -178,6 +178,64 @@ test_unsafe_uris_are_not_replayed_or_persisted(void)
     remove_profile(directory);
 }
 
+static void
+test_ephemeral_store_never_loads_or_persists_bookmarks(void)
+{
+    g_autofree gchar *directory = temporary_profile();
+    g_autoptr(MuxBrowserStore) persistent =
+        mux_browser_store_new(directory, NULL);
+    g_autoptr(MuxBrowserStore) memory = NULL;
+    g_autoptr(GError) error = NULL;
+
+    g_assert_true(mux_browser_store_set_bookmarked(persistent,
+                                                   FALSE,
+                                                   "https://direct.test/",
+                                                   "Direct",
+                                                   TRUE,
+                                                   &error));
+    g_assert_no_error(error);
+    memory = mux_browser_store_new_ephemeral();
+    g_assert_nonnull(memory);
+    g_assert_cmpuint(mux_browser_store_bookmark_count(memory, FALSE), ==, 0);
+    g_assert_true(mux_browser_store_set_bookmarked(memory,
+                                                   FALSE,
+                                                   "https://memory.test/",
+                                                   "Memory",
+                                                   TRUE,
+                                                   &error));
+    g_assert_no_error(error);
+    g_assert_true(mux_browser_store_is_bookmarked(memory,
+                                                  FALSE,
+                                                  "https://memory.test/"));
+    g_assert_true(mux_browser_store_set_bookmarked(memory,
+                                                   FALSE,
+                                                   "https://memory.test/",
+                                                   "Memory",
+                                                   FALSE,
+                                                   &error));
+    g_assert_no_error(error);
+    g_assert_cmpuint(mux_browser_store_bookmark_count(memory, FALSE), ==, 0);
+    g_assert_false(mux_browser_store_set_bookmarked(memory,
+                                                    TRUE,
+                                                    "https://private.test/",
+                                                    "Private",
+                                                    TRUE,
+                                                    &error));
+    g_assert_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED);
+    g_clear_error(&error);
+    g_clear_pointer(&memory, mux_browser_store_free);
+    memory = mux_browser_store_new_ephemeral();
+    g_assert_cmpuint(mux_browser_store_bookmark_count(memory, FALSE), ==, 0);
+    g_clear_pointer(&persistent, mux_browser_store_free);
+    persistent = mux_browser_store_new(directory, &error);
+    g_assert_no_error(error);
+    g_assert_cmpuint(mux_browser_store_bookmark_count(persistent, FALSE), ==, 1);
+    g_assert_true(mux_browser_store_is_bookmarked(persistent,
+                                                  FALSE,
+                                                  "https://direct.test/"));
+    remove_profile(directory);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -192,5 +250,7 @@ main(int argc, char **argv)
                     test_bookmarks_persist_but_private_does_not);
     g_test_add_func("/browser-store/unsafe-uri",
                     test_unsafe_uris_are_not_replayed_or_persisted);
+    g_test_add_func("/browser-store/ephemeral-no-persistence",
+                    test_ephemeral_store_never_loads_or_persists_bookmarks);
     return g_test_run();
 }

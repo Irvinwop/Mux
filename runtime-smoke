@@ -514,6 +514,7 @@ wait_frame_ack() {
     local kitty_window=$1
     local expected_url=$2
     local expected_title=$3
+    local after_line=${4:-0}
     local kitty_hash uri_hash title_hash attempt
 
     kitty_hash=$(sha256_text "$kitty_window")
@@ -523,8 +524,9 @@ wait_frame_ack() {
         if awk -F '\t' \
             -v kitty_hash="$kitty_hash" \
             -v uri_hash="$uri_hash" \
-            -v title_hash="$title_hash" '
-                $1 == "KITTY_FRAME_ACK" &&
+            -v title_hash="$title_hash" \
+            -v after_line="$after_line" '
+                NR > after_line && $1 == "KITTY_FRAME_ACK" &&
                 $2 ~ /^view=[1-9][0-9]*$/ &&
                 $3 ~ /^serial=[1-9][0-9]*$/ &&
                 $4 == "kitty_sha256=" kitty_hash &&
@@ -540,7 +542,308 @@ wait_frame_ack() {
         assert_core_alive
         sleep 0.05
     done
-    fail "positive Kitty FRAME_ACK was not observed for $expected_title within the polling deadline"
+    fail "positive Kitty FRAME_ACK was not observed for $expected_title after trace line $after_line within the polling deadline"
+}
+
+frame_ack_fence() {
+    awk 'END { print NR + 0 }' "$FRAME_ACK_TELEMETRY"
+}
+
+owned_web_process() {
+    local action=$1
+    local engine_pid=$2
+    local expected_identity=${3:-}
+
+    # Never search by a global process name. The process tree starts at the
+    # exact background engine launched by this harness for its isolated pane.
+    python3 - "$action" "$engine_pid" "$expected_identity" "$$" \
+        "$BIN_DIR/mux-engine" "$MUX_SMOKE_ID" "$ISOLATED_ENGINE_SOCKET" \
+        "$XDG_RUNTIME_DIR" "$ISOLATED_PROFILE" <<'PY'
+import os
+from pathlib import Path
+import select
+import signal
+import sys
+
+action, engine_arg, expected, harness_arg, binary, marker, socket_path, runtime, profile = sys.argv[1:]
+engine_pid = int(engine_arg)
+harness_pid = int(harness_arg)
+web_process_names = {"WPEWebProcess", "WebKitWebProcess"}
+
+
+def refuse(message):
+    print(f"runtime-smoke: refusing WebProcess operation: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def process_stat(pid):
+    fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+    if len(fields) < 20:
+        refuse(f"malformed process identity for PID {pid}")
+    return fields[0], int(fields[1]), int(fields[19])
+
+
+def require_uid(pid):
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith("Uid:"):
+            real, effective, *_ = map(int, line.split()[1:])
+            if real == os.getuid() and effective == os.geteuid():
+                return
+            break
+    refuse(f"PID {pid} does not belong to the smoke-test UID")
+
+
+def ancestry(pid, engine_start):
+    chain = []
+    for _ in range(64):
+        if pid <= 1 or pid in chain:
+            break
+        chain.append(pid)
+        state, parent, started = process_stat(pid)
+        if state == "Z":
+            refuse(f"PID {pid} is already a zombie")
+        if pid == engine_pid:
+            if started != engine_start:
+                refuse("owned engine identity changed")
+            return chain
+        pid = parent
+    refuse("target is not a current descendant of the owned engine")
+
+
+def children(pid):
+    result = set()
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        try:
+            result.update(map(int, (task / "children").read_text().split()))
+        except FileNotFoundError:
+            continue
+    return result
+
+
+engine_fd = target_fd = None
+try:
+    if action not in {"find", "crash"}:
+        refuse("invalid operation")
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        refuse("Python pidfd support is required for race-safe process ownership")
+    engine_fd = os.pidfd_open(engine_pid)
+    engine_state, engine_parent, engine_start = process_stat(engine_pid)
+    if engine_state == "Z" or engine_parent != harness_pid:
+        refuse("engine is not the live direct child launched by this harness")
+    require_uid(engine_pid)
+    actual_binary = os.stat(f"/proc/{engine_pid}/exe")
+    expected_binary = os.stat(binary)
+    if (actual_binary.st_dev, actual_binary.st_ino) != (expected_binary.st_dev, expected_binary.st_ino):
+        refuse("engine executable does not match the smoke-test binary")
+    environment = dict(
+        entry.split(b"=", 1)
+        for entry in Path(f"/proc/{engine_pid}/environ").read_bytes().split(b"\0")
+        if b"=" in entry
+    )
+    for key, value in {
+        "MUX_SMOKE_ID": marker,
+        "MUX_ENGINE_SOCKET": socket_path,
+        "XDG_RUNTIME_DIR": runtime,
+        "MUX_PROFILE": profile,
+    }.items():
+        if environment.get(key.encode()) != os.fsencode(value):
+            refuse(f"owned engine environment does not match {key}")
+
+    pending = [engine_pid]
+    seen = set()
+    candidates = []
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if len(seen) > 256:
+            refuse("owned engine process tree exceeds its safety bound")
+        try:
+            state, _parent, started = process_stat(pid)
+            if state == "Z":
+                continue
+            pending.extend(children(pid) - seen)
+            if pid == engine_pid:
+                continue
+            arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if not arguments or os.path.basename(os.fsdecode(arguments[0])) not in web_process_names:
+                continue
+            if Path(os.readlink(f"/proc/{pid}/exe")).name not in web_process_names:
+                refuse(f"PID {pid} has an unrecognized WebProcess executable")
+            require_uid(pid)
+            ancestry(pid, engine_start)
+            candidates.append((pid, started))
+        except FileNotFoundError:
+            continue
+    if not candidates:
+        raise SystemExit(1)
+    if len(candidates) != 1:
+        refuse(f"isolated engine has {len(candidates)} WebProcesses; ownership is ambiguous")
+
+    pid, started = candidates[0]
+    identity = f"{pid}:{started}"
+    if action == "find":
+        print(identity)
+    else:
+        if not expected or identity != expected:
+            refuse("target identity changed before the requested crash")
+        target_fd = os.pidfd_open(pid)
+        state, _parent, current_start = process_stat(pid)
+        if state == "Z" or current_start != started:
+            refuse("target identity changed while opening its pidfd")
+        require_uid(pid)
+        if Path(os.readlink(f"/proc/{pid}/exe")).name not in web_process_names:
+            refuse("target executable changed before signaling")
+        chain = ancestry(pid, engine_start)
+        engine_poll = select.poll()
+        engine_poll.register(engine_fd, select.POLLIN)
+        if engine_poll.poll(0):
+            refuse("owned engine exited before signaling")
+        signal.pidfd_send_signal(target_fd, signal.SIGKILL)
+        target_poll = select.poll()
+        target_poll.register(target_fd, select.POLLIN)
+        if not target_poll.poll(2000):
+            refuse("owned WebProcess did not exit within two seconds")
+        print(f"OWNED_WEB_PROCESS_CRASH\tengine_pid={engine_pid}\tpid={pid}\tstart_ticks={started}\tancestry={','.join(map(str, chain))}")
+except (OSError, ValueError) as error:
+    refuse(str(error))
+finally:
+    if target_fd is not None:
+        os.close(target_fd)
+    if engine_fd is not None:
+        os.close(engine_fd)
+PY
+}
+
+wait_owned_web_process() {
+    local engine_pid=$1
+    local excluded_identity=${2:-}
+    local attempt identity result
+
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        if identity=$(owned_web_process find "$engine_pid" \
+            2>>"$LOG_DIR/engine-error-recovery.log"); then
+            if [[ $identity != "$excluded_identity" ]]; then
+                printf '%s\n' "$identity"
+                return 0
+            fi
+        else
+            result=$?
+            (( result == 1 )) || fail "could not prove unique owned WebProcess identity"
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "a unique replacement WebProcess was not observed within ten seconds"
+}
+
+wait_automatic_recovery() {
+    local expected_url=$1
+    local attempt
+
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        if grep -Fq -- "Web process crashed; loading a clean GET once at $expected_url" \
+            "$LOG_DIR/private-engine.log"; then
+            return 0
+        fi
+        assert_core_alive
+        sleep 0.05
+    done
+    fail "owned engine did not enter its automatic clean-GET recovery"
+}
+
+wait_engine_diagnostic_screen() {
+    local expected=$1
+    local capture="$LOG_DIR/engine-error-$expected.screen"
+    local attempt
+
+    for (( attempt=0; attempt < 200; attempt++ )); do
+        # Only inspect the live screen, never historical scrollback text.
+        if kitty_rc get-text --match "id:$ISOLATED_KITTY_ID" --extent=screen \
+            >"$capture" 2>>"$LOG_DIR/kitty-actions.log"; then
+            if [[ $expected == present ]]; then
+                if grep -Fq 'Mux engine error (' "$capture" &&
+                    grep -Fq "The page's Web process crashed." "$capture"; then
+                    return 0
+                fi
+            elif [[ $expected == absent ]]; then
+                # This static fixture paints exclusively through Kitty graphics.
+                # Any printable terminal cells are stale diagnostic/log output.
+                if LC_ALL=C awk '
+                    /[^[:space:]]/ { nonempty = 1; exit }
+                    END { exit nonempty ? 1 : 0 }
+                ' "$capture"; then
+                    return 0
+                fi
+            else
+                fail "invalid diagnostic screen expectation: $expected"
+            fi
+        fi
+        assert_core_alive
+        pid_alive "$ISOLATED_PANE_PID" || fail "isolated pane exited during engine recovery"
+        sleep 0.05
+    done
+    fail "live pane diagnostic text did not become $expected within the polling deadline"
+}
+
+qualify_engine_error_recovery() {
+    local probe_url="$SECOND_URL?mux-recovery=$MUX_SMOKE_ID-before"
+    local recovered_url="$SECOND_URL?mux-recovery=$MUX_SMOKE_ID-after"
+    local original_process replacement_process recovered_process fence
+    local trace="$LOG_DIR/engine-error-recovery.log"
+
+    : >"$trace"
+    [[ $(pid_env_value "$ISOLATED_PANE_PID" MUX_ENGINE_SOCKET) == "$ISOLATED_ENGINE_SOCKET" ]] ||
+        fail "isolated pane does not belong to the selected engine socket"
+    [[ $(pid_env_value "$ISOLATED_PANE_PID" MUX_SMOKE_ID) == "$MUX_SMOKE_ID" ]] ||
+        fail "isolated pane does not belong to this smoke run"
+    run_muxctl open "$ISOLATED_VIEW_ID" "$probe_url" \
+        >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+        fail "engine-recovery fixture navigation failed"
+    wait_title "$ISOLATED_VIEW_ID" "$probe_url" MUX_SMOKE_SECOND_LOADED
+    wait_frame_ack "$ISOLATED_KITTY_ID" "$probe_url" MUX_SMOKE_SECOND_LOADED
+    original_process=$(wait_owned_web_process "$ISOLATED_ENGINE_PID") ||
+        fail "could not identify the original isolated WebProcess"
+    owned_web_process crash "$ISOLATED_ENGINE_PID" "$original_process" >>"$trace" 2>&1 ||
+        fail "first owned WebProcess crash failed its safety checks"
+    wait_automatic_recovery "$probe_url"
+    replacement_process=$(wait_owned_web_process "$ISOLATED_ENGINE_PID" "$original_process") ||
+        fail "automatic recovery did not create a replacement WebProcess"
+
+    # Re-show forces a fresh geometry/image placement after replacement without
+    # beginning another navigation or resetting the one-crash recovery budget.
+    run_muxctl focus "$BOOT_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+        fail "could not hide the isolated pane after automatic recovery"
+    wait_layer main "$BOOT_VIEW_ID"
+    fence=$(frame_ack_fence)
+    run_muxctl focus "$ISOLATED_VIEW_ID" >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+        fail "could not restore the isolated pane after automatic recovery"
+    wait_layer "$ISOLATED_LAYER" "$ISOLATED_VIEW_ID"
+    wait_title "$ISOLATED_VIEW_ID" "$probe_url" MUX_SMOKE_SECOND_LOADED
+    wait_frame_ack "$ISOLATED_KITTY_ID" "$probe_url" MUX_SMOKE_SECOND_LOADED "$fence"
+    wait_engine_diagnostic_screen absent
+
+    owned_web_process crash "$ISOLATED_ENGINE_PID" "$replacement_process" >>"$trace" 2>&1 ||
+        fail "second owned WebProcess crash failed its safety checks"
+    wait_engine_diagnostic_screen present
+    capture_screenshot 09-engine-error-diagnostic
+
+    # This URI has never been loaded, so earlier frames cannot supply its
+    # matching URI/title ACK. Also require a new WebProcess and a clean screen.
+    fence=$(frame_ack_fence)
+    run_muxctl open "$ISOLATED_VIEW_ID" "$recovered_url" \
+        >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
+        fail "normal navigation after the engine diagnostic failed"
+    recovered_process=$(wait_owned_web_process "$ISOLATED_ENGINE_PID" "$replacement_process") ||
+        fail "explicit recovery did not create a fresh WebProcess"
+    wait_title "$ISOLATED_VIEW_ID" "$recovered_url" MUX_SMOKE_SECOND_LOADED
+    wait_frame_ack "$ISOLATED_KITTY_ID" "$recovered_url" MUX_SMOKE_SECOND_LOADED "$fence"
+    wait_engine_diagnostic_screen absent
+    capture_screenshot 10-engine-error-recovered
+    printf 'ENGINE_ERROR_RECOVERY\tkitty_sha256=%s\turi_sha256=%s\toriginal=%s\tautomatic=%s\trecovered=%s\tack_after_line=%s\tresult=PASS\n' \
+        "$(sha256_text "$ISOLATED_KITTY_ID")" "$(sha256_text "$recovered_url")" \
+        "$original_process" "$replacement_process" "$recovered_process" "$fence" >>"$trace"
 }
 
 wait_bar_ready() {
@@ -1176,6 +1479,8 @@ wait_title "$ISOLATED_VIEW_ID" "$CROSS_PROFILE_TARGET_URL" MUX_CLIP_CROSS_PROFIL
 wait_frame_ack "$ISOLATED_KITTY_ID" "$CROSS_PROFILE_TARGET_URL" MUX_CLIP_CROSS_PROFILE_PASS
 capture_screenshot 08-private-profile-content
 
+qualify_engine_error_recovery
+
 kitty_rc send-key --match "id:$ISOLATED_KITTY_ID" super+q \
     >>"$LOG_DIR/kitty-actions.log" 2>&1 ||
     fail "encrypted Super+Q injection failed for $ISOLATED_VIEW_ID"
@@ -1204,7 +1509,7 @@ pid_alive "$ENGINE_PID" || fail "central engine exited after its last view close
 pid_alive "$ISOLATED_ENGINE_PID" || fail "isolated engine exited after its last view closed"
 pid_alive "$MUXD_PID" || fail "muxd exited after its last view closed"
 
-printf 'runtime-smoke: browser path, hashed Kitty FRAME_ACK, same-page/cross-pane/cross-profile clipboard, privacy boundaries, focus, layers, navigation, and graceful close passed\n'
+printf 'runtime-smoke: browser path, hashed Kitty FRAME_ACK, same-page/cross-pane/cross-profile clipboard, privacy boundaries, focus, layers, navigation, owned WebProcess error recovery, and graceful close passed\n'
 
 timeout 6s "$BIN_DIR/muxctl" stop >>"$LOG_DIR/muxctl-actions.log" 2>&1 ||
     fail "muxctl stop did not complete within its lifecycle deadline"

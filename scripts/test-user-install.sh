@@ -42,7 +42,8 @@ if ! awk '
     in_install_subdir && /install_dir: get_option/ && /datadir/ && /mux/ {
         destination_matches = 1
     }
-    in_install_subdir && /^[[:space:]]*\)[,]?[[:space:]]*$/ {
+    in_install_subdir && (/^[[:space:]]*\)[,]?[[:space:]]*$/ ||
+        /install_subdir\(.*\)[,]?[[:space:]]*$/) {
         if (source_matches && destination_matches) {
             found = 1
         }

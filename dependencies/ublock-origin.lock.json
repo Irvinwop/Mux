@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "name": "uBlock Origin",
+  "version": "1.74.0",
+  "default_variant": "firefox",
+  "manifest_version": 2,
+  "upstream": {
+    "repository": "https://github.com/gorhill/uBlock",
+    "release": "https://github.com/gorhill/uBlock/releases/tag/1.74.0",
+    "release_metadata": "https://api.github.com/repos/gorhill/uBlock/releases/tags/1.74.0",
+    "source_commit": "6dd2d95e50d134a477a4e183343c0b26e9147123",
+    "source": "https://github.com/gorhill/uBlock/tree/6dd2d95e50d134a477a4e183343c0b26e9147123"
+  },
+  "license": {
+    "spdx": "GPL-3.0-or-later",
+    "copyright": "Raymond Hill and contributors; bundled components retain their own notices",
+    "copy": "ublock-origin-LICENSE.txt",
+    "copy_variant": "chromium",
+    "source": "https://github.com/gorhill/uBlock/blob/6dd2d95e50d134a477a4e183343c0b26e9147123/LICENSE.txt"
+  },
+  "required_files": [
+    "LICENSE.txt",
+    "manifest.json",
+    "background.html",
+    "dashboard.html",
+    "popup-fenix.html",
+    "assets/assets.json",
+    "js/start.js",
+    "js/vapi.js",
+    "js/contentscript.js"
+  ],
+  "variants": {
+    "firefox": {
+      "description": "Genuine uBlock Origin, signed Firefox MV2 release; full-capability reference",
+      "filename": "uBlock0_1.74.0.firefox.signed.xpi",
+      "url": "https://github.com/gorhill/uBlock/releases/download/1.74.0/uBlock0_1.74.0.firefox.signed.xpi",
+      "size": 4617614,
+      "sha256": "175756d74468c9ba45863f7fc333d3be670f82d5b066314e915814dd547d1652",
+      "archive_root": "",
+      "license_sha256": "e73d33841f942fa73aa5a63d4a6399cc39a29564db1dbca0915485842fcb236d",
+      "extension_id": "uBlock0@raymondhill.net",
+      "permissions": [
+        "alarms", "dns", "menus", "privacy", "storage", "tabs",
+        "unlimitedStorage", "webNavigation", "webRequest", "webRequestBlocking",
+        "<all_urls>"
+      ]
+    },
+    "chromium": {
+      "description": "Genuine uBlock Origin, Chromium MV2 release; not Firefox feature parity",
+      "filename": "uBlock0_1.74.0.chromium.zip",
+      "url": "https://github.com/gorhill/uBlock/releases/download/1.74.0/uBlock0_1.74.0.chromium.zip",
+      "size": 4611592,
+      "sha256": "29a475e82688b304f2a9b2c0577c2655a8aaf75ce363fe02d720d389bbb9f451",
+      "archive_root": "uBlock0.chromium",
+      "license_sha256": "e73d33841f942fa73aa5a63d4a6399cc39a29564db1dbca0915485842fcb236d",
+      "permissions": [
+        "alarms", "contextMenus", "privacy", "storage", "tabs",
+        "unlimitedStorage", "webNavigation", "webRequest", "webRequestBlocking",
+        "<all_urls>"
+      ]
+    }
+  }
+}

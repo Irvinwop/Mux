@@ -24,6 +24,8 @@ void mux_browser_entry_free(MuxBrowserEntry *entry);
 
 MuxBrowserStore *mux_browser_store_new(const gchar *profile_directory,
                                        GError **error);
+/* Starts empty and never reads or writes a profile directory. */
+MuxBrowserStore *mux_browser_store_new_ephemeral(void);
 void mux_browser_store_free(MuxBrowserStore *store);
 
 void mux_browser_store_record_navigation(MuxBrowserStore *store,

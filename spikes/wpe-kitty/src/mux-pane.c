@@ -1,12 +1,14 @@
 #define _GNU_SOURCE
 
 #include "mux-engine-protocol.h"
+#include "mux-network-handshake.h"
 #include "mux-shortcuts.h"
 #include "mux-kitty-chooser.h"
 #include "mux-protocol.h"
 #include "mux-pane-clipboard.h"
 #include "mux-ui-pane.h"
 #include "mux-notification-pane.h"
+#include "mux-pane-diagnostic.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -443,6 +445,7 @@ typedef struct {
 typedef struct {
     guint image_id;
     guint64 frame_serial;
+    guint64 diagnostic_generation;
     gboolean retired;
 } KittyFrameResponse;
 
@@ -466,6 +469,7 @@ typedef struct {
     guint64 find_generation;
     guint find_matches;
     MuxEngineFindStatus find_status;
+    MuxPaneDiagnostic diagnostic;
     guint pointer_modifiers;
     gint pointer_x_milli;
     gint pointer_y_milli;
@@ -504,6 +508,7 @@ typedef struct {
     GByteArray *control_input;
     GByteArray *events_input;
     gchar *profile;
+    MuxNetworkPolicy *network_policy;
     gchar *socket_path;
     gchar *layer;
     gchar *uri;
@@ -520,6 +525,7 @@ typedef struct {
     gint64 events_retry_us;
     GMainContext *main_context;
     MuxPaneClipboard *clipboard;
+    MuxClipboardPickerSurface clipboard_picker_surface;
     MuxKittyChooser *chooser;
     MuxUiPaneBridge *ui_bridge;
     MuxNotificationPane *notifications;
@@ -535,6 +541,7 @@ static volatile sig_atomic_t quit_requested;
 
 static void find_overlay_repaint(Pane *pane);
 static void find_overlay_hide(Pane *pane);
+static gboolean clear_engine_diagnostic(Pane *pane, GError **error);
 
 static void send_navigation(Pane *pane,
                             MuxEngineNavigationAction action,
@@ -791,6 +798,56 @@ terminal_write(Pane *pane, const gchar *text)
     return FALSE;
 }
 
+static gboolean
+diagnostic_terminal_output(const guint8 *data,
+                            gsize length,
+                            gpointer user_data,
+                            GError **error)
+{
+    return terminal_output_enqueue(user_data, data, length, 0, error);
+}
+
+static gboolean
+clear_engine_diagnostic(Pane *pane, GError **error)
+{
+    struct winsize window = { 0 };
+
+    if (!pane->diagnostic.painted_rows)
+        return TRUE;
+    if (!pane->terminal_active ||
+        ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) < 0 ||
+        !window.ws_row) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_FAILED,
+                            "cannot determine diagnostic cleanup geometry");
+        return FALSE;
+    }
+    return mux_pane_diagnostic_clear(&pane->diagnostic,
+                                      window.ws_row,
+                                      diagnostic_terminal_output,
+                                      pane,
+                                      error);
+}
+
+static void
+recover_engine_diagnostic(Pane *pane, guint64 generation)
+{
+    struct winsize window = { 0 };
+
+    if (!pane->diagnostic.painted_rows || !pane->terminal_active)
+        return;
+    (void)ioctl(STDOUT_FILENO, TIOCGWINSZ, &window);
+    if (mux_pane_diagnostic_recover(&pane->diagnostic,
+                                     generation,
+                                     window.ws_row,
+                                     diagnostic_terminal_output,
+                                     pane,
+                                     NULL) &&
+        !pane->diagnostic.painted_rows)
+        find_overlay_repaint(pane);
+}
+
 static void
 find_overlay_write(Pane *pane, const gchar *label)
 {
@@ -801,6 +858,8 @@ find_overlay_write(Pane *pane, const gchar *label)
     if (!pane->terminal_active ||
         ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) < 0 ||
         !window.ws_row)
+        return;
+    if (label && !clear_engine_diagnostic(pane, NULL))
         return;
     command = g_string_new("\033[?2026h\0337");
     g_string_append_printf(command,
@@ -890,21 +949,29 @@ show_engine_diagnostic(Pane *pane,
                        const gchar *safe_detail,
                        gboolean reconnecting)
 {
-    g_autofree gchar *overlay = NULL;
-    const gchar *next_step = reconnecting
-        ? "The pane is reconnecting with bounded backoff."
-        : "Use the URL bar, reload, or close the pane.";
+    struct winsize window = { 0 };
 
-    g_printerr("mux-pane: engine error %u: %s\n", code, safe_detail);
-    if (!pane->terminal_active)
+    /* Raw stderr shares the terminal text plane and has no tracked footprint. */
+    if (!pane->terminal_active || !isatty(STDERR_FILENO))
+        g_printerr("mux-pane: engine error %u: %s\n", code, safe_detail);
+    if (!pane->terminal_active || !pane->visible ||
+        (pane->ui_bridge &&
+         mux_ui_pane_bridge_is_active(pane->ui_bridge)) ||
+        (pane->clipboard &&
+         mux_pane_clipboard_picker_is_open(pane->clipboard)) ||
+        ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) < 0 ||
+        !window.ws_col || !window.ws_row)
         return;
-    delete_image(pane);
-    overlay = g_strdup_printf(
-        "\033[2J\033[H\033[1;1HMux engine error (%u)\r\n\r\n%s\r\n\r\n%s\033[?25l",
-        code,
-        safe_detail,
-        next_step);
-    (void)terminal_write_critical(pane, overlay);
+    find_overlay_hide(pane);
+    (void)mux_pane_diagnostic_show(&pane->diagnostic,
+                                   code,
+                                   safe_detail,
+                                   reconnecting,
+                                   window.ws_col,
+                                   window.ws_row,
+                                   diagnostic_terminal_output,
+                                   pane,
+                                   NULL);
 }
 
 static gboolean
@@ -1328,6 +1395,24 @@ connect_control(Pane *pane, const gchar *initial_uri)
     }
     g_free(path);
 
+    if (mux_network_policy_get_mode(pane->network_policy) ==
+        MUX_NETWORK_MODE_TOR) {
+        struct ucred credentials;
+        socklen_t credentials_size = sizeof(credentials);
+
+        if (getsockopt(pane->control_fd, SOL_SOCKET, SO_PEERCRED,
+                       &credentials, &credentials_size) < 0 ||
+            credentials_size != sizeof(credentials) ||
+            credentials.uid != geteuid() ||
+            !mux_require_tor_policy(pane->control_fd)) {
+            g_printerr("mux-pane: daemon lacks authenticated Tor policy support; "
+                       "restart the Mux daemon to use Tor\n");
+            close(pane->control_fd);
+            pane->control_fd = -1;
+            return FALSE;
+        }
+    }
+
     if (pane->control_input != NULL)
         g_byte_array_set_size(pane->control_input, 0);
     if (pane->control_id == NULL)
@@ -1629,6 +1714,11 @@ send_hello(Pane *pane, const gchar *initial_uri)
     mux_engine_builder_put_u32(&builder, pane->height);
     mux_engine_builder_put_u32(&builder, pane->scale_milli);
     mux_engine_builder_put_string(&builder, initial_uri);
+    if (mux_network_policy_get_mode(pane->network_policy) ==
+        MUX_NETWORK_MODE_TOR)
+        mux_network_handshake_append(&builder,
+                                      pane->network_policy,
+                                      pane->profile);
     payload = mux_engine_builder_finish(&builder);
     result = send_message(pane,
                           MUX_ENGINE_MESSAGE_HELLO,
@@ -1731,6 +1821,7 @@ start_view(Pane *pane, const gchar *initial_uri)
     MuxEngineMessage response = { 0 };
     GBytes *payload;
     guint64 request_serial;
+    g_autoptr(GError) policy_error = NULL;
 
     if (!send_hello(pane, initial_uri))
         return FALSE;
@@ -1740,6 +1831,17 @@ start_view(Pane *pane, const gchar *initial_uri)
                           request_serial,
                           &response))
         return FALSE;
+    if (!mux_network_handshake_check_welcome(response.payload,
+                                              pane->network_policy,
+                                              pane->profile,
+                                              pane->socket_path,
+                                              &policy_error)) {
+        g_printerr("mux-pane: %s\n", policy_error->message);
+        mux_engine_message_clear(&response);
+        disconnect_engine(pane);
+        pane->engine_fatal = TRUE;
+        return FALSE;
+    }
     pane->engine_handshake_complete = TRUE;
     mux_engine_message_clear(&response);
 
@@ -1843,6 +1945,8 @@ terminal_enable(Pane *pane)
                   error != NULL ? error->message : "unknown error");
         return FALSE;
     }
+    pane->diagnostic.painted_rows = 0;
+    pane->diagnostic.recovered = FALSE;
     return TRUE;
 }
 
@@ -2414,25 +2518,43 @@ read_terminal_cells(guint *columns, guint *rows)
 }
 
 static void
+clear_clipboard_picker(Pane *pane)
+{
+    guint columns;
+    guint rows;
+    g_autofree gchar *clear = NULL;
+
+    if (!read_terminal_cells(&columns, &rows))
+        return;
+    clear = mux_clipboard_picker_surface_clear(&pane->clipboard_picker_surface,
+                                               columns, rows);
+    if (clear != NULL && clear[0] != '\0')
+        terminal_write(pane, clear);
+}
+
+static void
 redraw_clipboard_picker(Pane *pane)
 {
     guint columns;
     guint rows;
-    gchar *panel;
+    g_autofree gchar *panel = NULL;
+    g_autofree gchar *presentation = NULL;
 
     if (pane->clipboard == NULL ||
         !mux_pane_clipboard_picker_is_open(pane->clipboard) ||
         !read_terminal_cells(&columns, &rows))
         return;
-    delete_image(pane);
+    if (!clear_engine_diagnostic(pane, NULL))
+        return;
     panel = mux_pane_clipboard_render_picker(pane->clipboard,
                                             columns,
                                             rows);
-    terminal_write(pane, "\033[H\033[2J");
-    if (panel != NULL) {
-        terminal_write(pane, panel);
-        g_free(panel);
-    }
+    /* Keep the last browser placement as context while engine input is
+     * suspended. Its z-order is below the panel's opaque cell backgrounds. */
+    presentation = mux_clipboard_picker_surface_present(
+        &pane->clipboard_picker_surface, panel, columns, rows);
+    if (presentation != NULL && presentation[0] != '\0')
+        terminal_write(pane, presentation);
 }
 
 static void
@@ -2455,7 +2577,7 @@ clipboard_closed(MuxPaneClipboard *clipboard, gpointer user_data)
     Pane *pane = user_data;
 
     (void) clipboard;
-    terminal_write(pane, "\033[H\033[2J");
+    clear_clipboard_picker(pane);
     send_engine_visibility(pane);
     delete_image(pane);
     send_resize(pane);
@@ -2492,6 +2614,8 @@ queue_frame_response(Pane *pane, guint64 frame_serial)
         KITTY_FRAME_RESPONSE_CAPACITY;
     pane->frame_responses[index].image_id = pane->image_id;
     pane->frame_responses[index].frame_serial = frame_serial;
+    pane->frame_responses[index].diagnostic_generation =
+        pane->diagnostic.generation;
     pane->frame_responses[index].retired = FALSE;
     pane->frame_response_count++;
     pane->frame_waiting = TRUE;
@@ -2586,6 +2710,7 @@ acknowledge_graphics_response(Pane *pane, guint image_id)
     pane->frame_waiting = FALSE;
     pane->pending_frame_serial = 0;
     delete_retired_images(pane);
+    recover_engine_diagnostic(pane, response.diagnostic_generation);
 }
 
 static void
@@ -3118,6 +3243,10 @@ ui_terminal_output(const guint8 *data,
 {
     Pane *pane = user_data;
 
+    if (pane->ui_bridge &&
+        mux_ui_pane_bridge_is_active(pane->ui_bridge) &&
+        !clear_engine_diagnostic(pane, error))
+        return FALSE;
     return terminal_output_enqueue(pane,
                                    data,
                                    length,
@@ -4121,15 +4250,21 @@ handle_resize(Pane *pane)
     guint width;
     guint height;
 
-    if (!read_window_size(&width, &height) ||
-        (width == pane->width && height == pane->height))
-        return;
-    cancel_pointer_interaction(pane, TRUE);
-    pane->width = width;
-    pane->height = height;
-    send_resize(pane);
-    (void)ui_update_size(pane, NULL);
-    find_overlay_repaint(pane);
+    if (read_window_size(&width, &height) &&
+        (width != pane->width || height != pane->height)) {
+        cancel_pointer_interaction(pane, TRUE);
+        pane->width = width;
+        pane->height = height;
+        send_resize(pane);
+        (void)ui_update_size(pane, NULL);
+        find_overlay_repaint(pane);
+    }
+    /* Font changes can alter cell bounds without changing the pixel viewport. */
+    if (pane->clipboard != NULL &&
+        mux_pane_clipboard_picker_is_open(pane->clipboard))
+        redraw_clipboard_picker(pane);
+    else
+        clear_clipboard_picker(pane);
 }
 
 static void
@@ -4400,6 +4535,8 @@ next_poll_timeout(Pane *pane, gint64 now_us)
 static void
 service_maintenance(Pane *pane, gint64 monotonic_us)
 {
+    if (pane->diagnostic.recovered)
+        recover_engine_diagnostic(pane, pane->diagnostic.generation);
     if (pane->scroll_stop_due_us &&
         monotonic_us >= pane->scroll_stop_due_us)
         finish_pointer_scroll(pane);
@@ -4614,6 +4751,7 @@ pane_clear(Pane *pane)
     terminal_output_clear(pane);
     g_clear_error(&pane->terminal_output_error);
     g_free(pane->profile);
+    g_clear_pointer(&pane->network_policy, mux_network_policy_free);
     g_free(pane->socket_path);
     g_free(pane->layer);
     g_free(pane->uri);
@@ -4664,11 +4802,28 @@ main(int argc, char **argv)
     pane.profile = g_strdup(profile_environment && *profile_environment
                                 ? profile_environment
                                 : "default");
+    {
+        g_autoptr(GError) policy_error = NULL;
+
+        pane.network_policy = mux_network_policy_new(
+            g_getenv("MUX_NETWORK_MODE"),
+            g_getenv("MUX_TOR_SOCKS_PROXY"),
+            &policy_error);
+        if (!pane.network_policy ||
+            !mux_network_handshake_check_profile(pane.network_policy,
+                                                  pane.profile,
+                                                  &policy_error)) {
+            g_printerr("mux-pane: %s\n", policy_error->message);
+            pane_clear(&pane);
+            return 2;
+        }
+    }
     pane.layer = g_strdup(layer_environment && *layer_environment
                               ? layer_environment
                               : "main");
-    pane.ephemeral = ephemeral_environment &&
-        g_strcmp0(ephemeral_environment, "0") != 0;
+    pane.ephemeral = mux_network_policy_is_ephemeral(
+        pane.network_policy,
+        ephemeral_environment && g_strcmp0(ephemeral_environment, "0") != 0);
     pane.popup_token = g_strdup(popup_environment);
     pane.socket_path = engine_socket_path(pane.profile);
     pane.input = g_byte_array_new();

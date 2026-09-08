@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "mux-engine-protocol.h"
+#include "mux-protocol.h"
 #include "mux-shortcuts.h"
 #include "mux-clipboard-engine-link.h"
 #include "mux-ui-engine.h"
@@ -12,6 +13,9 @@
 #include "mux-input-method.h"
 #include "mux-notification-engine.h"
 #include "mux-navigation-policy.h"
+#include "mux-network-handshake.h"
+#include "mux-network-policy-wpe.h"
+#include "mux-privacy-policy-wpe.h"
 #include "mux-uri.h"
 
 #include <errno.h>
@@ -19,6 +23,7 @@
 #include <gio/gio.h>
 #include <glib-unix.h>
 #include <glib.h>
+#include <poll.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -28,6 +33,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -170,16 +176,14 @@ frame_backpressure_retry_delay_ms(guint rejection_count)
 }
 
 static WebKitNetworkSession *
-engine_private_network_session_new(void)
+engine_private_network_session_new(const MuxNetworkPolicy *policy,
+                                    GError **error)
 {
-    WebKitNetworkSession *session = webkit_network_session_new_ephemeral();
-
-    if (!session)
-        return NULL;
-    webkit_network_session_set_itp_enabled(session, TRUE);
-    webkit_network_session_set_persistent_credential_storage_enabled(session,
-                                                                     FALSE);
-    return session;
+    return mux_network_policy_wpe_new_session(policy,
+                                               TRUE,
+                                               NULL,
+                                               NULL,
+                                               error);
 }
 
 static GBytes *
@@ -248,7 +252,10 @@ mux_engine_test_find_shortcut(guint32 modifiers, guint32 keyval)
 WebKitNetworkSession *
 mux_engine_test_private_network_session_new(void)
 {
-    return engine_private_network_session_new();
+    g_autoptr(MuxNetworkPolicy) policy =
+        mux_network_policy_new("direct", NULL, NULL);
+
+    return engine_private_network_session_new(policy, NULL);
 }
 
 gboolean
@@ -419,6 +426,8 @@ struct _Engine {
     MuxPermissionStore *ephemeral_permission_store;
     MuxDownloadManager *download_manager;
     MuxBrowserStore *browser_store;
+    MuxNetworkPolicy *network_policy;
+    WebKitSettings *settings;
     WebKitWebContext *web_context;
     WebKitNetworkSession *persistent_session;
     int listen_fd;
@@ -1037,6 +1046,13 @@ engine_muxd_connect(Engine *engine)
         return FALSE;
     }
 
+    if (mux_network_policy_get_mode(engine->network_policy) ==
+        MUX_NETWORK_MODE_TOR && !mux_require_tor_policy(fd)) {
+        /* Do not register even the isolated profile with a legacy daemon. */
+        close(fd);
+        return FALSE;
+    }
+
     encoded_profile = g_base64_encode((const guchar *)engine->profile,
                                       strlen(engine->profile));
     registration = g_strdup_printf("ENGINE\t%u\t%s\t%ld\n",
@@ -1135,6 +1151,22 @@ prepare_paths(Engine *engine, const gchar *socket_override, GError **error)
     g_free(socket_directory);
 
     engine->lock_path = g_strconcat(engine->socket_path, ".lock", NULL);
+    if (mux_network_policy_get_mode(engine->network_policy) ==
+        MUX_NETWORK_MODE_TOR) {
+        g_autofree gchar *expected_socket = default_socket_path(engine->profile);
+
+        if (g_strcmp0(engine->socket_path, expected_socket) != 0 ||
+            data_environment || cache_environment) {
+            g_set_error_literal(error,
+                                G_IO_ERROR,
+                                G_IO_ERROR_INVALID_ARGUMENT,
+                                "Tor refuses custom engine sockets and "
+                                "persistent profile data/cache overrides");
+            return FALSE;
+        }
+        /* No persistent profile paths are constructed or opened in Tor mode. */
+        return TRUE;
+    }
     engine->data_directory = data_environment && *data_environment
         ? g_strdup(data_environment)
         : g_build_filename(g_get_user_data_dir(),
@@ -1291,12 +1323,18 @@ daemonize_engine(pid_t *child_pid, GError **error)
 }
 
 static gboolean
-engine_listener_reachable(const gchar *socket_path)
+engine_listener_reachable(Engine *engine, GError **error)
 {
+    const gchar *socket_path = engine->socket_path;
     struct stat status;
     struct sockaddr_un address = { 0 };
+    struct timeval timeout = { .tv_sec = 1 };
+    MuxEngineBuilder builder;
+    MuxEngineMessage response = { 0 };
+    g_autoptr(GBytes) payload = NULL;
     int fd;
-    gboolean reachable;
+    int ready;
+    gboolean matched = FALSE;
 
     if (lstat(socket_path, &status) < 0 ||
         !S_ISSOCK(status.st_mode) ||
@@ -1309,12 +1347,66 @@ engine_listener_reachable(const gchar *socket_path)
         return FALSE;
     address.sun_family = AF_UNIX;
     g_strlcpy(address.sun_path, socket_path, sizeof(address.sun_path));
-    reachable = connect(fd,
-                        (const struct sockaddr *)&address,
-                        offsetof(struct sockaddr_un, sun_path) +
-                            strlen(address.sun_path) + 1) == 0;
+    if (connect(fd,
+                (const struct sockaddr *)&address,
+                offsetof(struct sockaddr_un, sun_path) +
+                    strlen(address.sun_path) + 1) < 0) {
+        close(fd);
+        return FALSE;
+    }
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    mux_engine_builder_init(&builder);
+    mux_engine_builder_put_u32(&builder, (guint32)getpid());
+    mux_engine_builder_put_string(&builder, "");
+    mux_engine_builder_put_string(&builder, "main");
+    mux_engine_builder_put_u32(&builder, 1);
+    mux_engine_builder_put_u32(&builder, 1);
+    mux_engine_builder_put_u32(&builder, engine->device_scale_milli);
+    mux_engine_builder_put_string(&builder, "about:blank");
+    if (mux_network_policy_get_mode(engine->network_policy) ==
+        MUX_NETWORK_MODE_TOR)
+        mux_network_handshake_append(&builder,
+                                      engine->network_policy,
+                                      engine->profile);
+    payload = mux_engine_builder_finish(&builder);
+    MuxEngineMessage request = {
+        .type = MUX_ENGINE_MESSAGE_HELLO,
+        .serial = 1,
+        .payload = payload,
+    };
+    if (!mux_engine_send_message(fd, &request, error))
+        goto out;
+    struct pollfd descriptor = { .fd = fd, .events = POLLIN };
+    do {
+        ready = poll(&descriptor, 1, 1000);
+    } while (ready < 0 && errno == EINTR);
+    if (ready <= 0 || !(descriptor.revents & POLLIN)) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_TIMED_OUT,
+                            "running engine did not attest its network policy");
+        goto out;
+    }
+    if (mux_engine_receive_message(fd, &response, error) !=
+        MUX_ENGINE_RECEIVE_MESSAGE)
+        goto out;
+    if (response.type != MUX_ENGINE_MESSAGE_WELCOME || response.serial != 1) {
+        g_set_error_literal(error,
+                            G_IO_ERROR,
+                            G_IO_ERROR_PERMISSION_DENIED,
+                            "running engine rejected the requested "
+                            "profile/network policy");
+        goto out;
+    }
+    matched = mux_network_handshake_check_welcome(response.payload,
+                                                   engine->network_policy,
+                                                   engine->profile,
+                                                   engine->socket_path,
+                                                   error);
+out:
+    mux_engine_message_clear(&response);
     close(fd);
-    return reachable;
+    return matched;
 }
 
 static void
@@ -1354,18 +1446,29 @@ stop_daemon_child(pid_t child_pid)
 }
 
 static gboolean
-wait_for_engine_listener(const gchar *socket_path,
+wait_for_engine_listener(Engine *engine,
                          pid_t child_pid,
                          GError **error)
 {
+    const gchar *socket_path = engine->socket_path;
     gint64 deadline = g_get_monotonic_time() +
         (gint64)MUX_ENGINE_ENSURE_TIMEOUT_MS * 1000;
 
     for (;;) {
         int status = 0;
 
-        if (engine_listener_reachable(socket_path))
+        g_autoptr(GError) handshake_error = NULL;
+
+        if (engine_listener_reachable(engine, &handshake_error))
             return TRUE;
+        if (handshake_error) {
+            if (child_pid > 0) {
+                stop_daemon_child(child_pid);
+                remove_owned_engine_socket(socket_path);
+            }
+            g_propagate_error(error, g_steal_pointer(&handshake_error));
+            return FALSE;
+        }
         if (child_pid > 0) {
             pid_t waited;
 
@@ -2044,12 +2147,9 @@ engine_view_prepare_private_network(EngineView *view, GError **error)
     g_return_val_if_fail(view != NULL, FALSE);
     g_return_val_if_fail(view->ephemeral, FALSE);
 
-    view->network_session = engine_private_network_session_new();
+    view->network_session = engine_private_network_session_new(
+        view->engine->network_policy, error);
     if (!view->network_session) {
-        g_set_error_literal(error,
-                            G_IO_ERROR,
-                            G_IO_ERROR_FAILED,
-                            "private WebKit network session construction failed");
         return FALSE;
     }
     view->download_manager = mux_download_manager_new(view->network_session,
@@ -2235,6 +2335,7 @@ popup_create(WebKitWebView *parent,
         g_object_new(WEBKIT_TYPE_WEB_VIEW,
                      "related-view", parent,
                      "display", engine->display,
+                     "settings", engine->settings,
                      NULL));
     engine->pending_view = previous_pending_view;
     if (!child->web_view || !child->platform_view) {
@@ -2277,6 +2378,9 @@ popup_offer(WebKitWebView *parent,
     g_autofree gchar *layer_env = NULL;
     g_autofree gchar *token_env = NULL;
     g_autofree gchar *ephemeral_env = NULL;
+    g_autofree gchar *network_env = NULL;
+    g_autofree gchar *proxy_env = NULL;
+    g_autofree gchar *socket_env = NULL;
     g_autoptr(GPtrArray) arguments = g_ptr_array_new();
     GSubprocess *process;
     PopupLaunch *launch;
@@ -2330,6 +2434,21 @@ popup_offer(WebKitWebView *parent,
     g_ptr_array_add(arguments, token_env);
     g_ptr_array_add(arguments, (gpointer)"--env");
     g_ptr_array_add(arguments, ephemeral_env);
+    if (mux_network_policy_get_mode(parent_view->engine->network_policy) ==
+        MUX_NETWORK_MODE_TOR) {
+        network_env = g_strdup("MUX_NETWORK_MODE=tor");
+        proxy_env = g_strdup_printf(
+            "MUX_TOR_SOCKS_PROXY=%s",
+            mux_network_policy_get_proxy_uri(parent_view->engine->network_policy));
+        socket_env = g_strdup_printf("MUX_ENGINE_SOCKET=%s",
+                                     parent_view->engine->socket_path);
+        g_ptr_array_add(arguments, (gpointer)"--env");
+        g_ptr_array_add(arguments, network_env);
+        g_ptr_array_add(arguments, (gpointer)"--env");
+        g_ptr_array_add(arguments, proxy_env);
+        g_ptr_array_add(arguments, (gpointer)"--env");
+        g_ptr_array_add(arguments, socket_env);
+    }
     g_ptr_array_add(arguments, (gpointer)"--title");
     g_ptr_array_add(arguments, (gpointer)"Mux popup");
     g_ptr_array_add(arguments, pane_binary);
@@ -3555,6 +3674,7 @@ handle_hello(Client *client, const MuxEngineMessage *request)
     MuxEngineBuilder builder;
     GBytes *payload;
     gboolean sent;
+    g_autoptr(GError) policy_error = NULL;
 
     if (client->welcomed) {
         client_send_error(client,
@@ -3579,11 +3699,15 @@ handle_hello(Client *client, const MuxEngineMessage *request)
         !mux_engine_cursor_get_u32(&cursor, &height) ||
         !mux_engine_cursor_get_u32(&cursor, &scale_milli) ||
         !mux_engine_cursor_get_string(&cursor, &initial_uri) ||
-        !mux_engine_cursor_done(&cursor)) {
+        !mux_network_handshake_check_trailer(&cursor,
+                                              client->engine->network_policy,
+                                              client->engine->profile,
+                                              &policy_error)) {
         client_send_error(client,
                           request,
                           MUX_ENGINE_REMOTE_ERROR_BAD_MESSAGE,
-                          "invalid HELLO payload");
+                          policy_error ? policy_error->message
+                                       : "invalid HELLO payload");
         g_free(kitty_window);
         g_free(layer);
         g_free(initial_uri);
@@ -3619,6 +3743,9 @@ handle_hello(Client *client, const MuxEngineMessage *request)
     mux_engine_builder_put_u32(&builder, (guint32)getpid());
     mux_engine_builder_put_string(&builder, client->engine->profile);
     mux_engine_builder_put_string(&builder, client->engine->socket_path);
+    mux_network_handshake_append(&builder,
+                                  client->engine->network_policy,
+                                  client->engine->profile);
     payload = mux_engine_builder_finish(&builder);
     sent = client_send(client,
                        MUX_ENGINE_MESSAGE_WELCOME,
@@ -3793,7 +3920,9 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
         g_free(uri);
         return TRUE;
     }
-    if (view && view->ephemeral != requested_ephemeral) {
+    if (view && view->ephemeral !=
+        mux_network_policy_is_ephemeral(engine->network_policy,
+                                          requested_ephemeral)) {
         engine_view_free(view);
         client_send_error(client,
                           request,
@@ -3816,7 +3945,8 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
         view->width = width;
         view->height = height;
         view->scale_milli = scale_milli;
-        view->ephemeral = requested_ephemeral;
+        view->ephemeral = mux_network_policy_is_ephemeral(
+            engine->network_policy, requested_ephemeral);
         if (view->ephemeral &&
             !engine_view_prepare_private_network(
                 view, &private_network_error)) {
@@ -3838,6 +3968,7 @@ handle_create_view(Client *client, const MuxEngineMessage *request)
                          "web-context", engine->web_context,
                          "network-session", session,
                          "display", engine->display,
+                         "settings", engine->settings,
                          NULL));
         engine->pending_view = NULL;
     } else {
@@ -5903,19 +6034,24 @@ initialize_browser(Engine *engine, GError **error)
 {
     WPEDisplay *display;
     WPEDisplayClass *display_class;
+    gboolean tor = mux_network_policy_get_mode(engine->network_policy) ==
+        MUX_NETWORK_MODE_TOR;
 
-    if (!ensure_private_directory(engine->data_directory, error) ||
-        !ensure_private_directory(engine->cache_directory, error))
+    if (!tor &&
+        (!ensure_private_directory(engine->data_directory, error) ||
+         !ensure_private_directory(engine->cache_directory, error)))
         return FALSE;
 
-    engine->browser_store = mux_browser_store_new(engine->data_directory,
-                                                  error);
+    engine->browser_store = tor
+        ? mux_browser_store_new_ephemeral()
+        : mux_browser_store_new(engine->data_directory, error);
     if (!engine->browser_store)
         return FALSE;
     engine->permission_store = mux_permission_store_new_for_namespace(
-        engine->data_directory,
+        tor ? NULL : engine->data_directory,
         engine->profile,
-        MUX_PERMISSION_STORE_SCOPE_PERSISTENT,
+        tor ? MUX_PERMISSION_STORE_SCOPE_PRIVATE
+            : MUX_PERMISSION_STORE_SCOPE_PERSISTENT,
         error);
     if (!engine->permission_store)
         return FALSE;
@@ -5926,6 +6062,13 @@ initialize_browser(Engine *engine, GError **error)
         MUX_PERMISSION_STORE_SCOPE_PRIVATE,
         error);
     if (!engine->ephemeral_permission_store)
+        return FALSE;
+
+    engine->settings = webkit_settings_new();
+    if (!engine->settings ||
+        !mux_network_policy_wpe_apply_settings(engine->network_policy,
+                                                engine->settings,
+                                                error))
         return FALSE;
 
     if (!g_getenv("WPE_DISPLAY"))
@@ -5946,7 +6089,7 @@ initialize_browser(Engine *engine, GError **error)
     engine->clipboard_link = mux_clipboard_engine_link_new(
         display,
         engine->profile,
-        FALSE,
+        tor,
         clipboard_output,
         clipboard_paste,
         clipboard_failure,
@@ -5962,16 +6105,17 @@ initialize_browser(Engine *engine, GError **error)
     display_engine = engine;
     display_class->create_view = mux_display_create_view;
     display_class->get_clipboard = mux_display_get_clipboard;
-    engine->web_context =
-        g_object_ref(webkit_web_context_get_default());
+    engine->web_context = mux_privacy_policy_wpe_new_context(
+        engine->network_policy, error);
+    if (!engine->web_context)
+        return FALSE;
     engine->persistent_session =
-        webkit_network_session_new(engine->data_directory,
-                                   engine->cache_directory);
+        mux_network_policy_wpe_new_session(engine->network_policy,
+                                            FALSE,
+                                            engine->data_directory,
+                                            engine->cache_directory,
+                                            error);
     if (!engine->persistent_session) {
-        g_set_error_literal(error,
-                            G_IO_ERROR,
-                            G_IO_ERROR_FAILED,
-                            "WebKit network session construction failed");
         return FALSE;
     }
     engine->download_manager = mux_download_manager_new(
@@ -5990,7 +6134,6 @@ initialize_browser(Engine *engine, GError **error)
     mux_download_manager_set_clipboard_func(engine->download_manager,
                                             download_clipboard_output);
 
-    webkit_network_session_set_itp_enabled(engine->persistent_session, TRUE);
     return TRUE;
 }
 
@@ -6074,6 +6217,8 @@ engine_clear(Engine *engine)
     g_clear_pointer(&engine->permission_store,
                     mux_permission_store_free);
     g_clear_object(&engine->persistent_session);
+    g_clear_object(&engine->settings);
+    g_clear_pointer(&engine->network_policy, mux_network_policy_free);
     g_clear_object(&engine->web_context);
     g_clear_object(&engine->display);
     g_clear_pointer(&engine->loop, g_main_loop_unref);
@@ -6088,9 +6233,20 @@ int
 main(int argc, char **argv)
 {
     gboolean ensure = FALSE;
+    gboolean check_network = FALSE;
     gchar *profile_option = NULL;
     gchar *socket_option = NULL;
     GOptionEntry options[] = {
+        {
+            "check-network",
+            0,
+            0,
+            G_OPTION_ARG_NONE,
+            &check_network,
+            "Validate the selected network policy and local SOCKS endpoint "
+            "without starting a browser",
+            NULL,
+        },
         {
             "ensure",
             0,
@@ -6148,12 +6304,38 @@ main(int argc, char **argv)
     }
     g_option_context_free(option_context);
 
+    engine.network_policy = mux_network_policy_new(
+        g_getenv("MUX_NETWORK_MODE"),
+        g_getenv("MUX_TOR_SOCKS_PROXY"),
+        &error);
+    if (!engine.network_policy ||
+        (check_network &&
+         !mux_network_handshake_probe_socks(engine.network_policy, &error))) {
+        g_printerr("mux-engine: %s\n", error->message);
+        g_clear_error(&error);
+        g_free(profile_option);
+        g_free(socket_option);
+        engine_clear(&engine);
+        return 2;
+    }
+    if (check_network) {
+        g_free(profile_option);
+        g_free(socket_option);
+        engine_clear(&engine);
+        return 0;
+    }
+
     engine.profile = g_strdup(
         profile_option ? profile_option :
         (g_getenv("MUX_PROFILE") ? g_getenv("MUX_PROFILE") : "default"));
     g_free(profile_option);
-    if (!profile_is_valid(engine.profile)) {
-        g_printerr("mux-engine: invalid profile name\n");
+    if (!profile_is_valid(engine.profile) ||
+        !mux_network_handshake_check_profile(engine.network_policy,
+                                              engine.profile,
+                                              &error)) {
+        g_printerr("mux-engine: %s\n",
+                   error ? error->message : "invalid profile name");
+        g_clear_error(&error);
         g_free(socket_option);
         engine_clear(&engine);
         return 2;
@@ -6176,7 +6358,8 @@ main(int argc, char **argv)
     }
     g_free(socket_option);
 
-    if (!acquire_engine_lock(&engine, &already_running, &error)) {
+    if (!mux_network_handshake_probe_socks(engine.network_policy, &error) ||
+        !acquire_engine_lock(&engine, &already_running, &error)) {
         g_printerr("mux-engine: %s\n", error->message);
         g_clear_error(&error);
         engine_clear(&engine);
@@ -6189,7 +6372,7 @@ main(int argc, char **argv)
             engine_clear(&engine);
             return 1;
         }
-        if (!wait_for_engine_listener(engine.socket_path, 0, &error)) {
+        if (!wait_for_engine_listener(&engine, 0, &error)) {
             g_printerr("mux-engine: %s\n", error->message);
             g_clear_error(&error);
             engine_clear(&engine);
@@ -6208,7 +6391,7 @@ main(int argc, char **argv)
             return 1;
         }
         if (daemon_result > 0) {
-            gboolean ready = wait_for_engine_listener(engine.socket_path,
+            gboolean ready = wait_for_engine_listener(&engine,
                                                        daemon_pid,
                                                        &error);
 

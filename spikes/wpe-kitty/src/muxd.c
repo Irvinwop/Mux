@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "mux-protocol.h"
+#include "mux-network-handshake.h"
 #include "mux-session-state.h"
 #include "muxd-clipboard.h"
 
@@ -39,6 +40,7 @@ typedef struct {
     gboolean request_pending;
     gboolean graceful_bye;
     gboolean persistable;
+    gboolean ephemeral;
     GString *input;
     GQueue *output;
     gsize output_bytes;
@@ -49,6 +51,7 @@ typedef struct {
     gchar *kitty_socket;
     gchar *kitty_public_key;
     gchar *profile;
+    MuxNetworkPolicy *network_policy;
     gchar *layer;
     gchar *uri;
     gchar *title;
@@ -65,6 +68,7 @@ typedef struct {
 
 struct _EngineRegistration {
     gchar *profile;
+    MuxNetworkPolicy *network_policy;
     pid_t peer_pid;
     int peer_pidfd;
     Client *client;
@@ -276,6 +280,7 @@ static void engine_registration_free(gpointer data)
     if (engine->peer_pidfd >= 0)
         close(engine->peer_pidfd);
     g_free(engine->profile);
+    mux_network_policy_free(engine->network_policy);
     g_free(engine);
 }
 
@@ -358,58 +363,105 @@ static gboolean profile_is_valid(const gchar *profile)
 
 static gboolean peer_view_environment(pid_t pid,
                                       gboolean *ephemeral,
-                                      gchar **profile)
+                                      gchar **profile,
+                                      MuxNetworkPolicy **network_policy)
 {
+    static const gchar *prefixes[] = {
+        "MUX_EPHEMERAL=", "MUX_PROFILE=",
+        "MUX_NETWORK_MODE=", "MUX_TOR_SOCKS_PROXY=",
+    };
     g_autofree gchar *path = NULL;
     g_autofree gchar *contents = NULL;
+    g_autoptr(GPtrArray) stored_values =
+        g_ptr_array_new_with_free_func(g_free);
+    gchar **values;
+    g_autoptr(MuxNetworkPolicy) policy = NULL;
     gsize length = 0;
     gsize offset = 0;
 
-    g_return_val_if_fail(ephemeral != NULL && profile != NULL, FALSE);
+    g_return_val_if_fail(ephemeral != NULL && profile != NULL &&
+                         network_policy != NULL, FALSE);
     *ephemeral = TRUE;
     *profile = g_strdup("default");
+    *network_policy = NULL;
+    g_ptr_array_set_size(stored_values, G_N_ELEMENTS(prefixes));
+    values = (gchar **)stored_values->pdata;
     if (pid <= 0)
         return FALSE;
 
+    /* Only the kernel-bound peer's exec environment selects its policy.
+     * muxd may have been started by a different direct or Tor session. */
     path = g_strdup_printf("/proc/%ld/environ", (long)pid);
     if (!g_file_get_contents(path, &contents, &length, NULL) ||
         length > MAX_PEER_ENVIRONMENT_BYTES)
         return FALSE;
 
-    *ephemeral = FALSE;
     while (offset < length) {
         const gchar *entry = contents + offset;
         gsize remaining = length - offset;
         const gchar *terminator = memchr(entry, '\0', remaining);
-        gsize entry_length = terminator
-            ? (gsize)(terminator - entry)
-            : remaining;
-        const gchar ephemeral_prefix[] = "MUX_EPHEMERAL=";
-        const gchar profile_prefix[] = "MUX_PROFILE=";
+        gsize entry_length;
 
-        if (entry_length >= sizeof(ephemeral_prefix) - 1 &&
-            memcmp(entry,
-                   ephemeral_prefix,
-                   sizeof(ephemeral_prefix) - 1) == 0) {
-            const gchar *value = entry + sizeof(ephemeral_prefix) - 1;
-            gsize value_length =
-                entry_length - (sizeof(ephemeral_prefix) - 1);
+        if (terminator == NULL)
+            return FALSE;
+        entry_length = (gsize)(terminator - entry);
+        for (guint i = 0; i < G_N_ELEMENTS(prefixes); i++) {
+            gsize prefix_length = strlen(prefixes[i]);
 
-            *ephemeral = !(value_length == 1 && value[0] == '0');
-        } else if (entry_length >= sizeof(profile_prefix) - 1 &&
-                   memcmp(entry,
-                          profile_prefix,
-                          sizeof(profile_prefix) - 1) == 0) {
-            g_autofree gchar *candidate = g_strndup(
-                entry + sizeof(profile_prefix) - 1,
-                entry_length - (sizeof(profile_prefix) - 1));
-
-            if (!profile_is_valid(candidate))
+            if (entry_length < prefix_length ||
+                memcmp(entry, prefixes[i], prefix_length) != 0)
+                continue;
+            /* getenv() and /proc parsing must not disagree on duplicates. */
+            if (values[i] != NULL)
                 return FALSE;
-            g_free(*profile);
-            *profile = g_steal_pointer(&candidate);
+            values[i] = g_strndup(entry + prefix_length,
+                                  entry_length - prefix_length);
+            break;
         }
-        offset += entry_length + (terminator != NULL ? 1 : 0);
+        offset += entry_length + 1;
+    }
+
+    if (values[1] != NULL) {
+        if (!profile_is_valid(values[1]))
+            return FALSE;
+        replace_string(profile, g_strdup(values[1]));
+    }
+    policy = mux_network_policy_new(values[2], values[3], NULL);
+    if (policy == NULL)
+        return FALSE;
+    *ephemeral = mux_network_policy_is_ephemeral(
+        policy, values[0] != NULL && g_strcmp0(values[0], "0") != 0);
+    *network_policy = g_steal_pointer(&policy);
+    return TRUE;
+}
+
+static gboolean profile_policy_is_available(Server *server,
+                                              const gchar *profile,
+                                              const MuxNetworkPolicy *policy)
+{
+    const gchar *identity = mux_network_policy_get_identity(policy);
+
+    if (!mux_network_handshake_check_profile(policy, profile, NULL))
+        return FALSE;
+    for (guint i = 0; i < server->clients->len; i++) {
+        const Client *registered = g_ptr_array_index(server->clients, i);
+
+        if (registered->closing || registered->fd < 0 ||
+            registered->network_policy == NULL ||
+            g_strcmp0(registered->profile, profile) != 0)
+            continue;
+        if (g_strcmp0(identity, mux_network_policy_get_identity(
+                                  registered->network_policy)) != 0)
+            return FALSE;
+    }
+    for (guint i = 0; server->engines && i < server->engines->len; i++) {
+        const EngineRegistration *registered =
+            g_ptr_array_index(server->engines, i);
+
+        if (g_strcmp0(registered->profile, profile) == 0 &&
+            g_strcmp0(identity, mux_network_policy_get_identity(
+                                   registered->network_policy)) != 0)
+            return FALSE;
     }
     return TRUE;
 }
@@ -727,6 +779,7 @@ static void client_free(gpointer data)
     g_free(client->kitty_socket);
     g_free(client->kitty_public_key);
     g_free(client->profile);
+    mux_network_policy_free(client->network_policy);
     g_free(client->layer);
     g_free(client->uri);
     g_free(client->title);
@@ -1039,6 +1092,23 @@ static gboolean kitty_operation_async(Server *server,
 
     if (server->pending_kitty_operations->len >= MAX_CLIENTS)
         return FALSE;
+    if (source->network_policy == NULL)
+        return FALSE;
+    environment = g_environ_setenv(environment, "MUX_NETWORK_MODE",
+        mux_network_policy_get_mode(source->network_policy) ==
+            MUX_NETWORK_MODE_TOR ? "tor" : "direct", TRUE);
+    environment = g_environ_unsetenv(environment, "MUX_TOR_SOCKS_PROXY");
+    if (mux_network_policy_get_proxy_uri(source->network_policy) != NULL)
+        environment = g_environ_setenv(environment, "MUX_TOR_SOCKS_PROXY",
+            mux_network_policy_get_proxy_uri(source->network_policy), TRUE);
+    environment = g_environ_setenv(environment, "MUX_PROFILE",
+                                    source->profile, TRUE);
+    environment = g_environ_setenv(environment, "MUX_EPHEMERAL",
+                                    source->ephemeral ? "1" : "0", TRUE);
+    environment = g_environ_unsetenv(environment, "MUX_ENGINE_SOCKET");
+    environment = g_environ_unsetenv(environment, "MUX_PROFILE_DATA_DIR");
+    environment = g_environ_unsetenv(environment, "MUX_PROFILE_CACHE_DIR");
+    environment = g_environ_unsetenv(environment, "MUX_POPUP_TOKEN");
     environment = g_environ_unsetenv(environment, "KITTY_PUBLIC_KEY");
     if (source->kitty_public_key != NULL)
         environment = g_environ_setenv(environment, "KITTY_PUBLIC_KEY",
@@ -1593,8 +1663,11 @@ static gboolean register_engine(Server *server,
                                 guint field_count)
 {
     g_autofree gchar *profile = NULL;
+    g_autofree gchar *peer_profile = NULL;
+    g_autoptr(MuxNetworkPolicy) network_policy = NULL;
     EngineRegistration *engine;
     pid_t claimed_pid;
+    gboolean ephemeral;
 
     if (field_count != 4 ||
         g_strcmp0(fields[1], "1") != 0 ||
@@ -1606,6 +1679,12 @@ static gboolean register_engine(Server *server,
     }
 
     remove_exited_engines(server);
+    if (!peer_view_environment(client->peer_pid, &ephemeral,
+                               &peer_profile, &network_policy) ||
+        !profile_policy_is_available(server, profile, network_policy)) {
+        control_error(client, "invalid engine network policy");
+        return FALSE;
+    }
     engine = find_engine(server, profile);
     if (engine) {
         if (engine->peer_pid != client->peer_pid || engine->client) {
@@ -1621,6 +1700,7 @@ static gboolean register_engine(Server *server,
         }
         engine = g_new0(EngineRegistration, 1);
         engine->profile = g_steal_pointer(&profile);
+        engine->network_policy = g_steal_pointer(&network_policy);
         engine->peer_pid = client->peer_pid;
         engine->peer_pidfd = client->peer_pidfd;
         client->peer_pidfd = -1;
@@ -2005,6 +2085,13 @@ static void handle_line(Server *server, Client *client, const gchar *line)
     }
 
     if (client->kind == CLIENT_UNKNOWN &&
+        g_strcmp0(fields[0], "TOR_POLICY") == 0 &&
+        field_count == 2 && g_strcmp0(fields[1], "1") == 0) {
+        /* Keep this same connection open. Private metadata follows only after
+         * the client learns this daemon enforces profile-bound Tor policy. */
+        client_send_line(client, "TOR_POLICY_OK\t%d",
+                          MUX_TOR_POLICY_VERSION);
+    } else if (client->kind == CLIENT_UNKNOWN &&
         g_strcmp0(fields[0], "ENGINE") == 0) {
         (void)register_engine(server, client, fields, field_count);
     } else if (client->kind == CLIENT_UNKNOWN &&
@@ -2014,9 +2101,18 @@ static void handle_line(Server *server, Client *client, const gchar *line)
                                 &client->kitty_public_key)) {
         g_autofree gchar *proposed_id = mux_decode(fields[1]);
         g_autofree gchar *peer_profile = NULL;
+        g_autoptr(MuxNetworkPolicy) network_policy = NULL;
         guint64 proposed_session_view_id = 0;
         gboolean ephemeral;
 
+        if (!peer_view_environment(client->peer_pid, &ephemeral,
+                                   &peer_profile, &network_policy) ||
+            !profile_policy_is_available(server, peer_profile,
+                                           network_policy)) {
+            control_error(client, "invalid view network policy");
+            g_strfreev(fields);
+            return;
+        }
         client->kind = CLIENT_VIEW;
         client->pid = (long)client->peer_pid;
         client->kitty_window = mux_decode(fields[3]);
@@ -2024,13 +2120,10 @@ static void handle_line(Server *server, Client *client, const gchar *line)
         client->layer = mux_decode(fields[5]);
         client->uri = mux_decode(fields[6]);
         client->title = g_strdup("");
-        client->persistable = peer_view_environment(client->peer_pid,
-                                                    &ephemeral,
-                                                    &peer_profile) &&
-            !ephemeral;
+        client->ephemeral = ephemeral;
+        client->persistable = !ephemeral;
         client->profile = g_steal_pointer(&peer_profile);
-        if (!client->profile)
-            client->profile = g_strdup("default");
+        client->network_policy = g_steal_pointer(&network_policy);
         Client *duplicate = find_view(server, proposed_id);
         if (duplicate && duplicate != client &&
             duplicate->peer_pid == client->peer_pid &&
@@ -2071,6 +2164,9 @@ static void handle_line(Server *server, Client *client, const gchar *line)
                field_count >= 6 && encoded_layer_is_valid(fields[5]) &&
                decode_kitty_public_key(field_count >= 8 ? fields[7] : NULL,
                                        &client->kitty_public_key)) {
+        g_autofree gchar *peer_profile = NULL;
+        g_autoptr(MuxNetworkPolicy) network_policy = NULL;
+
         client->kind = CLIENT_BAR;
         client->id = mux_decode(fields[1]);
         client->pid = strtol(fields[2], NULL, 10);
@@ -2082,12 +2178,19 @@ static void handle_line(Server *server, Client *client, const gchar *line)
             : g_strdup("default");
         client->uri = g_strdup("");
         client->title = g_strdup("");
-        if (!profile_is_valid(client->profile)) {
+        if (!peer_view_environment(client->peer_pid, &client->ephemeral,
+                                   &peer_profile, &network_policy) ||
+            g_strcmp0(client->profile, peer_profile) != 0 ||
+            !profile_policy_is_available(server, client->profile,
+                                           network_policy)) {
             client->closing = TRUE;
-        } else if (client_send_line(client,
+        } else {
+            client->network_policy = g_steal_pointer(&network_policy);
+            if (client_send_line(client,
                              "OK\t%d",
                              MUX_PROTOCOL_VERSION))
-            send_snapshot(server, client);
+                send_snapshot(server, client);
+        }
     } else if (client->kind == CLIENT_UNKNOWN &&
                g_strcmp0(fields[0], "SUB") == 0) {
         client->kind = CLIENT_SUBSCRIBER;
@@ -2935,12 +3038,33 @@ static int ensure_daemon(void)
     return EXIT_FAILURE;
 }
 
+static int ensure_tor_policy_daemon(void)
+{
+    int fd;
+    gboolean supported;
+
+    if (ensure_daemon() != EXIT_SUCCESS)
+        return EXIT_FAILURE;
+    fd = mux_connect_socket();
+    supported = fd >= 0 && mux_require_tor_policy(fd);
+    if (fd >= 0)
+        close(fd);
+    if (!supported) {
+        g_printerr("muxd: running daemon lacks compatible Tor policy support; "
+                   "close your Mux sessions and restart the Mux daemon to use Tor\n");
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && g_strcmp0(argv[1], "--ensure") == 0)
         return ensure_daemon();
+    if (argc > 1 && g_strcmp0(argv[1], "--ensure-tor-policy") == 0)
+        return ensure_tor_policy_daemon();
     if (argc > 1 && g_strcmp0(argv[1], "--foreground") != 0) {
-        g_printerr("usage: muxd [--ensure|--foreground]\n");
+        g_printerr("usage: muxd [--ensure|--ensure-tor-policy|--foreground]\n");
         return EXIT_FAILURE;
     }
     if (daemon_alive()) {

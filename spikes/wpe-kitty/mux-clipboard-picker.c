@@ -3,8 +3,10 @@
 #include <string.h>
 
 #define PICKER_QUERY_MAX_BYTES 512u
-#define PICKER_PANEL_MAX_COLUMNS 100u
-#define PICKER_MIN_ROWS 6u
+#define PICKER_PANEL_MAX_COLUMNS 88u
+#define PICKER_PANEL_MAX_ROWS 14u
+#define PICKER_PAGE_MAX_ITEMS 6u
+#define PICKER_PANEL_STYLE "\033[0;38;5;252;48;5;234m"
 
 struct _MuxClipboardPickerItem {
     gatomicrefcount references;
@@ -459,6 +461,19 @@ delete_last_word(MuxClipboardPicker *picker)
     *cursor = '\0';
 }
 
+static gboolean
+history_has_unpinned_items(const MuxClipboardPicker *picker)
+{
+    for (guint index = 0; index < picker->items->len; index++) {
+        const MuxClipboardPickerItem *item =
+            g_ptr_array_index(picker->items, index);
+
+        if (!item->pinned)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 gboolean
 mux_clipboard_picker_handle_key(MuxClipboardPicker *picker,
                                 MuxClipboardPickerKey key,
@@ -557,6 +572,8 @@ mux_clipboard_picker_handle_key(MuxClipboardPicker *picker,
         out_action->entry_id = selected->id;
         break;
     case MUX_CLIPBOARD_PICKER_KEY_CLEAR_HISTORY:
+        if (!history_has_unpinned_items(picker))
+            return FALSE;
         out_action->kind = MUX_CLIPBOARD_PICKER_ACTION_CLEAR;
         break;
     default:
@@ -651,87 +668,144 @@ format_size(gsize size)
 static void
 append_panel_line(GString *output,
                   const gchar *content,
-                  guint inside_width,
+                  guint panel_width,
+                  gboolean framed,
                   const gchar *style)
 {
+    guint inside_width = framed ? panel_width - 4 : panel_width;
     g_autofree gchar *clipped = clip_text(content, inside_width);
     guint padding = inside_width - text_width(clipped);
 
-    g_string_append(output, "\033[2K\033[38;5;37m|\033[0m ");
+    if (output->len > 0)
+        g_string_append(output, "\r\n");
+    g_string_append(output, PICKER_PANEL_STYLE);
+    if (framed)
+        g_string_append(output, "\033[38;5;37m| " PICKER_PANEL_STYLE);
     if (style != NULL)
         g_string_append(output, style);
     g_string_append(output, clipped);
     while (padding-- > 0)
         g_string_append_c(output, ' ');
-    if (style != NULL)
-        g_string_append(output, "\033[0m");
-    g_string_append(output, " \033[38;5;37m|\033[0m\r\n");
+    if (framed)
+        g_string_append(output, PICKER_PANEL_STYLE "\033[38;5;37m |");
+    g_string_append(output, "\033[0m");
 }
 
 static void
 append_border(GString *output, guint panel_width)
 {
-    guint index;
-
-    g_string_append(output, "\033[2K\033[38;5;37m+");
-    for (index = 0; index < panel_width - 2; index++)
+    if (output->len > 0)
+        g_string_append(output, "\r\n");
+    g_string_append(output, PICKER_PANEL_STYLE "\033[38;5;37m+");
+    for (guint index = 0; index < panel_width - 2; index++)
         g_string_append_c(output, '-');
-    g_string_append(output, "+\033[0m\r\n");
+    g_string_append(output, "+\033[0m");
 }
 
 gchar *
-mux_clipboard_picker_render(MuxClipboardPicker *picker,
-                            guint terminal_columns,
-                            guint terminal_rows)
+mux_clipboard_picker_render_full(MuxClipboardPicker *picker,
+                                 guint terminal_columns,
+                                 guint terminal_rows,
+                                 gboolean ready)
 {
+    static const gchar *empty_history[] = {
+        "No clipboard history in this profile yet.",
+        "Copy in this profile to add an item.",
+        "History from other profiles stays separate.",
+    };
+    static const gchar *no_results[] = {
+        "No matches for this search.",
+        "Try a shorter query, or clear the search.",
+    };
+    const MuxClipboardPickerItem *selected;
     GString *output;
+    GString *footer;
     guint panel_width;
+    guint maximum_rows;
     guint inside_width;
-    guint row_count;
-    guint row;
+    guint content_budget;
+    guint header_rows;
+    guint footer_rows;
+    guint body_rows;
+    guint list_rows;
+    gboolean framed;
+    gboolean detailed_actions;
+    gboolean query_present;
+    gboolean has_status;
     g_autofree gchar *title = NULL;
+    g_autofree gchar *profile = NULL;
+    g_autofree gchar *visible_query = NULL;
     g_autofree gchar *query = NULL;
-    g_autofree gchar *footer = NULL;
 
     g_return_val_if_fail(picker != NULL, NULL);
 
-    panel_width = MIN(MAX(terminal_columns, 4u),
-                      PICKER_PANEL_MAX_COLUMNS);
-    row_count = terminal_rows > 5 ? terminal_rows - 5 : 1;
-    row_count = MAX(row_count, 1u);
-    if (terminal_rows >= PICKER_MIN_ROWS)
-        row_count = MIN(row_count, terminal_rows - 5);
-    picker->page_rows = row_count;
+    if (terminal_columns == 0 || terminal_rows == 0)
+        return g_strdup("");
+
+    panel_width = MIN(terminal_columns, PICKER_PANEL_MAX_COLUMNS);
+    maximum_rows = MIN(terminal_rows, PICKER_PANEL_MAX_ROWS);
+    framed = panel_width >= 32 && maximum_rows >= 8;
+    inside_width = framed ? panel_width - 4 : panel_width;
+    content_budget = maximum_rows - (framed ? 2u : 0u);
+    header_rows = content_budget >= 5 ? 3 : content_budget >= 3 ? 2 : 1;
+    selected = mux_clipboard_picker_get_selected(picker);
+    detailed_actions = ready && selected != NULL &&
+                       inside_width >= 40 && content_budget >= 7;
+    footer_rows = detailed_actions ? 2 : content_budget >= 2 ? 1 : 0;
+    body_rows = content_budget - header_rows - footer_rows;
+    query_present = picker->query[0] != '\0';
+    has_status = picker->status[0] != '\0';
+    list_rows = MIN(picker->matches->len, PICKER_PAGE_MAX_ITEMS);
+    list_rows = MIN(list_rows, body_rows - (has_status && body_rows > 0 ? 1u : 0u));
+    picker->page_rows = MAX(list_rows, 1u);
     keep_selection_visible(picker);
-    inside_width = panel_width - 4;
+
+    visible_query = normalise_visible_text(picker->query);
+    query = g_strdup_printf("Search: %s",
+                             query_present ? visible_query : "type to filter");
+    if (content_budget <= 2 && has_status) {
+        title = g_strdup_printf("Clipboard: %s", picker->status);
+    } else if (content_budget == 1 && query_present) {
+        title = g_strdup(query);
+    } else if (content_budget <= 2 && picker->matches->len == 0) {
+        title = g_strdup(picker->items->len == 0
+                             ? "Clipboard: empty"
+                             : "Clipboard: no matches");
+    } else if (picker->matches->len > 0) {
+        title = g_strdup_printf("Clipboard history  |  %u of %u",
+                                 picker->selected + 1,
+                                 picker->matches->len);
+    } else {
+        title = g_strdup("Clipboard history");
+    }
+    profile = g_strdup_printf("Profile: %s  |  %u item%s",
+                               picker->profile[0] != '\0'
+                                   ? picker->profile : "default",
+                               picker->items->len,
+                               picker->items->len == 1 ? "" : "s");
 
     output = g_string_new(NULL);
-    title = g_strdup_printf("CLIPBOARD / %s / %u of %u",
-                            *picker->profile != '\0' ? picker->profile : "default",
-                            picker->matches->len == 0 ? 0 : picker->selected + 1,
-                            picker->matches->len);
-    query = g_strdup_printf("> %s", picker->query);
-    if (*picker->status != '\0') {
-        footer = g_strdup_printf(
-            "%s | enter paste  alt-p pin  alt-d delete  alt-c clear  esc close",
-            picker->status);
-    } else {
-        footer = g_strdup(
-            "enter paste  alt-p pin  alt-d delete  alt-c clear  esc close");
+    if (framed)
+        append_border(output, panel_width);
+    append_panel_line(output, title, panel_width, framed, "\033[1;38;5;223m");
+    if (header_rows >= 3)
+        append_panel_line(output, profile, panel_width, framed,
+                           "\033[38;5;245m");
+    if (header_rows >= 2)
+        append_panel_line(output, query, panel_width, framed,
+                           query_present ? "\033[1;38;5;81m"
+                                         : "\033[38;5;245m");
+
+    if (has_status && body_rows > 0) {
+        append_panel_line(output, picker->status, panel_width, framed,
+                           "\033[38;5;223m");
+        body_rows--;
     }
-
-    append_border(output, panel_width);
-    append_panel_line(output, title, inside_width, "\033[1;38;5;223m");
-    append_panel_line(output, query, inside_width, "\033[1;38;5;81m");
-
-    for (row = 0; row < row_count; row++) {
-        guint match_index = picker->top + row;
-
-        if (match_index < picker->matches->len) {
+    if (picker->matches->len > 0) {
+        for (guint row = 0; row < list_rows; row++) {
+            guint match_index = picker->top + row;
             MuxClipboardPickerMatch *match = &g_array_index(
-                picker->matches,
-                MuxClipboardPickerMatch,
-                match_index);
+                picker->matches, MuxClipboardPickerMatch, match_index);
             MuxClipboardPickerItem *item = match->item;
             g_autofree gchar *age = format_age(item->created_us);
             g_autofree gchar *size = format_size(item->total_size);
@@ -740,27 +814,136 @@ mux_clipboard_picker_render(MuxClipboardPicker *picker,
                 item->pinned ? '*' : ' ',
                 age,
                 size,
-                *item->origin != '\0' ? item->origin : "unknown",
-                *item->preview != '\0' ? item->preview : "[binary data]",
+                item->origin[0] != '\0' ? item->origin : "unknown",
+                item->preview[0] != '\0' ? item->preview : "[binary data]",
                 item->format_count);
 
-            append_panel_line(output,
-                              line,
-                              inside_width,
-                              match_index == picker->selected
-                                  ? "\033[1;30;48;5;223m"
-                                  : NULL);
-        } else if (picker->matches->len == 0 && row == 0) {
-            append_panel_line(output,
-                              "no matching clipboard entries",
-                              inside_width,
-                              "\033[2m");
-        } else {
-            append_panel_line(output, "", inside_width, NULL);
+            append_panel_line(output, line, panel_width, framed,
+                               match_index == picker->selected
+                                   ? "\033[1;30;48;5;223m" : NULL);
         }
+    } else if (has_status) {
+        if (body_rows > 0)
+            append_panel_line(output,
+                               "History from other profiles stays separate.",
+                               panel_width, framed, "\033[38;5;245m");
+    } else {
+        const gchar *const *messages = picker->items->len == 0
+            ? empty_history : no_results;
+        guint message_count = picker->items->len == 0
+            ? G_N_ELEMENTS(empty_history) : G_N_ELEMENTS(no_results);
+
+        for (guint row = 0; row < MIN(body_rows, message_count); row++)
+            append_panel_line(output, messages[row], panel_width, framed,
+                               row == 0 ? NULL : "\033[38;5;245m");
     }
 
-    append_panel_line(output, footer, inside_width, "\033[2m");
-    append_border(output, panel_width);
+    footer = g_string_new("Esc close");
+    if (detailed_actions) {
+        g_autofree gchar *actions = g_strdup_printf(
+            "Enter paste  Alt+P %s  Alt+D delete",
+            selected->pinned ? "unpin" : "pin");
+
+        append_panel_line(output, actions, panel_width, framed,
+                           "\033[38;5;245m");
+    } else if (ready && selected != NULL) {
+        g_string_append(footer, "  Enter paste");
+    }
+    if (ready && query_present)
+        g_string_append(footer, inside_width >= 40
+                                   ? "  Ctrl+U clear search"
+                                   : "  Ctrl+U reset");
+    if (ready && history_has_unpinned_items(picker) &&
+        (detailed_actions || selected == NULL))
+        g_string_append(footer, "  Alt+C clear unpinned");
+    if (footer_rows > 0)
+        append_panel_line(output, footer->str, panel_width, framed,
+                           "\033[38;5;245m");
+    g_string_free(footer, TRUE);
+    if (framed)
+        append_border(output, panel_width);
+    return g_string_free(output, FALSE);
+}
+
+gchar *
+mux_clipboard_picker_render(MuxClipboardPicker *picker,
+                            guint terminal_columns,
+                            guint terminal_rows)
+{
+    return mux_clipboard_picker_render_full(picker, terminal_columns,
+                                            terminal_rows, TRUE);
+}
+
+static void
+append_surface_clear(GString *output,
+                      MuxClipboardPickerSurface *surface,
+                      guint terminal_columns,
+                      guint terminal_rows)
+{
+    for (guint row = 1; row <= MIN(surface->painted_rows, terminal_rows); row++)
+        g_string_append_printf(output, "\033[%u;1H\033[0m\033[2K", row);
+    /* A smaller viewport cannot erase offscreen cells. Keep that footprint
+     * until a later resize exposes it, including when the picker has closed. */
+    if (terminal_rows >= surface->painted_rows &&
+        terminal_columns >= surface->painted_columns) {
+        surface->painted_rows = 0;
+        surface->painted_columns = 0;
+    }
+}
+
+gchar *
+mux_clipboard_picker_surface_present(MuxClipboardPickerSurface *surface,
+                                     const gchar *panel,
+                                     guint terminal_columns,
+                                     guint terminal_rows)
+{
+    GString *output;
+    guint panel_width;
+    guint left;
+    guint top;
+    guint line_count;
+    g_auto(GStrv) lines = NULL;
+
+    g_return_val_if_fail(surface != NULL, NULL);
+
+    if (terminal_columns == 0 || terminal_rows == 0)
+        return g_strdup("");
+    if (panel == NULL || panel[0] == '\0')
+        return mux_clipboard_picker_surface_clear(surface, terminal_columns,
+                                                   terminal_rows);
+
+    panel_width = MIN(terminal_columns, PICKER_PANEL_MAX_COLUMNS);
+    left = (terminal_columns - panel_width) / 2 + 1;
+    top = terminal_rows >= PICKER_PANEL_MAX_ROWS + 2 ? 2 : 1;
+    lines = g_strsplit(panel, "\r\n", -1);
+    line_count = MIN(g_strv_length(lines), terminal_rows - top + 1);
+    output = g_string_new("\0337");
+    append_surface_clear(output, surface, terminal_columns, terminal_rows);
+    for (guint row = 0; row < line_count; row++) {
+        g_string_append_printf(output, "\033[%u;%uH", top + row, left);
+        g_string_append(output, lines[row]);
+    }
+    surface->painted_rows = MAX(surface->painted_rows, top + line_count - 1);
+    surface->painted_columns = MAX(surface->painted_columns,
+                                   left + panel_width - 1);
+    g_string_append(output, "\033[0m\0338");
+    return g_string_free(output, FALSE);
+}
+
+gchar *
+mux_clipboard_picker_surface_clear(MuxClipboardPickerSurface *surface,
+                                   guint terminal_columns,
+                                   guint terminal_rows)
+{
+    GString *output;
+
+    g_return_val_if_fail(surface != NULL, NULL);
+
+    if (surface->painted_rows == 0 ||
+        terminal_columns == 0 || terminal_rows == 0)
+        return g_strdup("");
+    output = g_string_new("\0337");
+    append_surface_clear(output, surface, terminal_columns, terminal_rows);
+    g_string_append(output, "\0338");
     return g_string_free(output, FALSE);
 }

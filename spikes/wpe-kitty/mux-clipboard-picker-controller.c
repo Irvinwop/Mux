@@ -453,7 +453,7 @@ mux_clipboard_picker_controller_render(
 
     if (controller->state == MUX_CLIPBOARD_PICKER_CONTROLLER_CLOSED)
         return NULL;
-    return mux_clipboard_picker_render(controller->picker,
-                                       terminal_columns,
-                                       terminal_rows);
+    return mux_clipboard_picker_render_full(
+        controller->picker, terminal_columns, terminal_rows,
+        controller->state == MUX_CLIPBOARD_PICKER_CONTROLLER_READY);
 }

@@ -7,6 +7,13 @@ G_BEGIN_DECLS
 typedef struct _MuxClipboardPickerItem MuxClipboardPickerItem;
 typedef struct _MuxClipboardPicker MuxClipboardPicker;
 
+/* Zero-initialize per terminal surface. Hidden resize damage is retained until
+ * it can be cleared, even after the picker closes. */
+typedef struct {
+    guint painted_rows;
+    guint painted_columns;
+} MuxClipboardPickerSurface;
+
 typedef enum {
     MUX_CLIPBOARD_PICKER_KEY_TEXT,
     MUX_CLIPBOARD_PICKER_KEY_BACKSPACE,
@@ -94,9 +101,26 @@ gboolean mux_clipboard_picker_handle_key(
     gunichar text,
     MuxClipboardPickerAction *out_action);
 
-/* Returns a complete ANSI panel without moving or saving the cursor. */
+/* Returns a bounded, opaque ANSI panel. CRLF separates rows, with no trailing
+ * newline, cursor positioning, or screen erasure. Zero size returns "". */
 gchar *mux_clipboard_picker_render(MuxClipboardPicker *picker,
                                   guint terminal_columns,
                                   guint terminal_rows);
+/* A busy controller passes ready=FALSE so only its close action is advertised. */
+gchar *mux_clipboard_picker_render_full(MuxClipboardPicker *picker,
+                                       guint terminal_columns,
+                                       guint terminal_rows,
+                                       gboolean ready);
+
+/* Present only a panel produced by the renderer above. These helpers save and
+ * restore the cursor and clear only rows touched by this surface. Call clear
+ * on close and subsequent resizes so hidden old cells cannot reappear. */
+gchar *mux_clipboard_picker_surface_present(MuxClipboardPickerSurface *surface,
+                                           const gchar *panel,
+                                           guint terminal_columns,
+                                           guint terminal_rows);
+gchar *mux_clipboard_picker_surface_clear(MuxClipboardPickerSurface *surface,
+                                         guint terminal_columns,
+                                         guint terminal_rows);
 
 G_END_DECLS

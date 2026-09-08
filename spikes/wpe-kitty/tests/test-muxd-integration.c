@@ -1391,6 +1391,449 @@ static void restore_environment(const gchar *name, const gchar *value)
         }                                                                   \
     } G_STMT_END
 
+/* exec makes /proc/PID/environ describe the peer, not the runner's startup. */
+static int network_policy_peer(const gchar *socket_path,
+                                const gchar *window,
+                                const gchar *ready_path,
+                                const gchar *expectation,
+                                const gchar *role)
+{
+    g_autoptr(GError) error = NULL;
+    g_autofree gchar *assigned = NULL;
+    g_autofree gchar *response = NULL;
+    int fd = connect_unix_socket(socket_path, CONNECT_TIMEOUT_MS, &error);
+    gboolean accepted = FALSE;
+
+    if (fd < 0)
+        return 2;
+    if (g_strcmp0(g_getenv("MUX_NETWORK_MODE"), "tor") == 0 &&
+        !mux_require_tor_policy(fd)) {
+        close(fd);
+        return 3;
+    }
+    if (g_strcmp0(role, "view") == 0) {
+        accepted = register_view_with_context(fd, "", window,
+            "integration-kitty", "1:policy-peer", "main",
+            &assigned, &error);
+    } else {
+        g_autofree gchar *profile = mux_encode(g_getenv("MUX_PROFILE"));
+        gboolean sent;
+
+        if (g_strcmp0(role, "engine") == 0) {
+            sent = mux_send_line(fd, "ENGINE\t1\t%s\t%ld",
+                                  profile, (long)getpid());
+        } else {
+            g_autofree gchar *id = mux_encode("policy-bar");
+            g_autofree gchar *kitty_window = mux_encode(window);
+            g_autofree gchar *kitty_socket = mux_encode("integration-kitty");
+            g_autofree gchar *layer = mux_encode("main");
+            g_autofree gchar *key = mux_encode("1:policy-peer");
+
+            sent = mux_send_line(fd, "BAR\t%s\t%ld\t%s\t%s\t%s\t%s\t%s",
+                id, (long)getpid(), kitty_window, kitty_socket, layer,
+                profile, key);
+        }
+        if (sent)
+            response = mux_read_line(fd, RESPONSE_TIMEOUT_MS);
+        accepted = g_strcmp0(response,
+            g_strcmp0(role, "engine") == 0 ? "ENGINE_OK\t1" : "OK\t1") == 0;
+        assigned = g_strdup(role);
+    }
+    if (g_strcmp0(expectation, "reject") == 0) {
+        close(fd);
+        return !accepted && publish_marker(ready_path, "rejected") ? 0 : 4;
+    }
+    if (!accepted || !publish_marker(ready_path, assigned)) {
+        close(fd);
+        return 5;
+    }
+    while (TRUE) {
+        g_autofree gchar *line = mux_read_line(fd, -1);
+
+        if (line == NULL)
+            break;
+        if (g_str_has_prefix(line, "DO\tQUIT\t")) {
+            (void)mux_send_line(fd, "BYE");
+            break;
+        }
+    }
+    close(fd);
+    return 0;
+}
+
+static pid_t spawn_network_policy_peer(const gchar *socket_path,
+                                        const gchar *profile,
+                                        const gchar *mode,
+                                        const gchar *proxy,
+                                        const gchar *window,
+                                        const gchar *ready_path,
+                                        const gchar *expectation,
+                                        const gchar *role,
+                                        GError **error)
+{
+    pid_t child = fork();
+
+    if (child < 0) {
+        set_errno_error(error, "fork network-policy peer", errno);
+        return -1;
+    }
+    if (child == 0) {
+        child_redirect_to_null();
+        g_setenv("MUX_PROFILE", profile, TRUE);
+        g_setenv("MUX_EPHEMERAL", "0", TRUE);
+        restore_environment("MUX_NETWORK_MODE", mode);
+        restore_environment("MUX_TOR_SOCKS_PROXY", proxy);
+        execl("/proc/self/exe", "test-muxd-integration",
+              "--network-policy-peer", socket_path, window, ready_path,
+              expectation, role, (char *)NULL);
+        _exit(127);
+    }
+    return child;
+}
+
+static void test_muxd_network_policy_registration(void)
+{
+    static const gchar kitten_script[] =
+        "#!/bin/sh\n"
+        "[ \"$KITTY_PUBLIC_KEY\" = '1:policy-peer' ] || exit 60\n"
+        "case \"$*\" in\n"
+        "  *\"focus-window\"*\"--match id:701\")\n"
+        "    [ \"$MUX_NETWORK_MODE\" = tor ] || exit 61\n"
+        "    [ \"$MUX_TOR_SOCKS_PROXY\" = socks5://127.0.0.1:9050 ] || exit 62\n"
+        "    [ \"$MUX_PROFILE\" = tor-private-aaaaaaaa ] || exit 63\n"
+        "    [ \"$MUX_EPHEMERAL\" = 1 ] || exit 64\n"
+        "    ;;\n"
+        "  *\"focus-window\"*\"--match id:702\")\n"
+        "    [ \"$MUX_NETWORK_MODE\" = direct ] || exit 61\n"
+        "    [ \"${MUX_TOR_SOCKS_PROXY+x}\" != x ] || exit 62\n"
+        "    [ \"$MUX_PROFILE\" = default ] || exit 63\n"
+        "    [ \"$MUX_EPHEMERAL\" = 0 ] || exit 64\n"
+        "    ;;\n"
+        "  *) exit 65 ;;\n"
+        "esac\n"
+        "[ \"${MUX_ENGINE_SOCKET+x}\" != x ] || exit 66\n";
+    static const struct {
+        const gchar *profile;
+        const gchar *mode;
+        const gchar *proxy;
+        const gchar *role;
+    } rejected[] = {
+        { "tor-private-aaaaaaaa", "tor", "socks5://127.0.0.1:9150", "view" },
+        { "tor-private-aaaaaaaa", "tor", "socks5://127.0.0.1:9150", "bar" },
+        { "tor-private-aaaaaaaa", "tor", "socks5://127.0.0.1:9150", "engine" },
+        { "tor-private-aaaaaaaa", NULL, NULL, "view" },
+        { "tor-private-aaaaaaaa", "direct", NULL, "engine" },
+        { "ordinary", "tor", "socks5://127.0.0.1:9050", "view" },
+        { "tor-private-short", "tor", "socks5://127.0.0.1:9050", "view" },
+        { "tor-private-bbbbbbbb", "tor", "socks5://localhost:9050", "view" },
+        { "default", "direct", "socks5://127.0.0.1:9050", "view" },
+        { "default", "unknown", NULL, "view" },
+    };
+    g_autofree gchar *root = NULL;
+    g_autofree gchar *runtime_dir = NULL;
+    g_autofree gchar *state_dir = NULL;
+    g_autofree gchar *bin_dir = NULL;
+    g_autofree gchar *kitten_path = NULL;
+    g_autofree gchar *socket_path = NULL;
+    g_autofree gchar *daemon_log = NULL;
+    g_autofree gchar *ready_path = NULL;
+    g_autofree gchar *path_value = NULL;
+    g_autofree gchar *tor_id = NULL;
+    g_autofree gchar *direct_id = NULL;
+    g_autofree gchar *old_runtime = g_strdup(g_getenv("XDG_RUNTIME_DIR"));
+    g_autofree gchar *old_state = g_strdup(g_getenv("XDG_STATE_HOME"));
+    g_autofree gchar *old_path = g_strdup(g_getenv("PATH"));
+    g_autofree gchar *old_mode = g_strdup(g_getenv("MUX_NETWORK_MODE"));
+    g_autofree gchar *old_proxy = g_strdup(g_getenv("MUX_TOR_SOCKS_PROXY"));
+    g_autofree gchar *old_profile = g_strdup(g_getenv("MUX_PROFILE"));
+    g_autofree gchar *old_ephemeral = g_strdup(g_getenv("MUX_EPHEMERAL"));
+    g_autofree gchar *old_key = g_strdup(g_getenv("KITTY_PUBLIC_KEY"));
+    g_autofree gchar *old_engine_socket = g_strdup(g_getenv("MUX_ENGINE_SOCKET"));
+    g_autoptr(GError) error = NULL;
+    pid_t daemon_pid = -1;
+    pid_t peers[4] = { -1, -1, -1, -1 };
+    pid_t rejected_pid = -1;
+    int fd = -1;
+    mode_t old_umask = umask(0077);
+
+    root = g_dir_make_tmp("muxd-network-policy-XXXXXX", &error);
+    REQUIRE_CALL(root != NULL, "create policy test root");
+    runtime_dir = g_build_filename(root, "runtime", NULL);
+    state_dir = g_build_filename(root, "state", NULL);
+    bin_dir = g_build_filename(root, "bin", NULL);
+    kitten_path = g_build_filename(bin_dir, "kitten", NULL);
+    ready_path = g_build_filename(root, "peer-ready", NULL);
+    daemon_log = g_build_filename(root, "muxd.log", NULL);
+    socket_path = g_build_filename(runtime_dir, "mux", "muxd.sock", NULL);
+    REQUIRE(g_mkdir(runtime_dir, 0700) == 0 &&
+            g_mkdir(state_dir, 0700) == 0 && g_mkdir(bin_dir, 0700) == 0,
+            "create policy test directories: %s", g_strerror(errno));
+    REQUIRE_CALL(g_file_set_contents(kitten_path, kitten_script, -1, &error),
+                  "write policy-aware mock kitten");
+    REQUIRE(g_chmod(kitten_path, 0700) == 0, "chmod policy mock kitten");
+    path_value = g_strdup_printf("%s:%s", bin_dir,
+                                  old_path != NULL ? old_path : "");
+    g_setenv("XDG_RUNTIME_DIR", runtime_dir, TRUE);
+    g_setenv("XDG_STATE_HOME", state_dir, TRUE);
+    g_setenv("PATH", path_value, TRUE);
+    g_setenv("MUX_NETWORK_MODE", "direct", TRUE);
+    g_unsetenv("MUX_TOR_SOCKS_PROXY");
+    g_setenv("MUX_PROFILE", "daemon-startup", TRUE);
+    g_setenv("MUX_EPHEMERAL", "0", TRUE);
+    g_setenv("MUX_ENGINE_SOCKET", "/tmp/stale-daemon-engine.sock", TRUE);
+    g_setenv("KITTY_PUBLIC_KEY", "1:stale-daemon", TRUE);
+    daemon_pid = spawn_logged_daemon(daemon_log, &error);
+    REQUIRE_CALL(daemon_pid > 0, "start direct-mode daemon");
+    fd = connect_unix_socket(socket_path, CONNECT_TIMEOUT_MS, &error);
+    REQUIRE_CALL(fd >= 0, "connect to direct-mode daemon");
+    REQUIRE(mux_require_tor_policy(fd),
+            "new daemon did not attest Tor policy support");
+    close(fd);
+    fd = -1;
+    REQUIRE_CALL(run_command(muxd_executable, "--ensure-tor-policy",
+                              CHILD_TIMEOUT_MS, &error),
+                  "reuse policy-capable direct daemon for Tor");
+
+    peers[0] = spawn_network_policy_peer(socket_path,
+        "tor-private-aaaaaaaa", "tor", "socks5://127.0.0.1:9050",
+        "701", ready_path, "accept", "view", &error);
+    REQUIRE_CALL(peers[0] > 0, "start Tor view");
+    REQUIRE(wait_for_path(ready_path, STATE_TIMEOUT_MS),
+            "Tor view did not register");
+    REQUIRE_CALL(g_file_get_contents(ready_path, &tor_id, NULL, &error),
+                  "read Tor view identity");
+    REQUIRE(g_str_has_prefix(tor_id, "transient-"),
+            "Tor peer with MUX_EPHEMERAL=0 received persistent identity %s", tor_id);
+    REQUIRE(g_unlink(ready_path) == 0, "clear Tor registration marker");
+
+    peers[1] = spawn_network_policy_peer(socket_path,
+        "default", "direct", NULL, "702", ready_path, "accept", "view", &error);
+    REQUIRE_CALL(peers[1] > 0, "start direct view alongside Tor");
+    REQUIRE(wait_for_path(ready_path, STATE_TIMEOUT_MS),
+            "direct view did not register");
+    REQUIRE_CALL(g_file_get_contents(ready_path, &direct_id, NULL, &error),
+                  "read direct view identity");
+    REQUIRE(persistent_view_id_is_valid(direct_id),
+            "direct peer lost persistent identity: %s", direct_id);
+    REQUIRE(g_unlink(ready_path) == 0, "clear direct registration marker");
+
+    for (guint i = 2; i < G_N_ELEMENTS(peers); i++) {
+        peers[i] = spawn_network_policy_peer(socket_path,
+            "tor-private-aaaaaaaa", "tor", "socks5://127.0.0.1:9050",
+            "703", ready_path, "accept", i == 2 ? "bar" : "engine", &error);
+        REQUIRE_CALL(peers[i] > 0, "start matching Tor bar or engine");
+        REQUIRE(wait_for_path(ready_path, STATE_TIMEOUT_MS),
+                "matching Tor %s did not register", i == 2 ? "bar" : "engine");
+        REQUIRE(g_unlink(ready_path) == 0, "clear matching policy marker");
+    }
+
+    for (guint i = 0; i < G_N_ELEMENTS(rejected); i++) {
+        gboolean denied;
+
+        rejected_pid = spawn_network_policy_peer(socket_path,
+            rejected[i].profile, rejected[i].mode, rejected[i].proxy,
+            "704", ready_path, "reject", rejected[i].role, &error);
+        REQUIRE_CALL(rejected_pid > 0, "start invalid-policy peer");
+        denied = wait_child_success(rejected_pid, CHILD_TIMEOUT_MS, &error);
+        rejected_pid = -1;
+        REQUIRE_CALL(denied, "reject lost, malformed, or mismatched peer policy");
+        REQUIRE(wait_for_path(ready_path, STATE_TIMEOUT_MS),
+                "invalid policy case %u was not rejected", i);
+        REQUIRE(g_unlink(ready_path) == 0, "clear rejected policy marker");
+    }
+    REQUIRE_CALL(wait_for_view_count(socket_path, 2, STATE_TIMEOUT_MS, &error),
+                  "invalid registrations did not change live views");
+
+    for (guint i = 0; i < 2; i++) {
+        g_autofree gchar *response = NULL;
+
+        fd = request_control_target(socket_path, "FOCUS",
+                                      i == 0 ? tor_id : direct_id, &error);
+        REQUIRE_CALL(fd >= 0, "focus a policy-bound source");
+        response = mux_read_line(fd, RESPONSE_TIMEOUT_MS);
+        REQUIRE(g_strcmp0(response, "OK") == 0,
+                "Kitty command used stale daemon policy: %s",
+                response != NULL ? response : "(none)");
+        close(fd);
+        fd = -1;
+    }
+    REQUIRE_CALL(run_command(muxd_executable, "--ensure",
+                              CHILD_TIMEOUT_MS, &error),
+                  "direct ensure remains compatible with mixed profiles");
+
+cleanup:
+    if (fd >= 0)
+        close(fd);
+    if (rejected_pid > 0)
+        reap_forcefully(rejected_pid);
+    for (guint i = 0; i < G_N_ELEMENTS(peers); i++)
+        reap_forcefully(peers[i]);
+    if (daemon_pid > 0) {
+        g_autoptr(GError) stop_error = NULL;
+
+        if (!stop_identified_daemon(socket_path, daemon_pid, &stop_error)) {
+            g_test_message("stop policy-test daemon: %s",
+                            stop_error != NULL ? stop_error->message : "unknown");
+            g_test_fail();
+            reap_forcefully(daemon_pid);
+        } else if (!wait_child_success(daemon_pid, CHILD_TIMEOUT_MS, &stop_error)) {
+            g_test_message("reap policy-test daemon: %s", stop_error->message);
+            g_test_fail();
+        }
+    }
+    remove_tree(root);
+    restore_environment("XDG_RUNTIME_DIR", old_runtime);
+    restore_environment("XDG_STATE_HOME", old_state);
+    restore_environment("PATH", old_path);
+    restore_environment("MUX_NETWORK_MODE", old_mode);
+    restore_environment("MUX_TOR_SOCKS_PROXY", old_proxy);
+    restore_environment("MUX_PROFILE", old_profile);
+    restore_environment("MUX_EPHEMERAL", old_ephemeral);
+    restore_environment("MUX_ENGINE_SOCKET", old_engine_socket);
+    restore_environment("KITTY_PUBLIC_KEY", old_key);
+    (void)umask(old_umask);
+}
+
+static pid_t spawn_legacy_policy_daemon(const gchar *socket_path, GError **error)
+{
+    struct sockaddr_un address = { .sun_family = AF_UNIX };
+    int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    pid_t child;
+
+    if (listener < 0) {
+        set_errno_error(error, "create legacy daemon socket", errno);
+        return -1;
+    }
+    g_strlcpy(address.sun_path, socket_path, sizeof(address.sun_path));
+    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) < 0 ||
+        listen(listener, 4) < 0 || g_chmod(socket_path, 0600) < 0) {
+        int saved_errno = errno;
+
+        close(listener);
+        set_errno_error(error, "listen as legacy daemon", saved_errno);
+        return -1;
+    }
+    child = fork();
+    if (child == 0) {
+        while (TRUE) {
+            g_autofree gchar *request = NULL;
+            int fd;
+
+            do {
+                fd = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+            } while (fd < 0 && errno == EINTR);
+            if (fd < 0)
+                _exit(2);
+            request = mux_read_line(fd, RESPONSE_TIMEOUT_MS);
+            if (g_strcmp0(request, "CTL\tPING") == 0)
+                (void)mux_send_line(fd, "PONG\t1");
+            close(fd);
+        }
+    }
+    if (child < 0)
+        set_errno_error(error, "fork legacy daemon", errno);
+    close(listener);
+    return child;
+}
+
+static void test_muxd_legacy_tor_policy_fence(void)
+{
+    g_autofree gchar *root = NULL;
+    g_autofree gchar *runtime_dir = NULL;
+    g_autofree gchar *mux_dir = NULL;
+    g_autofree gchar *socket_path = NULL;
+    g_autofree gchar *old_runtime = g_strdup(g_getenv("XDG_RUNTIME_DIR"));
+    g_autoptr(GError) error = NULL;
+    struct stat before;
+    struct stat after;
+    pid_t child = -1;
+    mode_t old_umask = umask(0077);
+
+    root = g_dir_make_tmp("muxd-legacy-policy-XXXXXX", &error);
+    REQUIRE_CALL(root != NULL, "create legacy daemon test root");
+    runtime_dir = g_build_filename(root, "runtime", NULL);
+    mux_dir = g_build_filename(runtime_dir, "mux", NULL);
+    socket_path = g_build_filename(mux_dir, "muxd.sock", NULL);
+    REQUIRE(g_mkdir_with_parents(mux_dir, 0700) == 0,
+            "create legacy daemon runtime directory");
+    g_setenv("XDG_RUNTIME_DIR", runtime_dir, TRUE);
+    child = spawn_legacy_policy_daemon(socket_path, &error);
+    REQUIRE_CALL(child > 0, "start legacy protocol daemon");
+    REQUIRE(lstat(socket_path, &before) == 0, "identify legacy daemon socket");
+    REQUIRE(!run_command(muxd_executable, "--ensure-tor-policy",
+                           CHILD_TIMEOUT_MS, &error),
+            "Tor ensure reused a legacy daemon without its policy fence");
+    g_clear_error(&error);
+    REQUIRE(kill(child, 0) == 0, "Tor ensure terminated the legacy daemon");
+    REQUIRE(lstat(socket_path, &after) == 0 &&
+            before.st_dev == after.st_dev && before.st_ino == after.st_ino,
+            "Tor ensure replaced the legacy daemon socket");
+    REQUIRE_CALL(run_command(muxd_executable, "--ensure",
+                              CHILD_TIMEOUT_MS, &error),
+                  "direct ensure still reuses the untouched legacy daemon");
+
+cleanup:
+    reap_forcefully(child);
+    remove_tree(root);
+    restore_environment("XDG_RUNTIME_DIR", old_runtime);
+    (void)umask(old_umask);
+}
+
+static void test_muxd_tor_policy_probe_replies(void)
+{
+    static const struct {
+        const gchar *response;
+        gboolean accepted;
+    } cases[] = {
+        { "TOR_POLICY_OK\t1", TRUE },
+        { NULL, FALSE },
+        { "TOR_POLICY_OK\t0", FALSE },
+        { "TOR_POLICY_OK\t1\textra", FALSE },
+        { "PONG\t1", FALSE },
+    };
+    g_autoptr(GError) error = NULL;
+    int sockets[2] = { -1, -1 };
+    pid_t child = -1;
+
+    for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+        gboolean exited;
+
+        REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0,
+                "create policy probe socketpair");
+        child = fork();
+        REQUIRE(child >= 0, "fork policy probe peer");
+        if (child == 0) {
+            g_autofree gchar *request = NULL;
+
+            close(sockets[0]);
+            request = mux_read_line(sockets[1], RESPONSE_TIMEOUT_MS);
+            if (g_strcmp0(request, "TOR_POLICY\t1") != 0)
+                _exit(2);
+            if (cases[i].response != NULL &&
+                !mux_send_line(sockets[1], "%s", cases[i].response))
+                _exit(3);
+            close(sockets[1]);
+            _exit(0);
+        }
+        close(sockets[1]);
+        sockets[1] = -1;
+        REQUIRE(mux_require_tor_policy(sockets[0]) == cases[i].accepted,
+                "unexpected policy capability result for case %u", i);
+        close(sockets[0]);
+        sockets[0] = -1;
+        exited = wait_child_success(child, CHILD_TIMEOUT_MS, &error);
+        child = -1;
+        REQUIRE_CALL(exited, "reap policy capability peer");
+    }
+
+cleanup:
+    if (sockets[0] >= 0)
+        close(sockets[0]);
+    if (sockets[1] >= 0)
+        close(sockets[1]);
+    reap_forcefully(child);
+}
+
 static void test_muxd_identity_lifecycle(void)
 {
     gchar *root = NULL;
@@ -2801,6 +3244,9 @@ int main(int argc, char **argv)
 {
     int result;
 
+    if (argc == 7 && g_strcmp0(argv[1], "--network-policy-peer") == 0)
+        return network_policy_peer(argv[2], argv[3], argv[4], argv[5], argv[6]);
+
     if (argc < 3) {
         g_printerr("usage: %s [GLib test options] MUXD_PATH MUXCTL_PATH\n",
                    argv[0]);
@@ -2813,6 +3259,12 @@ int main(int argc, char **argv)
     argv[argc] = NULL;
 
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/muxd/integration/network-policy-registration",
+                    test_muxd_network_policy_registration);
+    g_test_add_func("/muxd/integration/legacy-tor-policy-fence",
+                    test_muxd_legacy_tor_policy_fence);
+    g_test_add_func("/muxd/integration/tor-policy-probe-replies",
+                    test_muxd_tor_policy_probe_replies);
     g_test_add_func("/muxd/integration/identity-lifecycle",
                     test_muxd_identity_lifecycle);
     g_test_add_func("/muxd/integration/async-move-and-queued-replies",

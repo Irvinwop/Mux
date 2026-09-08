@@ -121,15 +121,22 @@ uninstall_mux() {
 usage() {
     cat <<'EOF'
 Usage: mux [URL]
+       mux --tor --tor-socks-proxy socks5://127.0.0.1:9050 [URL]
        mux ctl COMMAND [ARGUMENTS...]
        mux --print-install-paths
        mux --uninstall
 
 Launch Mux, send a headless control command, inspect the resolved relocatable
 installation, or remove only the installed Mux program files.
+
+--tor starts a fresh, memory-only profile through an already-running local Tor
+SOCKS5 endpoint. MUX_TOR_SOCKS_PROXY can supply the endpoint instead of the flag.
+Only numeric loopback endpoints are accepted. No Tor service is installed or
+started. This is not Tor Browser and does not provide its anonymity guarantees.
 EOF
 }
 
+positional_only=0
 case ${1:-} in
     --print-install-paths)
         [ "$#" -eq 1 ] || die "--print-install-paths takes no arguments"
@@ -149,8 +156,35 @@ case ${1:-} in
         usage
         exit 0
         ;;
-    --) shift ;;
+    --) shift; positional_only=1 ;;
 esac
+
+network_mode=${MUX_NETWORK_MODE-direct}
+network_options=0
+while [ "$#" -gt 0 ] && [ "$positional_only" -eq 0 ]; do
+    case $1 in
+        --tor)
+            network_mode=tor
+            network_options=1
+            shift
+            ;;
+        --tor-socks-proxy)
+            [ "$#" -ge 2 ] || die "--tor-socks-proxy needs a SOCKS5 URI"
+            MUX_TOR_SOCKS_PROXY=$2
+            network_options=1
+            export MUX_TOR_SOCKS_PROXY
+            shift 2
+            ;;
+        --tor-socks-proxy=*)
+            MUX_TOR_SOCKS_PROXY=${1#*=}
+            network_options=1
+            export MUX_TOR_SOCKS_PROXY
+            shift
+            ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
 
 if [ "$(uname -s)" != "Linux" ]; then
     die "Mux currently runs on Linux because WPEPlatform is Linux-only"
@@ -168,12 +202,28 @@ PATH=$bin_dir:${PATH:-/usr/bin:/bin}
 export PATH
 
 if [ "$#" -gt 0 ] && [ "$1" = ctl ]; then
+    [ "$network_options" -eq 0 ] ||
+        die "Tor launch options cannot be combined with ctl"
     shift
     if [ "$#" -gt 0 ] && [ "$1" != stop ]; then
         "$bin_dir/muxd" --ensure
     fi
     exec "$bin_dir/muxctl" "$@"
 fi
+
+case $network_mode in
+    direct)
+        [ "${MUX_TOR_SOCKS_PROXY+x}" != x ] ||
+            die "MUX_TOR_SOCKS_PROXY/--tor-socks-proxy requires --tor"
+        ;;
+    tor)
+        [ -n "${MUX_TOR_SOCKS_PROXY:-}" ] ||
+            die "--tor requires an explicit local SOCKS endpoint: --tor-socks-proxy socks5://127.0.0.1:9050"
+        ;;
+    *) die "unknown MUX_NETWORK_MODE: $network_mode" ;;
+esac
+MUX_NETWORK_MODE=$network_mode
+export MUX_NETWORK_MODE
 
 for command in kitty kitten stat; do
     command -v "$command" >/dev/null 2>&1 ||
@@ -264,15 +314,41 @@ rm -f -- "$kitty_socket"
 KITTY_LISTEN_ON=unix:$kitty_socket
 export MUX_LAYER MUX_GLOBAL_BAR KITTY_LISTEN_ON
 
-"$bin_dir/muxd" --ensure
-
+tor_runtime=
 cleanup_kitty_socket() {
     rm -f -- "$kitty_socket"
+    if [ -n "$tor_runtime" ]; then
+        rmdir -- "$tor_runtime" 2>/dev/null || true
+    fi
 }
 trap cleanup_kitty_socket EXIT
+
+kitty_title=Mux
+if [ "$network_mode" = tor ]; then
+    command -v mktemp >/dev/null 2>&1 || die "missing required command: mktemp"
+    tor_runtime=$(mktemp -d "$kitty_runtime/tor-private-XXXXXXXXXXXX") ||
+        die "could not create an isolated Tor launch namespace"
+    MUX_PROFILE=${tor_runtime##*/}
+    MUX_EPHEMERAL=1
+    unset MUX_ENGINE_SOCKET MUX_PROFILE_DATA_DIR MUX_PROFILE_CACHE_DIR
+    unset MUX_POPUP_TOKEN
+    export MUX_PROFILE MUX_EPHEMERAL MUX_TOR_SOCKS_PROXY
+    "$bin_dir/mux-engine" --check-network ||
+        die "Tor SOCKS preflight failed; no browser was started"
+    kitty_title='Mux Tor SOCKS'
+    printf '%s\n' "Mux Tor SOCKS: fresh ephemeral profile; WebRTC disabled." >&2
+    printf '%s\n' "The local SOCKS service must be Tor. This is not Tor Browser or a fingerprint-anonymity guarantee." >&2
+fi
+
+if [ "$network_mode" = tor ]; then
+    "$bin_dir/muxd" --ensure-tor-policy ||
+        die "restart the Mux daemon to use Tor; existing sessions were left running"
+else
+    "$bin_dir/muxd" --ensure
+fi
 
 kitty \
     --config "$kitty_config" \
     --listen-on "$KITTY_LISTEN_ON" \
-    --title Mux \
+    --title "$kitty_title" \
     "$bin_dir/mux-layer" "$@"

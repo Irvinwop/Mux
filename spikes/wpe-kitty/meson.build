@@ -23,8 +23,15 @@ endif
 core_library = static_library(
   'mux-core',
   [
+    'mux-bar-render.c',
+    'mux-pane-diagnostic.c',
+    'mux-network-policy.c',
+    'mux-network-handshake.c',
+    'src/mux-engine-protocol.c',
     'mux-clipboard.c',
     'mux-clipboard-history.c',
+    'mux-clipboard-picker.c',
+    'mux-clipboard-picker-controller.c',
     'mux-clipboard-broker.c',
     'mux-clipboard-control.c',
     'mux-clipboard-wire.c',
@@ -35,6 +42,7 @@ core_library = static_library(
     'mux-ui-protocol.c',
     'mux-permission-store.c',
     'mux-browser-store.c',
+    'mux-privacy-policy.c',
     'mux-uri.c',
     'src/mux-session-state.c',
   ],
@@ -48,6 +56,10 @@ core_dep = declare_dependency(
 )
 
 core_tests = [
+  'bar-render',
+  'clipboard-picker',
+  'network-policy',
+  'network-handshake',
   'clipboard-history',
   'clipboard-broker',
   'ui-protocol',
@@ -57,6 +69,7 @@ core_tests = [
   'permission-store',
   'session-state',
   'browser-store',
+  'privacy-policy',
 ]
 foreach test_name : core_tests
   core_test = executable(
@@ -152,15 +165,15 @@ if runtime_enabled
   executable(
     'mux-bar',
     ['src/mux-bar.c', 'src/mux-protocol.c', 'src/mux-shortcuts.c'],
-    dependencies: glib_dep,
+    dependencies: core_dep,
     install: true,
     install_dir: mux_runtime_install_dir,
   )
 
-  executable(
+  mux_layer_executable = executable(
     'mux-layer',
     'src/mux-layer.c',
-    dependencies: glib_dep,
+    dependencies: core_dep,
     install: true,
     install_dir: mux_runtime_install_dir,
   )
@@ -169,7 +182,9 @@ if runtime_enabled
     'mux-engine',
     [
       'src/mux-engine.c',
-      'src/mux-engine-protocol.c',
+      'mux-privacy-policy-wpe.c',
+      'src/mux-protocol.c',
+      'mux-network-policy-wpe.c',
       'src/mux-shortcuts.c',
       'mux-wpe-clipboard.c',
       'mux-clipboard-engine-link.c',
@@ -191,7 +206,6 @@ if runtime_enabled
     'mux-pane',
     [
       'src/mux-pane.c',
-      'src/mux-engine-protocol.c',
       'src/mux-shortcuts.c',
       'src/mux-protocol.c',
       'mux-pane-clipboard.c',
@@ -203,8 +217,6 @@ if runtime_enabled
       'mux-local-transport.c',
       'mux-local-source.c',
       'mux-local-endpoint.c',
-      'mux-clipboard-picker.c',
-      'mux-clipboard-picker-controller.c',
       'mux-clipboard-picker-broker.c',
       'mux-ui-pane.c',
       'mux-pane-overlay.c',
@@ -220,8 +232,8 @@ if runtime_enabled
     'test-engine-protocol',
     [
       'tests/test-engine-protocol.c',
-      'src/mux-engine-protocol.c',
       'src/mux-engine.c',
+      'mux-network-policy-wpe.c',
       'src/mux-pane.c',
       'src/mux-shortcuts.c',
     ],
@@ -229,6 +241,27 @@ if runtime_enabled
     dependencies: engine_dependencies,
   )
   test('engine-protocol', engine_protocol_test, suite: 'runtime')
+
+  privacy_policy_wpe_test = executable(
+    'test-privacy-policy-wpe',
+    [
+      'tests/test-privacy-policy-wpe.c',
+      'mux-privacy-policy-wpe.c',
+    ],
+    dependencies: engine_dependencies,
+  )
+  test('privacy-policy-wpe', privacy_policy_wpe_test, suite: 'runtime')
+
+  test(
+    'mux-layer-policy',
+    find_program('sh'),
+    args: [
+      meson.project_source_root() / '..' / '..' / 'scripts' / 'test-mux-layer-policy.sh',
+      mux_layer_executable.full_path(),
+    ],
+    timeout: 20,
+    suite: 'runtime',
+  )
 
   clipboard_engine_link_test = executable(
     'test-clipboard-engine-link',
@@ -240,6 +273,14 @@ if runtime_enabled
     dependencies: engine_dependencies,
   )
   test('clipboard-engine-link', clipboard_engine_link_test, suite: 'runtime')
+
+  network_policy_wpe_test = executable(
+    'test-network-policy-wpe',
+    ['tests/test-network-policy.c', 'mux-network-policy-wpe.c'],
+    c_args: ['-DMUX_NETWORK_POLICY_TEST_WPE'],
+    dependencies: engine_dependencies,
+  )
+  test('network-policy-wpe', network_policy_wpe_test, suite: 'runtime')
 
   muxd_integration_test = executable(
     'test-muxd-integration',
